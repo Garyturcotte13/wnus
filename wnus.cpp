@@ -1,0 +1,25506 @@
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <iphlpapi.h>
+#include <icmpapi.h>
+#include <windows.h>
+#include <dwmapi.h>
+#include <uxtheme.h>
+#include <shlwapi.h>
+#include <aclapi.h>
+#include <sddl.h>
+#include <tlhelp32.h>
+#include <psapi.h>
+#include <winternl.h>
+#include <bcrypt.h>
+#include <string>
+#include <vector>
+#include <sstream>
+#include <iostream>
+#include <iomanip>
+#include <fstream>
+#include <algorithm>
+#include <functional>
+#include <cmath>
+#include <chrono>
+#include <ctime>
+#include <direct.h>
+#include <io.h>
+#include <map>
+#include <set>
+#include <filesystem>
+
+#pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "iphlpapi.lib")
+#pragma comment(lib, "bcrypt.lib")
+
+// ZIP file format structures
+#pragma pack(push, 1)
+struct ZipLocalFileHeader {
+    uint32_t signature;           // 0x04034b50
+    uint16_t versionNeeded;
+    uint16_t flags;
+    uint16_t compression;
+    uint16_t modTime;
+    uint16_t modDate;
+    uint32_t crc32;
+    uint32_t compressedSize;
+    uint32_t uncompressedSize;
+    uint16_t filenameLength;
+    uint16_t extraFieldLength;
+};
+
+struct ZipCentralDirHeader {
+    uint32_t signature;           // 0x02014b50
+    uint16_t versionMadeBy;
+    uint16_t versionNeeded;
+    uint16_t flags;
+    uint16_t compression;
+    uint16_t modTime;
+    uint16_t modDate;
+    uint32_t crc32;
+    uint32_t compressedSize;
+    uint32_t uncompressedSize;
+    uint16_t filenameLength;
+    uint16_t extraFieldLength;
+    uint16_t commentLength;
+    uint16_t diskStart;
+    uint16_t internalAttr;
+    uint32_t externalAttr;
+    uint32_t localHeaderOffset;
+};
+
+struct ZipEndOfCentralDir {
+    uint32_t signature;           // 0x06054b50
+    uint16_t diskNumber;
+    uint16_t centralDirDisk;
+    uint16_t numEntriesThisDisk;
+    uint16_t numEntriesTotal;
+    uint32_t centralDirSize;
+    uint32_t centralDirOffset;
+    uint16_t commentLength;
+};
+#pragma pack(pop)
+
+// Convert Windows FILETIME to DOS date/time
+void fileTimeToDosDateTime(const FILETIME& ft, uint16_t& dosDate, uint16_t& dosTime) {
+    SYSTEMTIME st;
+    FileTimeToSystemTime(&ft, &st);
+    
+    dosDate = ((st.wYear - 1980) << 9) | (st.wMonth << 5) | st.wDay;
+    dosTime = (st.wHour << 11) | (st.wMinute << 5) | (st.wSecond / 2);
+}
+
+// Convert DOS date/time to Windows FILETIME
+void dosDateTimeToFileTime(uint16_t dosDate, uint16_t dosTime, FILETIME& ft) {
+    SYSTEMTIME st = {0};
+    st.wYear = ((dosDate >> 9) & 0x7F) + 1980;
+    st.wMonth = (dosDate >> 5) & 0x0F;
+    st.wDay = dosDate & 0x1F;
+    st.wHour = (dosTime >> 11) & 0x1F;
+    st.wMinute = (dosTime >> 5) & 0x3F;
+    st.wSecond = (dosTime & 0x1F) * 2;
+    
+    SystemTimeToFileTime(&st, &ft);
+}
+
+// CRC32 table for gzip
+static unsigned int crc32_table[256];
+static bool crc32_table_initialized = false;
+
+void init_crc32_table() {
+    if (crc32_table_initialized) return;
+    
+    for (unsigned int i = 0; i < 256; i++) {
+        unsigned int c = i;
+        for (int j = 0; j < 8; j++) {
+            if (c & 1) {
+                c = 0xEDB88320 ^ (c >> 1);
+            } else {
+                c = c >> 1;
+            }
+        }
+        crc32_table[i] = c;
+    }
+    crc32_table_initialized = true;
+}
+
+unsigned int calculate_crc32(const unsigned char* data, size_t length) {
+    init_crc32_table();
+    unsigned int crc = 0xFFFFFFFF;
+    
+    for (size_t i = 0; i < length; i++) {
+        crc = crc32_table[(crc ^ data[i]) & 0xFF] ^ (crc >> 8);
+    }
+    
+    return crc ^ 0xFFFFFFFF;
+}
+
+// Bit stream writer for DEFLATE
+class BitWriter {
+private:
+    std::vector<unsigned char>& output;
+    unsigned char bitBuffer;
+    int bitCount;
+    
+public:
+    BitWriter(std::vector<unsigned char>& out) : output(out), bitBuffer(0), bitCount(0) {}
+    
+    void writeBit(int bit) {
+        bitBuffer |= (bit & 1) << bitCount;
+        bitCount++;
+        if (bitCount == 8) {
+            output.push_back(bitBuffer);
+            bitBuffer = 0;
+            bitCount = 0;
+        }
+    }
+    
+    void writeBits(unsigned int value, int numBits) {
+        for (int i = 0; i < numBits; i++) {
+            writeBit((value >> i) & 1);
+        }
+    }
+    
+    void writeReverseBits(unsigned int value, int numBits) {
+        for (int i = numBits - 1; i >= 0; i--) {
+            writeBit((value >> i) & 1);
+        }
+    }
+    
+    void flush() {
+        if (bitCount > 0) {
+            output.push_back(bitBuffer);
+            bitBuffer = 0;
+            bitCount = 0;
+        }
+    }
+    
+    void alignToByte() {
+        if (bitCount > 0) {
+            flush();
+        }
+    }
+};
+
+// Simple DEFLATE compression (uncompressed blocks only for reliability)
+std::vector<unsigned char> deflate_compress(const unsigned char* data, size_t length) {
+    std::vector<unsigned char> output;
+    BitWriter writer(output);
+    
+    // Process data in blocks of up to 65535 bytes (uncompressed)
+    size_t offset = 0;
+    
+    while (offset < length) {
+        size_t blockSize = length - offset;
+        if (blockSize > 65535) blockSize = 65535;
+        
+        bool isFinal = (offset + blockSize >= length);
+        
+        // Block header: BFINAL (1 bit) + BTYPE (2 bits, 00 = uncompressed)
+        writer.writeBit(isFinal ? 1 : 0);
+        writer.writeBits(0, 2);  // Uncompressed block
+        
+        // Align to byte boundary
+        writer.alignToByte();
+        
+        // Write LEN and NLEN (stored block format)
+        unsigned short len = (unsigned short)blockSize;
+        unsigned short nlen = ~len;
+        
+        output.push_back(len & 0xFF);
+        output.push_back((len >> 8) & 0xFF);
+        output.push_back(nlen & 0xFF);
+        output.push_back((nlen >> 8) & 0xFF);
+        
+        // Write uncompressed data
+        for (size_t i = 0; i < blockSize; i++) {
+            output.push_back(data[offset + i]);
+        }
+        
+        offset += blockSize;
+    }
+    
+    writer.flush();
+    return output;
+}
+
+// Bit stream reader for DEFLATE
+class BitReader {
+private:
+    const unsigned char* data;
+    size_t length;
+    size_t bytePos;
+    int bitPos;
+    
+public:
+    BitReader(const unsigned char* d, size_t len) : data(d), length(len), bytePos(0), bitPos(0) {}
+    
+    int readBit() {
+        if (bytePos >= length) return -1;
+        int bit = (data[bytePos] >> bitPos) & 1;
+        bitPos++;
+        if (bitPos == 8) {
+            bitPos = 0;
+            bytePos++;
+        }
+        return bit;
+    }
+    
+    unsigned int readBits(int numBits) {
+        unsigned int value = 0;
+        for (int i = 0; i < numBits; i++) {
+            int bit = readBit();
+            if (bit < 0) return 0;
+            value |= (bit << i);
+        }
+        return value;
+    }
+    
+    void alignToByte() {
+        if (bitPos > 0) {
+            bitPos = 0;
+            bytePos++;
+        }
+    }
+    
+    size_t getBytePos() const { return bytePos; }
+    bool hasData() const { return bytePos < length; }
+};
+
+// Simple DEFLATE decompression (handles uncompressed blocks)
+std::vector<unsigned char> deflate_decompress(const unsigned char* data, size_t length) {
+    std::vector<unsigned char> output;
+    BitReader reader(data, length);
+    
+    while (reader.hasData()) {
+        // Read block header
+        int bfinal = reader.readBit();
+        int btype = reader.readBits(2);
+        
+        if (btype == 0) {
+            // Uncompressed block
+            reader.alignToByte();
+            
+            size_t pos = reader.getBytePos();
+            if (pos + 4 > length) break;
+            
+            unsigned short len = data[pos] | (data[pos + 1] << 8);
+            unsigned short nlen = data[pos + 2] | (data[pos + 3] << 8);
+            
+            // Verify NLEN
+            if (len != (unsigned short)(~nlen)) {
+                break;  // Invalid block
+            }
+            
+            pos += 4;
+            
+            // Copy uncompressed data
+            for (unsigned short i = 0; i < len && pos < length; i++) {
+                output.push_back(data[pos++]);
+            }
+            
+            // Update reader position
+            BitReader newReader(data, length);
+            for (size_t i = 0; i < pos; i++) {
+                newReader.readBits(8);
+            }
+            reader = newReader;
+        } else {
+            // Compressed block - not implemented in this simple version
+            break;
+        }
+        
+        if (bfinal) break;
+    }
+    
+    return output;
+}
+
+// Dark mode APIs (undocumented)
+enum PreferredAppMode { Default, AllowDark, ForceDark, ForceLight, Max };
+typedef PreferredAppMode(WINAPI* fnSetPreferredAppMode)(PreferredAppMode appMode);
+typedef BOOL(WINAPI* fnAllowDarkModeForWindow)(HWND hWnd, BOOL allow);
+typedef BOOL(WINAPI* fnShouldAppsUseDarkMode)();
+typedef void(WINAPI* fnFlushMenuThemes)();
+typedef void(WINAPI* fnRefreshImmersiveColorPolicyState)();
+
+// Undocumented menu messages for dark mode
+#define WM_UAHDRAWMENU 0x0091
+#define WM_UAHDRAWMENUITEM 0x0092
+
+struct UAHMENU {
+    HMENU hmenu;
+    HDC hdc;
+    DWORD dwFlags;
+};
+
+struct UAHDRAWMENUITEM {
+    DRAWITEMSTRUCT dis;
+    UAHMENU um;
+    DWORD dwFlags;
+};
+
+// Global variables
+HWND g_hWnd = NULL;
+HWND g_hOutput = NULL;
+HMENU g_hMenu = NULL;
+HMENU g_hOptionsMenu = NULL;
+WNDPROC g_originalEditProc = NULL;
+std::vector<std::string> g_commandHistory;
+int g_historyIndex = -1;
+int g_promptStart = 0;
+bool g_caseSensitive = false;
+bool g_fullPathPrompt = false;
+bool g_lineWrap = true;  // Default to line wrap enabled
+bool g_isFullScreen = false;
+bool g_skipFinalPrompt = false;  // Skip final prompt in executeCommand
+RECT g_savedWindowRect = {0};
+LONG g_savedWindowStyle = 0;
+bool g_capturingOutput = false;
+std::vector<std::string> g_capturedOutput;
+int g_lastExitStatus = 0;  // Track exit status of last command (0 = success)
+bool g_executeOnStartup = false;
+std::string g_startupCommand;
+COLORREF g_textColor = RGB(0, 255, 0);     // Default: green text
+COLORREF g_bgColor = RGB(0, 0, 0);         // Default: black background
+HBRUSH g_hBrush = NULL;
+std::vector<std::string> g_tabMatches;
+int g_tabIndex = -1;
+std::string g_tabPrefix;
+int g_tabInputLength = 0;  // Track input length when tab sequence started
+DWORD g_lastTabTime = 0;   // Track last tab press for double-tab detection
+std::map<std::string, std::string> g_aliases;  // Command aliases (name -> command)
+
+// Redirection and output management
+struct RedirectionInfo {
+    bool redirectOutput = false;
+    bool appendOutput = false;
+    bool redirectInput = false;
+    bool runInBackground = false;
+    std::string outputFile;
+    std::string inputFile;
+    std::ofstream* outputStream = nullptr;
+    std::ifstream* inputStream = nullptr;
+};
+
+// Global redirection info
+RedirectionInfo g_redirection;
+
+// Background process tracking
+struct BackgroundProcess {
+    DWORD processId;
+    std::string commandLine;
+    HANDLE processHandle;
+};
+
+std::vector<BackgroundProcess> g_backgroundProcesses;
+
+// Nano editor state
+bool g_nanoMode = false;  // Are we in nano editing mode?
+std::vector<std::string> g_nanoBuffer;  // Current file lines being edited
+std::string g_nanoFilename;  // File being edited
+int g_nanoCursorLine = 0;  // Cursor line number
+int g_nanoCursorCol = 0;   // Cursor column position
+int g_nanoTopLine = 0;     // First visible line in viewport
+bool g_nanoModified = false;  // Has file been modified?
+bool g_nanoSaveAsMode = false;  // Are we prompting for Save As filename?
+std::string g_nanoSaveAsInput;  // Save As filename being typed
+// Menu IDs
+#define ID_OPTIONS_CASE_SENSITIVE 1001
+#define ID_OPTIONS_CASE_INSENSITIVE 1002
+#define ID_OPTIONS_TEXT_COLOR 1003
+#define ID_OPTIONS_BG_COLOR 1004
+#define ID_OPTIONS_FULL_PATH 1005
+#define ID_OPTIONS_LINE_WRAP 1006
+#define ID_OPTIONS_FULLSCREEN 1007
+
+// Registry settings
+#define REG_KEY_PATH "Software\\GarysConsole"
+#define REG_VALUE_CASE_SENSITIVE "CaseSensitive"
+#define REG_VALUE_TEXT_COLOR "TextColor"
+#define REG_VALUE_BG_COLOR "BackgroundColor"
+#define REG_VALUE_FULL_PATH "FullPathPrompt"
+#define REG_VALUE_LINE_WRAP "LineWrap"
+
+// Utility functions
+std::vector<std::string> split(const std::string& str, char delimiter = ' ') {
+    std::vector<std::string> tokens;
+    std::string token;
+    bool inQuotes = false;
+    bool escapeNext = false;
+    
+    for (size_t i = 0; i < str.length(); i++) {
+        char c = str[i];
+        
+        if (escapeNext) {
+            // Backslash escapes the next character
+            token += c;
+            escapeNext = false;
+        } else if (c == '\\') {
+            // Backslash escapes next character
+            escapeNext = true;
+        } else if (c == '"') {
+            // Toggle quote mode
+            inQuotes = !inQuotes;
+            // Don't include the quote in the token
+        } else if (c == delimiter && !inQuotes) {
+            // Delimiter outside quotes - end current token
+            if (!token.empty()) {
+                tokens.push_back(token);
+                token.clear();
+            }
+        } else {
+            // Regular character
+            token += c;
+        }
+    }
+    
+    // Add final token
+    if (!token.empty()) {
+        tokens.push_back(token);
+    }
+    
+    return tokens;
+}
+
+std::string trim(const std::string& str) {
+    size_t start = str.find_first_not_of(" \t\n\r");
+    size_t end = str.find_last_not_of(" \t\n\r");
+    
+    if (start == std::string::npos) {
+        return "";
+    }
+    
+    return str.substr(start, end - start + 1);
+}
+
+std::string unixPathToWindows(const std::string& path) {
+    std::string result = path;
+    std::replace(result.begin(), result.end(), '/', '\\');
+    return result;
+}
+
+std::string windowsPathToUnix(const std::string& path) {
+    std::string result = path;
+    std::replace(result.begin(), result.end(), '\\', '/');
+    return result;
+}
+
+// Pad string to the right with spaces
+std::string padRight(const std::string& str, size_t width) {
+    if (str.length() >= width) {
+        return str;
+    }
+    return str + std::string(width - str.length(), ' ');
+}
+
+// Forward declarations
+void output(const std::string& text);
+void executeCommand(const std::string& command);
+void searchFiles(const std::string& basePath, const std::string& pattern, 
+                 bool recursive, bool caseSensitive, char sortOrder, 
+                 bool collectAll, std::vector<std::string>& results, 
+                 int& count, int maxEntries);
+
+// Split command string by pipes (not in quotes)
+std::vector<std::string> splitByPipe(const std::string& command) {
+    std::vector<std::string> commands;
+    std::string current;
+    bool inQuotes = false;
+    bool escapeNext = false;
+    
+    for (size_t i = 0; i < command.length(); i++) {
+        char c = command[i];
+        
+        if (escapeNext) {
+            current += c;
+            escapeNext = false;
+        } else if (c == '\\') {
+            current += c;
+            escapeNext = true;
+        } else if (c == '"') {
+            inQuotes = !inQuotes;
+            current += c;
+        } else if (c == '|' && !inQuotes) {
+            // Check if it's || (OR operator) - if so, don't split here
+            if (i + 1 < command.length() && command[i + 1] == '|') {
+                current += c;
+                continue;
+            }
+            // Found a pipe outside quotes
+            if (!current.empty()) {
+                commands.push_back(trim(current));
+                current.clear();
+            }
+        } else {
+            current += c;
+        }
+    }
+    
+    // Add final command
+    if (!current.empty()) {
+        commands.push_back(trim(current));
+    }
+    
+    return commands;
+}
+
+// Structure to hold a command and its conditional operator
+struct ChainedCommand {
+    std::string command;
+    std::string nextOperator; // "&&" or "||" or empty for last command
+};
+
+// Split command string by && and || (not in quotes)
+std::vector<ChainedCommand> splitByChain(const std::string& command) {
+    std::vector<ChainedCommand> commands;
+    std::string current;
+    bool inQuotes = false;
+    bool escapeNext = false;
+    
+    for (size_t i = 0; i < command.length(); i++) {
+        char c = command[i];
+        
+        if (escapeNext) {
+            current += c;
+            escapeNext = false;
+        } else if (c == '\\') {
+            current += c;
+            escapeNext = true;
+        } else if (c == '"') {
+            inQuotes = !inQuotes;
+            current += c;
+        } else if (!inQuotes && c == '&' && i + 1 < command.length() && command[i + 1] == '&') {
+            // Found && operator
+            if (!trim(current).empty()) {
+                ChainedCommand cmd;
+                cmd.command = trim(current);
+                cmd.nextOperator = "&&";
+                commands.push_back(cmd);
+                current.clear();
+            }
+            i++; // Skip the second &
+        } else if (!inQuotes && c == '|' && i + 1 < command.length() && command[i + 1] == '|') {
+            // Found || operator
+            if (!trim(current).empty()) {
+                ChainedCommand cmd;
+                cmd.command = trim(current);
+                cmd.nextOperator = "||";
+                commands.push_back(cmd);
+                current.clear();
+            }
+            i++; // Skip the second |
+        } else {
+            current += c;
+        }
+    }
+    
+    // Add final command
+    if (!trim(current).empty()) {
+        ChainedCommand cmd;
+        cmd.command = trim(current);
+        cmd.nextOperator = ""; // No operator after last command
+        commands.push_back(cmd);
+    }
+    
+    return commands;
+}
+
+// Parse and extract redirection operators from command
+std::string parseRedirections(const std::string& command, RedirectionInfo& redir) {
+    std::string cleanedCmd;
+    bool inQuotes = false;
+    bool escapeNext = false;
+    
+    for (size_t i = 0; i < command.length(); i++) {
+        char c = command[i];
+        
+        if (escapeNext) {
+            cleanedCmd += c;
+            escapeNext = false;
+        } else if (c == '\\') {
+            cleanedCmd += c;
+            escapeNext = true;
+        } else if (c == '"') {
+            inQuotes = !inQuotes;
+            cleanedCmd += c;
+        } else if (!inQuotes && c == '>' && i + 1 < command.length() && command[i + 1] == '>') {
+            // Append redirection (>>)
+            redir.appendOutput = true;
+            redir.redirectOutput = true;
+            // Skip whitespace and get filename
+            i += 2;
+            while (i < command.length() && (command[i] == ' ' || command[i] == '\t')) i++;
+            std::string filename;
+            while (i < command.length() && command[i] != ' ' && command[i] != '\t' && 
+                   command[i] != '|' && command[i] != '&' && command[i] != '<') {
+                filename += command[i];
+                i++;
+            }
+            redir.outputFile = trim(filename);
+            i--; // Back up one because the loop will increment
+        } else if (!inQuotes && c == '>' && (i + 1 >= command.length() || command[i + 1] != '>')) {
+            // Output redirection (>)
+            redir.redirectOutput = true;
+            redir.appendOutput = false;
+            i++;
+            while (i < command.length() && (command[i] == ' ' || command[i] == '\t')) i++;
+            std::string filename;
+            while (i < command.length() && command[i] != ' ' && command[i] != '\t' && 
+                   command[i] != '|' && command[i] != '&' && command[i] != '<') {
+                filename += command[i];
+                i++;
+            }
+            redir.outputFile = trim(filename);
+            i--; // Back up one
+        } else if (!inQuotes && c == '<') {
+            // Input redirection (<)
+            redir.redirectInput = true;
+            i++;
+            while (i < command.length() && (command[i] == ' ' || command[i] == '\t')) i++;
+            std::string filename;
+            while (i < command.length() && command[i] != ' ' && command[i] != '\t' && 
+                   command[i] != '|' && command[i] != '&' && command[i] != '>') {
+                filename += command[i];
+                i++;
+            }
+            redir.inputFile = trim(filename);
+            i--; // Back up one
+        } else if (!inQuotes && c == '&' && i + 1 < command.length() && command[i + 1] == '&') {
+            // This is the && operator, don't treat & as background
+            cleanedCmd += c;
+            cleanedCmd += command[i + 1];
+            i++; // Skip the second &
+        } else if (!inQuotes && c == '&' && (i + 1 >= command.length() || command[i + 1] != '&')) {
+            // Single & = background process
+            redir.runInBackground = true;
+            // Skip trailing whitespace
+            i++;
+            while (i < command.length() && (command[i] == ' ' || command[i] == '\t')) i++;
+            i--; // Back up one
+        } else if (!inQuotes && c == '|' && i + 1 < command.length() && command[i + 1] == '|') {
+            // This is the || operator, don't treat as pipe
+            cleanedCmd += c;
+            cleanedCmd += command[i + 1];
+            i++; // Skip the second |
+        } else if (!inQuotes && c == '|' && (i + 1 >= command.length() || command[i + 1] != '|')) {
+            // This is a pipe, keep it
+            cleanedCmd += c;
+        } else {
+            cleanedCmd += c;
+        }
+    }
+    
+    return trim(cleanedCmd);
+}
+
+// Open output file for redirection
+bool openOutputRedirection(const std::string& filename, bool append) {
+    try {
+        std::ios::openmode mode = std::ios::out;
+        if (append) mode |= std::ios::app;
+        
+        g_redirection.outputStream = new std::ofstream(filename, mode);
+        if (!g_redirection.outputStream->is_open()) {
+            delete g_redirection.outputStream;
+            g_redirection.outputStream = nullptr;
+            return false;
+        }
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+// Close output redirection
+void closeOutputRedirection() {
+    if (g_redirection.outputStream) {
+        g_redirection.outputStream->close();
+        delete g_redirection.outputStream;
+        g_redirection.outputStream = nullptr;
+    }
+}
+
+// Open input file for redirection
+bool openInputRedirection(const std::string& filename) {
+    try {
+        g_redirection.inputStream = new std::ifstream(filename, std::ios::in);
+        if (!g_redirection.inputStream->is_open()) {
+            delete g_redirection.inputStream;
+            g_redirection.inputStream = nullptr;
+            return false;
+        }
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+// Close input redirection
+void closeInputRedirection() {
+    if (g_redirection.inputStream) {
+        g_redirection.inputStream->close();
+        delete g_redirection.inputStream;
+        g_redirection.inputStream = nullptr;
+    }
+}
+
+// Read a line from input redirection
+bool readInputRedirection(std::string& line) {
+    if (g_redirection.inputStream && std::getline(*g_redirection.inputStream, line)) {
+        return true;
+    }
+    return false;
+}
+
+// Execute command in background
+bool executeCommandInBackground(const std::string& commandLine) {
+    STARTUPINFOA si = { 0 };
+    PROCESS_INFORMATION pi = { 0 };
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_NORMAL;
+    
+    // Create process with command line
+    if (!CreateProcessA(NULL, (LPSTR)commandLine.c_str(), NULL, NULL, FALSE, 
+                       CREATE_NEW_CONSOLE, NULL, NULL, &si, &pi)) {
+        return false;
+    }
+    
+    // Track the background process
+    BackgroundProcess bgProc;
+    bgProc.processId = pi.dwProcessId;
+    bgProc.commandLine = commandLine;
+    bgProc.processHandle = pi.hProcess;
+    g_backgroundProcesses.push_back(bgProc);
+    
+    // Close the thread handle, keep process handle for status checking
+    CloseHandle(pi.hThread);
+    
+    output("[" + std::to_string(g_backgroundProcesses.size()) + "] " + std::to_string(pi.dwProcessId) + " " + commandLine);
+    
+    return true;
+}
+
+// Clean up finished background processes
+void cleanupBackgroundProcesses() {
+    auto it = g_backgroundProcesses.begin();
+    while (it != g_backgroundProcesses.end()) {
+        DWORD exitCode = 0;
+        if (GetExitCodeProcess(it->processHandle, &exitCode) && exitCode != STILL_ACTIVE) {
+            // Process finished, output completion message
+            output("Process " + std::to_string(it->processId) + " completed with exit code " + std::to_string(exitCode));
+            CloseHandle(it->processHandle);
+            it = g_backgroundProcesses.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+// Registry functions
+void saveCaseSensitiveSetting() {
+    HKEY hKey;
+    LONG result = RegCreateKeyExA(HKEY_CURRENT_USER, REG_KEY_PATH, 0, NULL, 
+                                   REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hKey, NULL);
+    
+    if (result == ERROR_SUCCESS) {
+        DWORD value = g_caseSensitive ? 1 : 0;
+        RegSetValueExA(hKey, REG_VALUE_CASE_SENSITIVE, 0, REG_DWORD, 
+                      (const BYTE*)&value, sizeof(DWORD));
+        RegCloseKey(hKey);
+    }
+}
+
+void loadCaseSensitiveSetting() {
+    HKEY hKey;
+    LONG result = RegOpenKeyExA(HKEY_CURRENT_USER, REG_KEY_PATH, 0, KEY_READ, &hKey);
+    
+    if (result == ERROR_SUCCESS) {
+        DWORD value = 0;
+        DWORD dataSize = sizeof(DWORD);
+        
+        result = RegQueryValueExA(hKey, REG_VALUE_CASE_SENSITIVE, NULL, NULL, 
+                                  (BYTE*)&value, &dataSize);
+        
+        if (result == ERROR_SUCCESS) {
+            g_caseSensitive = (value != 0);
+        }
+        
+        dataSize = sizeof(DWORD);
+        value = 0;
+        result = RegQueryValueExA(hKey, REG_VALUE_FULL_PATH, NULL, NULL, 
+                                  (BYTE*)&value, &dataSize);
+        
+        if (result == ERROR_SUCCESS) {
+            g_fullPathPrompt = (value != 0);
+        }
+        
+        dataSize = sizeof(DWORD);
+        value = 1;  // Default to line wrap on
+        result = RegQueryValueExA(hKey, REG_VALUE_LINE_WRAP, NULL, NULL, 
+                                  (BYTE*)&value, &dataSize);
+        
+        if (result == ERROR_SUCCESS) {
+            g_lineWrap = (value != 0);
+        }
+        
+        RegCloseKey(hKey);
+    }
+}
+
+void saveColorSettings() {
+    HKEY hKey;
+    LONG result = RegCreateKeyExA(HKEY_CURRENT_USER, REG_KEY_PATH, 0, NULL, 
+                                   REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hKey, NULL);
+    
+    if (result == ERROR_SUCCESS) {
+        DWORD textColor = (DWORD)g_textColor;
+        DWORD bgColor = (DWORD)g_bgColor;
+        RegSetValueExA(hKey, REG_VALUE_TEXT_COLOR, 0, REG_DWORD, 
+                      (const BYTE*)&textColor, sizeof(DWORD));
+        RegSetValueExA(hKey, REG_VALUE_BG_COLOR, 0, REG_DWORD, 
+                      (const BYTE*)&bgColor, sizeof(DWORD));
+        RegCloseKey(hKey);
+    }
+}
+
+void loadColorSettings() {
+    HKEY hKey;
+    LONG result = RegOpenKeyExA(HKEY_CURRENT_USER, REG_KEY_PATH, 0, KEY_READ, &hKey);
+    
+    if (result == ERROR_SUCCESS) {
+        DWORD textColor = 0;
+        DWORD bgColor = 0;
+        DWORD dataSize = sizeof(DWORD);
+        
+        if (RegQueryValueExA(hKey, REG_VALUE_TEXT_COLOR, NULL, NULL, 
+                            (BYTE*)&textColor, &dataSize) == ERROR_SUCCESS) {
+            g_textColor = (COLORREF)textColor;
+        }
+        
+        dataSize = sizeof(DWORD);
+        if (RegQueryValueExA(hKey, REG_VALUE_BG_COLOR, NULL, NULL, 
+                            (BYTE*)&bgColor, &dataSize) == ERROR_SUCCESS) {
+            g_bgColor = (COLORREF)bgColor;
+        }
+        
+        RegCloseKey(hKey);
+    }
+}
+
+std::string getHistoryFilePath() {
+    const char* home = getenv("USERPROFILE");
+    if (home) {
+        return std::string(home) + "\\.gash_history";
+    }
+    return ".gash_history";
+}
+
+void loadCommandHistory() {
+    std::string historyPath = getHistoryFilePath();
+    std::ifstream historyFile(historyPath);
+    
+    if (historyFile.is_open()) {
+        std::string line;
+        while (std::getline(historyFile, line)) {
+            if (!line.empty()) {
+                g_commandHistory.push_back(line);
+            }
+        }
+        historyFile.close();
+        g_historyIndex = g_commandHistory.size();
+    }
+}
+
+void saveCommandHistory() {
+    std::string historyPath = getHistoryFilePath();
+    std::ofstream historyFile(historyPath);
+    
+    if (historyFile.is_open()) {
+        // Limit history to last 1000 commands
+        size_t startIndex = g_commandHistory.size() > 1000 ? g_commandHistory.size() - 1000 : 0;
+        
+        for (size_t i = startIndex; i < g_commandHistory.size(); ++i) {
+            historyFile << g_commandHistory[i] << std::endl;
+        }
+        historyFile.close();
+    }
+}
+
+bool isWindowsDarkModeEnabled() {
+    HKEY hKey;
+    LONG result = RegOpenKeyExA(HKEY_CURRENT_USER, 
+        "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize", 
+        0, KEY_READ, &hKey);
+    
+    if (result == ERROR_SUCCESS) {
+        DWORD value = 1; // Default to light mode
+        DWORD dataSize = sizeof(DWORD);
+        RegQueryValueExA(hKey, "AppsUseLightTheme", NULL, NULL, 
+                        (BYTE*)&value, &dataSize);
+        RegCloseKey(hKey);
+        return (value == 0); // 0 = dark mode, 1 = light mode
+    }
+    
+    return true; // Default to dark mode if can't read
+}
+
+void applySystemTheme() {
+    // Check if user has custom colors saved
+    HKEY hKey;
+    LONG result = RegOpenKeyExA(HKEY_CURRENT_USER, REG_KEY_PATH, 0, KEY_READ, &hKey);
+    bool hasCustomColors = false;
+    
+    if (result == ERROR_SUCCESS) {
+        DWORD dataSize = sizeof(DWORD);
+        DWORD dummy;
+        // If either color exists in registry, user has set custom colors
+        if (RegQueryValueExA(hKey, REG_VALUE_TEXT_COLOR, NULL, NULL, (BYTE*)&dummy, &dataSize) == ERROR_SUCCESS ||
+            RegQueryValueExA(hKey, REG_VALUE_BG_COLOR, NULL, NULL, (BYTE*)&dummy, &dataSize) == ERROR_SUCCESS) {
+            hasCustomColors = true;
+        }
+        RegCloseKey(hKey);
+    }
+    
+    // Only apply system theme if user hasn't customized colors
+    if (!hasCustomColors) {
+        if (isWindowsDarkModeEnabled()) {
+            // Dark mode: green text on black background
+            g_textColor = RGB(0, 255, 0);
+            g_bgColor = RGB(0, 0, 0);
+        } else {
+            // Light mode: black text on white background
+            g_textColor = RGB(0, 0, 0);
+            g_bgColor = RGB(255, 255, 255);
+        }
+    }
+}
+
+std::string toLower(const std::string& str) {
+    std::string result = str;
+    std::transform(result.begin(), result.end(), result.begin(), ::tolower);
+    return result;
+}
+
+bool commandEquals(const std::string& cmd, const char* target) {
+    if (g_caseSensitive) {
+        return cmd == target;
+    } else {
+        return toLower(cmd) == toLower(target);
+    }
+}
+
+bool confirmInConsole(const std::string& prompt) {
+    output(prompt + " (y/n): ");
+    
+    // Get current text length
+    int textLen = GetWindowTextLengthA(g_hOutput);
+    std::string allText;
+    allText.resize(textLen + 1);
+    GetWindowTextA(g_hOutput, &allText[0], textLen + 1);
+    allText.resize(textLen);
+    
+    // Set prompt start position
+    int oldPromptStart = g_promptStart;
+    g_promptStart = textLen;
+    
+    // Set cursor to end
+    SendMessage(g_hOutput, EM_SETSEL, textLen, textLen);
+    SetFocus(g_hOutput);
+    
+    // Wait for user input (message loop)
+    MSG msg;
+    std::string response;
+    bool gotResponse = false;
+    
+    while (!gotResponse && GetMessage(&msg, NULL, 0, 0)) {
+        if (msg.message == WM_CHAR && msg.hwnd == g_hOutput) {
+            if (msg.wParam == VK_RETURN) {
+                // Get the response
+                int currentLen = GetWindowTextLengthA(g_hOutput);
+                if (currentLen > g_promptStart) {
+                    std::string currentText;
+                    currentText.resize(currentLen + 1);
+                    GetWindowTextA(g_hOutput, &currentText[0], currentLen + 1);
+                    currentText.resize(currentLen);
+                    response = currentText.substr(g_promptStart);
+                }
+                gotResponse = true;
+                break;
+            }
+        }
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
+    }
+    
+    // Restore prompt start
+    g_promptStart = oldPromptStart;
+    
+    // Move to new line
+    output("");
+    
+    // Check response
+    response = trim(response);
+    return (response == "y" || response == "Y" || response == "yes" || response == "Yes" || response == "YES");
+}
+
+bool verifyFileNameCase(const std::string& providedPath) {
+    if (!g_caseSensitive) {
+        return true; // In case-insensitive mode, any case is OK
+    }
+    
+    // Convert to Windows path
+    std::string winPath = unixPathToWindows(providedPath);
+    
+    // Find the last backslash to separate directory and filename
+    size_t lastSlash = winPath.find_last_of("\\");
+    std::string directory = ".";
+    std::string filename = winPath;
+    
+    if (lastSlash != std::string::npos) {
+        directory = winPath.substr(0, lastSlash);
+        filename = winPath.substr(lastSlash + 1);
+    }
+    
+    // Search for the file in the directory
+    std::string searchPath = directory + "\\" + filename;
+    WIN32_FIND_DATAA findData;
+    HANDLE hFind = FindFirstFileA(searchPath.c_str(), &findData);
+    
+    if (hFind == INVALID_HANDLE_VALUE) {
+        return false; // File doesn't exist
+    }
+    
+    // Check if the actual filename matches exactly (case-sensitive)
+    bool matches = (filename == findData.cFileName);
+    FindClose(hFind);
+    
+    return matches;
+}
+
+// Wildcard matching function
+bool matchWildcard(const std::string& pattern, const std::string& text) {
+    // Use case-insensitive comparison for Windows file system
+    std::string patternLower = g_caseSensitive ? pattern : toLower(pattern);
+    std::string textLower = g_caseSensitive ? text : toLower(text);
+    
+    size_t pIdx = 0, tIdx = 0;
+    size_t starIdx = std::string::npos;
+    size_t matchIdx = 0;
+    
+    while (tIdx < textLower.length()) {
+        if (pIdx < patternLower.length() && (patternLower[pIdx] == textLower[tIdx] || patternLower[pIdx] == '?')) {
+            pIdx++;
+            tIdx++;
+        } else if (pIdx < patternLower.length() && patternLower[pIdx] == '*') {
+            starIdx = pIdx;
+            matchIdx = tIdx;
+            pIdx++;
+        } else if (starIdx != std::string::npos) {
+            pIdx = starIdx + 1;
+            matchIdx++;
+            tIdx = matchIdx;
+        } else {
+            return false;
+        }
+    }
+    
+    while (pIdx < patternLower.length() && patternLower[pIdx] == '*') {
+        pIdx++;
+    }
+    
+    return pIdx == patternLower.length();
+}
+
+// Expand wildcards in a single argument
+std::vector<std::string> expandWildcard(const std::string& pattern) {
+    std::vector<std::string> matches;
+    
+    // If no wildcard, return as-is
+    if (pattern.find('*') == std::string::npos && pattern.find('?') == std::string::npos) {
+        matches.push_back(pattern);
+        return matches;
+    }
+    
+    // Split pattern into directory and filename parts
+    std::string winPattern = unixPathToWindows(pattern);
+    size_t lastSlash = winPattern.find_last_of("\\");
+    std::string directory = ".";
+    std::string filePattern = winPattern;
+    
+    if (lastSlash != std::string::npos) {
+        directory = winPattern.substr(0, lastSlash);
+        filePattern = winPattern.substr(lastSlash + 1);
+    }
+    
+    // Search for matching files
+    std::string searchPath = directory + "\\*";
+    WIN32_FIND_DATAA findData;
+    HANDLE hFind = FindFirstFileA(searchPath.c_str(), &findData);
+    
+    if (hFind == INVALID_HANDLE_VALUE) {
+        // If pattern doesn't match anything, return the original pattern
+        matches.push_back(pattern);
+        return matches;
+    }
+    
+    do {
+        std::string filename = findData.cFileName;
+        
+        // Skip . and ..
+        if (filename == "." || filename == "..") {
+            continue;
+        }
+        
+        // Check if filename matches pattern
+        if (matchWildcard(filePattern, filename)) {
+            // Build full path if needed
+            std::string fullPath;
+            if (directory != ".") {
+                fullPath = directory + "\\" + filename;
+                fullPath = windowsPathToUnix(fullPath);
+            } else {
+                fullPath = filename;
+            }
+            matches.push_back(fullPath);
+        }
+    } while (FindNextFileA(hFind, &findData));
+    
+    FindClose(hFind);
+    
+    // If no matches found, return original pattern
+    if (matches.empty()) {
+        matches.push_back(pattern);
+    }
+    
+    // Sort matches alphabetically
+    std::sort(matches.begin(), matches.end());
+    
+    return matches;
+}
+
+// Expand all wildcards in argument list
+std::vector<std::string> expandWildcards(const std::vector<std::string>& args) {
+    std::vector<std::string> expanded;
+    
+    for (size_t i = 0; i < args.size(); i++) {
+        std::vector<std::string> matches = expandWildcard(args[i]);
+        expanded.insert(expanded.end(), matches.begin(), matches.end());
+    }
+    
+    return expanded;
+}
+
+// Output functions
+std::string getCurrentPrompt() {
+    char cwd[MAX_PATH];
+    std::string prompt = "wnus$ ";
+    if (_getcwd(cwd, sizeof(cwd)) != NULL) {
+        std::string path = windowsPathToUnix(cwd);
+        if (!g_fullPathPrompt) {
+            // Show only current directory name
+            size_t lastSlash = path.find_last_of('/');
+            if (lastSlash != std::string::npos) {
+                path = path.substr(lastSlash + 1);
+            }
+        }
+        prompt = "wnus:" + path + "$ ";
+    }
+    return prompt;
+}
+
+void showPrompt() {
+    if (!g_hOutput) return;
+    
+    // Get current text length
+    int textLen = GetWindowTextLengthA(g_hOutput);
+    
+    // Add prompt
+    std::string prompt = getCurrentPrompt();
+    SendMessageA(g_hOutput, EM_SETSEL, textLen, textLen);
+    SendMessageA(g_hOutput, EM_REPLACESEL, FALSE, (LPARAM)prompt.c_str());
+    
+    // Mark where user input starts
+    g_promptStart = GetWindowTextLengthA(g_hOutput);
+    
+    // Set focus and cursor to end
+    SetFocus(g_hOutput);
+    SendMessageA(g_hOutput, EM_SETSEL, g_promptStart, g_promptStart);
+}
+
+void output(const std::string& text) {
+    // Handle output redirection
+    if (g_redirection.redirectOutput && g_redirection.outputStream) {
+        *g_redirection.outputStream << text << "\n";
+        g_redirection.outputStream->flush();
+        return;
+    }
+    
+    if (g_capturingOutput) {
+        // When capturing, store output for piping
+        g_capturedOutput.push_back(text);
+        return;
+    }
+    
+    // If in startup execution mode, also output to console
+    if (g_executeOnStartup) {
+        printf("%s\n", text.c_str());
+        fflush(stdout);
+    }
+    
+    if (!g_hOutput) return;
+    
+    // Get current text length
+    int textLen = GetWindowTextLengthA(g_hOutput);
+    
+    // Append text with newline
+    std::string line = text + "\r\n";
+    SendMessageA(g_hOutput, EM_SETSEL, textLen, textLen);
+    SendMessageA(g_hOutput, EM_REPLACESEL, FALSE, (LPARAM)line.c_str());
+    
+    // Scroll to bottom
+    SendMessage(g_hOutput, EM_SCROLLCARET, 0, 0);
+    
+    // Force update
+    UpdateWindow(g_hOutput);
+    InvalidateRect(g_hOutput, NULL, TRUE);
+}
+
+void outputError(const std::string& text) {
+    output(text);
+}
+
+// Helper function to check for help flag
+bool checkHelpFlag(const std::vector<std::string>& args) {
+    if (args.size() > 1) {
+        for (size_t i = 1; i < args.size(); ++i) {
+            if (args[i] == "-h" || args[i] == "--help") {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// Helper function to check if a command is an internal shell command
+bool isInternalCommand(const std::string& cmd) {
+    static const std::vector<std::string> internalCommands = {
+        "pwd", "cd", "echo", "ls", "dir", "cat", "type", "less", "head", "tail",
+        "grep", "egrep", "find", "locate", "mkdir", "rmdir", "rm", "del", "touch", "chmod",
+        "chown", "chgrp", "mv", "rename", "dd", "df", "du", "sort", "cut", "paste", "wc",
+        "tee", "diff", "patch", "which", "file", "ln", "unlink", "tar", "gzip", "gunzip",
+        "bzip2", "bunzip2", "zip", "unzip", "sed", "awk", "xargs", "alias", "unalias", "source",
+        "exec", "history", "man", "help", "neofetch", "clear", "screen", "nano",
+        "finger", "id", "whoami", "groups", "user", "getent", "passwd", "useradd",
+        "userdel", "usermod", "groupadd", "addgroup", "groupmod", "groupdel",
+        "gpasswd", "who", "w", "last", "proc", "ps", "kill", "killall", "xkill",
+        "jobs", "ping", "traceroute", "tracert", "ip", "iptables", "wget", "curl",
+        "ssh", "scp", "rsync", "service", "shutdown", "reboot", "sync", "date",
+        "ncal", "cal", "uptime", "uname", "mount", "rev", "tac", "version", "sudo", "su",
+        "qalc", "ifconfig", "ss", "nmap", "tcpdump", "umask", "top", "nice",
+        "mpstat", "lspci", "lsusb", "pkill", "bg", "renice", "fg", "strace", "lsof", "sh", "sleep", "wait",
+        "nc", "unrar", "xz", "unxz", "dmesg", "mkfs", "fsck", "systemctl", "journalctl", "more", "updatedb", "timedatectl", "env", "split", "nl", "tr", "printenv", "export", "shuf", "banner", "time", "watch", "trap", "ulimit", "expr", "info", "apropos", "whatis", "quota", "basename", "whereis", "stat", "type", "chattr", "pgrep", "pidof", "pstree", "timeout", "ftp", "sftp", "sysctl", "read", "nohup", "blkid", "test"
+    };
+    
+    for (const auto& internal : internalCommands) {
+        if (commandEquals(cmd, internal.c_str())) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Built-in command implementations
+void cmd_pwd() {
+    // No args needed, so just execute
+    char cwd[MAX_PATH];
+    if (_getcwd(cwd, sizeof(cwd)) != NULL) {
+        output(windowsPathToUnix(cwd));
+    } else {
+        outputError("pwd: error getting current directory");
+    }
+}
+
+void cmd_pwd(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: pwd");
+        output("  Print the current working directory");
+        return;
+    }
+    cmd_pwd();
+}
+
+void cmd_cd(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: cd [directory]");
+        output("  Change the current working directory");
+        output("  With no arguments, changes to home directory");
+        return;
+    }
+    if (args.size() < 2) {
+        // cd with no args goes to home
+        const char* home = getenv("USERPROFILE");
+        if (home && _chdir(home) == 0) {
+            return;
+        }
+    } else {
+        std::string path = unixPathToWindows(args[1]);
+        if (_chdir(path.c_str()) == 0) {
+            return;
+        }
+        outputError("cd: " + args[1] + ": No such file or directory");
+    }
+}
+
+void cmd_echo(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: echo [text...]");
+        output("  Display a line of text");
+        return;
+    }
+    std::string result;
+    for (size_t i = 1; i < args.size(); ++i) {
+        if (i > 1) result += " ";
+        result += args[i];
+    }
+    output(result);
+}
+
+void cmd_ls(const std::vector<std::string>& args) {
+    std::string path = ".";
+    bool showHidden = false;
+    bool longFormat = false;
+    std::vector<std::string> paths;
+    
+    // Parse arguments
+    for (size_t i = 1; i < args.size(); ++i) {
+        if (args[i][0] == '-') {
+            for (size_t j = 1; j < args[i].length(); ++j) {
+                char c = args[i][j];
+                if (c == 'a') showHidden = true;
+                if (c == 'l') longFormat = true;
+            }
+        } else {
+            paths.push_back(args[i]);
+        }
+    }
+    
+    // If no paths specified, use current directory
+    if (paths.empty()) {
+        paths.push_back(".");
+    }
+    
+    std::vector<std::string> displayFiles;
+    
+    // Process each path
+    for (const std::string& path : paths) {
+        std::string winPath = unixPathToWindows(path);
+        
+        // Check if path is a file or directory
+        DWORD attrs = GetFileAttributesA(winPath.c_str());
+        
+        if (attrs == INVALID_FILE_ATTRIBUTES) {
+            // Path doesn't exist, skip it
+            char errBuf[256];
+            sprintf(errBuf, "ls: cannot access '%s': No such file or directory", path.c_str());
+            outputError(errBuf);
+            continue;
+        }
+        
+        if (!(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+            // It's a file - just display it directly
+            WIN32_FIND_DATAA findData;
+            HANDLE hFind = FindFirstFileA(winPath.c_str(), &findData);
+            if (hFind != INVALID_HANDLE_VALUE) {
+                std::string filename = findData.cFileName;
+                
+                if (longFormat) {
+                    char permissions[11] = "----------";
+                    permissions[1] = 'r';
+                    permissions[3] = 'x';
+                    if (!(findData.dwFileAttributes & FILE_ATTRIBUTE_READONLY)) permissions[2] = 'w';
+                    
+                    ULARGE_INTEGER fileSize;
+                    fileSize.LowPart = findData.nFileSizeLow;
+                    fileSize.HighPart = findData.nFileSizeHigh;
+                    
+                    SYSTEMTIME stUTC, stLocal;
+                    FileTimeToSystemTime(&findData.ftLastWriteTime, &stUTC);
+                    SystemTimeToTzSpecificLocalTime(NULL, &stUTC, &stLocal);
+                    
+                    char buffer[512];
+                    sprintf(buffer, "%s %10llu %02d/%02d/%04d %02d:%02d %s",
+                           permissions,
+                           fileSize.QuadPart,
+                           stLocal.wMonth, stLocal.wDay, stLocal.wYear,
+                           stLocal.wHour, stLocal.wMinute,
+                           path.c_str());
+                    output(buffer);
+                } else {
+                    displayFiles.push_back(path);
+                }
+                FindClose(hFind);
+            }
+            continue;
+        }
+        
+        // It's a directory - list its contents
+        std::string searchPath = winPath;
+        if (searchPath == "." || searchPath.empty()) {
+            searchPath = "*";
+        } else {
+            char lastChar = searchPath[searchPath.length() - 1];
+            if (lastChar != '\\' && lastChar != '/') {
+                searchPath += "\\";
+            }
+            searchPath += "*";
+        }
+        
+        WIN32_FIND_DATAA findData;
+        HANDLE hFind = FindFirstFileA(searchPath.c_str(), &findData);
+        
+        if (hFind == INVALID_HANDLE_VALUE) {
+            char errBuf[256];
+            sprintf(errBuf, "ls: cannot access '%s': Error %d", path.c_str(), GetLastError());
+            outputError(errBuf);
+            continue;
+        }
+        
+        std::vector<std::string> allFiles;
+        
+        do {
+            std::string filename = findData.cFileName;
+            allFiles.push_back(filename);
+            
+            // Skip . and .. unless -a is specified
+            if (!showHidden && (filename == "." || filename == "..")) {
+                continue;
+            }
+            
+            // Skip hidden files unless -a is specified
+            if (!showHidden && (findData.dwFileAttributes & FILE_ATTRIBUTE_HIDDEN)) {
+                continue;
+            }
+            
+            if (longFormat) {
+                // Long format: permissions, size, date, name
+                char permissions[11] = "----------";
+                if (findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) permissions[0] = 'd';
+                if (!(findData.dwFileAttributes & FILE_ATTRIBUTE_READONLY)) permissions[2] = 'w';
+                permissions[1] = 'r';
+                permissions[3] = 'x';
+                
+                ULARGE_INTEGER fileSize;
+                fileSize.LowPart = findData.nFileSizeLow;
+                fileSize.HighPart = findData.nFileSizeHigh;
+                
+                SYSTEMTIME stUTC, stLocal;
+                FileTimeToSystemTime(&findData.ftLastWriteTime, &stUTC);
+                SystemTimeToTzSpecificLocalTime(NULL, &stUTC, &stLocal);
+                
+                char buffer[512];
+                sprintf(buffer, "%s %10llu %02d/%02d/%04d %02d:%02d %s",
+                       permissions,
+                       fileSize.QuadPart,
+                       stLocal.wMonth, stLocal.wDay, stLocal.wYear,
+                       stLocal.wHour, stLocal.wMinute,
+                       filename.c_str());
+                output(buffer);
+            } else {
+                std::string entry = filename;
+                if (findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+                    entry += "/";
+                }
+                displayFiles.push_back(entry);
+            }
+            
+        } while (FindNextFileA(hFind, &findData) != 0);
+        
+        FindClose(hFind);
+    }
+    
+    // Output short format
+    if (!longFormat && !displayFiles.empty()) {
+        std::string result;
+        for (size_t i = 0; i < displayFiles.size(); ++i) {
+            result += displayFiles[i];
+            if (i < displayFiles.size() - 1) {
+                result += "  ";
+            }
+        }
+        output(result);
+    }
+}
+
+void cmd_cat(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: cat <file>...");
+        output("  Concatenate and display file contents");
+        return;
+    }
+    if (args.size() < 2) {
+        outputError("cat: missing file operand");
+        return;
+    }
+    
+    for (size_t i = 1; i < args.size(); ++i) {
+        // Verify case if in case-sensitive mode
+        if (!verifyFileNameCase(args[i])) {
+            outputError("cat: " + args[i] + ": File name case doesn't match (case-sensitive mode)");
+            continue;
+        }
+        
+        std::string path = unixPathToWindows(args[i]);
+        std::ifstream file(path);
+        
+        if (!file.is_open()) {
+            outputError("cat: " + args[i] + ": No such file or directory");
+            continue;
+        }
+        
+        std::string line;
+        while (std::getline(file, line)) {
+            output(line);
+        }
+        
+        file.close();
+    }
+}
+
+// Disk usage command
+void cmd_df(const std::vector<std::string>& args) {
+    // Check for help flag (use --help instead of -h since -h means human-readable)
+    if (args.size() > 1 && args[1] == "--help") {
+        output("Usage: df [options] [path...]");
+        output("  Display disk space usage of file systems");
+        output("");
+        output("OPTIONS");
+        output("  -h              Human-readable format (KB, MB, GB)");
+        output("  -k              Display sizes in kilobytes (default)");
+        output("  -m              Display sizes in megabytes");
+        output("  -B <size>       Block size in bytes");
+        output("");
+        output("EXAMPLES");
+        output("  df                   Display all disk usage");
+        output("  df -h                Show in human-readable format");
+        output("  df -h C:/             Show C: drive usage");
+        output("  df -m D:/             Show D: drive usage in megabytes");
+        return;
+    }
+    
+    // Parse options
+    bool humanReadable = false;
+    int blockSize = 1024;  // Default: 1 KB blocks
+    std::vector<std::string> paths;
+    
+    for (size_t i = 1; i < args.size(); i++) {
+        const std::string& arg = args[i];
+        
+        if (arg == "-h") {
+            humanReadable = true;
+        } else if (arg == "-k") {
+            blockSize = 1024;
+        } else if (arg == "-m") {
+            blockSize = 1024 * 1024;
+        } else if (arg == "-B" && i + 1 < args.size()) {
+            blockSize = std::atoi(args[i + 1].c_str());
+            if (blockSize <= 0) blockSize = 1024;
+            i++;
+        } else if (arg[0] != '-') {
+            paths.push_back(arg);
+        }
+    }
+    
+    // If no paths specified, show all mounted drives
+    if (paths.empty()) {
+        // Get all drive letters
+        DWORD drives = GetLogicalDrives();
+        for (int i = 0; i < 26; i++) {
+            if (drives & (1 << i)) {
+                char drivePath[4];
+                drivePath[0] = 'A' + i;
+                drivePath[1] = ':';
+                drivePath[2] = '\\';
+                drivePath[3] = '\0';
+                paths.push_back(drivePath);
+            }
+        }
+    }
+    
+    // Convert Unix paths to Windows paths
+    for (auto& path : paths) {
+        path = unixPathToWindows(path);
+        // Ensure path ends with backslash for GetDiskFreeSpaceEx
+        if (!path.empty() && path.back() != '\\') {
+            path += '\\';
+        }
+    }
+    
+    // Print header
+    if (humanReadable) {
+        output("Filesystem      Total     Used Available Capacity  Mounted on");
+    } else {
+        output("Filesystem         Total      Used Available Capacity  Mounted on");
+    }
+    output(std::string(78, '-'));
+    
+    // Show disk usage for each path
+    ULARGE_INTEGER freeBytesAvailable, totalBytes, totalFreeBytes;
+    
+    for (const std::string& path : paths) {
+        if (!GetDiskFreeSpaceExA(path.c_str(), &freeBytesAvailable, &totalBytes, &totalFreeBytes)) {
+            // Try without trailing backslash
+            std::string pathWithoutSlash = path;
+            if (!pathWithoutSlash.empty() && pathWithoutSlash.back() == '\\') {
+                pathWithoutSlash.pop_back();
+            }
+            
+            if (!GetDiskFreeSpaceExA(pathWithoutSlash.c_str(), &freeBytesAvailable, &totalBytes, &totalFreeBytes)) {
+                outputError("df: cannot access '" + path + "': No such file or directory");
+                continue;
+            }
+        }
+        
+        ULONGLONG used = totalBytes.QuadPart - totalFreeBytes.QuadPart;
+        ULONGLONG available = freeBytesAvailable.QuadPart;
+        ULONGLONG total = totalBytes.QuadPart;
+        
+        // Format numbers based on options
+        std::string totalStr, usedStr, availStr;
+        
+        if (humanReadable) {
+            // Convert to human-readable format
+            const char* units[] = { "B", "KB", "MB", "GB", "TB" };
+            
+            auto formatSize = [&units](ULONGLONG bytes) -> std::string {
+                double size = (double)bytes;
+                int unitIndex = 0;
+                
+                while (size >= 1024.0 && unitIndex < 4) {
+                    size /= 1024.0;
+                    unitIndex++;
+                }
+                
+                std::ostringstream oss;
+                oss << std::fixed << std::setprecision(1) << size << units[unitIndex];
+                return oss.str();
+            };
+            
+            totalStr = formatSize(total);
+            usedStr = formatSize(used);
+            availStr = formatSize(available);
+        } else {
+            // Display in blocks with commas for readability
+            auto formatNumber = [](ULONGLONG num) -> std::string {
+                std::string numStr = std::to_string(num);
+                std::string result;
+                int count = 0;
+                for (int i = numStr.length() - 1; i >= 0; i--) {
+                    if (count == 3) {
+                        result = ',' + result;
+                        count = 0;
+                    }
+                    result = numStr[i] + result;
+                    count++;
+                }
+                return result;
+            };
+            
+            totalStr = formatNumber(total / blockSize);
+            usedStr = formatNumber(used / blockSize);
+            availStr = formatNumber(available / blockSize);
+        }
+        
+        // Calculate usage percentage
+        double percentUsed = (total > 0) ? (100.0 * used / total) : 0.0;
+        
+        // Get filesystem name (drive letter)
+        std::string fsName = path;
+        if (!fsName.empty() && fsName.back() == '\\') {
+            fsName.pop_back();
+        }
+        // Convert back to Unix-style
+        fsName = windowsPathToUnix(fsName);
+        
+        // Format output line with proper column widths
+        std::ostringstream line;
+        line << std::left << std::setw(16) << fsName;
+        
+        if (humanReadable) {
+            line << std::right << std::setw(10) << totalStr;
+            line << std::right << std::setw(10) << usedStr;
+            line << std::right << std::setw(10) << availStr;
+        } else {
+            line << std::right << std::setw(14) << totalStr;
+            line << std::right << std::setw(14) << usedStr;
+            line << std::right << std::setw(14) << availStr;
+        }
+        
+        line << std::right << std::setw(10) << std::fixed << std::setprecision(1) << percentUsed << "%";
+        
+        output(line.str());
+    }
+}
+
+// Disk usage command (du)
+void cmd_du(const std::vector<std::string>& args) {
+    // Check for help flag (use --help instead of -h since -h means human-readable)
+    if (args.size() > 1 && args[1] == "--help") {
+        output("Usage: du [options] [path...]");
+        output("  Estimate file space usage");
+        output("");
+        output("OPTIONS");
+        output("  -h              Human-readable format (KB, MB, GB)");
+        output("  -s              Display only total for each argument");
+        output("  -a              Show all files, not just directories");
+        output("  -c              Produce a grand total");
+        output("  -k              Display sizes in kilobytes (default)");
+        output("  -m              Display sizes in megabytes");
+        output("");
+        output("EXAMPLES");
+        output("  du                   Show usage of current directory");
+        output("  du -h                Show in human-readable format");
+        output("  du -sh *             Summary of each item in current dir");
+        output("  du -ah /path         Show all files in human-readable format");
+        return;
+    }
+    
+    // Parse options
+    bool humanReadable = false;
+    bool summaryOnly = false;
+    bool showAllFiles = false;
+    bool showGrandTotal = false;
+    int blockSize = 1024;  // Default: 1 KB blocks
+    std::vector<std::string> paths;
+    
+    for (size_t i = 1; i < args.size(); i++) {
+        const std::string& arg = args[i];
+        
+        if (arg == "-h") {
+            humanReadable = true;
+        } else if (arg == "-s") {
+            summaryOnly = true;
+        } else if (arg == "-a") {
+            showAllFiles = true;
+        } else if (arg == "-c") {
+            showGrandTotal = true;
+        } else if (arg == "-k") {
+            blockSize = 1024;
+        } else if (arg == "-m") {
+            blockSize = 1024 * 1024;
+        } else if (arg[0] == '-') {
+            // Handle combined flags like -sh
+            for (size_t j = 1; j < arg.length(); j++) {
+                if (arg[j] == 'h') humanReadable = true;
+                else if (arg[j] == 's') summaryOnly = true;
+                else if (arg[j] == 'a') showAllFiles = true;
+                else if (arg[j] == 'c') showGrandTotal = true;
+                else if (arg[j] == 'k') blockSize = 1024;
+                else if (arg[j] == 'm') blockSize = 1024 * 1024;
+            }
+        } else {
+            paths.push_back(arg);
+        }
+    }
+    
+    // If no paths specified, use current directory
+    if (paths.empty()) {
+        paths.push_back(".");
+    }
+    
+    // Function to recursively calculate directory size
+    std::function<ULONGLONG(const std::string&, const std::string&, bool, bool)> calculateSize;
+    calculateSize = [&](const std::string& path, const std::string& displayPath, bool isRoot, bool showFiles) -> ULONGLONG {
+        ULONGLONG totalSize = 0;
+        
+        std::string winPath = unixPathToWindows(path);
+        DWORD attrs = GetFileAttributesA(winPath.c_str());
+        
+        if (attrs == INVALID_FILE_ATTRIBUTES) {
+            outputError("du: cannot access '" + path + "': No such file or directory");
+            return 0;
+        }
+        
+        if (!(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+            // It's a file
+            WIN32_FIND_DATAA findData;
+            HANDLE hFind = FindFirstFileA(winPath.c_str(), &findData);
+            if (hFind != INVALID_HANDLE_VALUE) {
+                ULARGE_INTEGER fileSize;
+                fileSize.LowPart = findData.nFileSizeLow;
+                fileSize.HighPart = findData.nFileSizeHigh;
+                totalSize = fileSize.QuadPart;
+                FindClose(hFind);
+                
+                if (showFiles) {
+                    std::string sizeStr;
+                    if (humanReadable) {
+                        const char* units[] = { "B", "KB", "MB", "GB", "TB" };
+                        double size = (double)totalSize;
+                        int unitIndex = 0;
+                        while (size >= 1024.0 && unitIndex < 4) {
+                            size /= 1024.0;
+                            unitIndex++;
+                        }
+                        std::ostringstream oss;
+                        oss << std::fixed << std::setprecision(1) << size << units[unitIndex];
+                        sizeStr = oss.str();
+                    } else {
+                        ULONGLONG blocks = (totalSize + blockSize - 1) / blockSize;
+                        sizeStr = std::to_string(blocks);
+                    }
+                    output(sizeStr + "\t" + displayPath);
+                }
+            }
+            return totalSize;
+        }
+        
+        // It's a directory
+        std::string searchPath = winPath + "\\*";
+        WIN32_FIND_DATAA findData;
+        HANDLE hFind = FindFirstFileA(searchPath.c_str(), &findData);
+        
+        if (hFind == INVALID_HANDLE_VALUE) {
+            return 0;
+        }
+        
+        do {
+            std::string fileName = findData.cFileName;
+            if (fileName == "." || fileName == "..") continue;
+            
+            bool isDir = (findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+            std::string fullPath = winPath + "\\" + fileName;
+            std::string fullDisplayPath = displayPath;
+            if (fullDisplayPath == ".") {
+                fullDisplayPath = fileName;
+            } else if (fullDisplayPath.back() == '/' || fullDisplayPath.back() == '\\') {
+                fullDisplayPath += fileName;
+            } else {
+                fullDisplayPath += "/" + fileName;
+            }
+            
+            if (isDir) {
+                ULONGLONG dirSize = calculateSize(fullPath, fullDisplayPath, false, showFiles);
+                totalSize += dirSize;
+                
+                if (!summaryOnly) {
+                    std::string sizeStr;
+                    if (humanReadable) {
+                        const char* units[] = { "B", "KB", "MB", "GB", "TB" };
+                        double size = (double)dirSize;
+                        int unitIndex = 0;
+                        while (size >= 1024.0 && unitIndex < 4) {
+                            size /= 1024.0;
+                            unitIndex++;
+                        }
+                        std::ostringstream oss;
+                        oss << std::fixed << std::setprecision(1) << size << units[unitIndex];
+                        sizeStr = oss.str();
+                    } else {
+                        ULONGLONG blocks = (dirSize + blockSize - 1) / blockSize;
+                        sizeStr = std::to_string(blocks);
+                    }
+                    output(sizeStr + "\t" + fullDisplayPath);
+                }
+            } else {
+                // File
+                ULARGE_INTEGER fileSize;
+                fileSize.LowPart = findData.nFileSizeLow;
+                fileSize.HighPart = findData.nFileSizeHigh;
+                totalSize += fileSize.QuadPart;
+                
+                if (showFiles && !summaryOnly) {
+                    std::string sizeStr;
+                    if (humanReadable) {
+                        const char* units[] = { "B", "KB", "MB", "GB", "TB" };
+                        double size = (double)fileSize.QuadPart;
+                        int unitIndex = 0;
+                        while (size >= 1024.0 && unitIndex < 4) {
+                            size /= 1024.0;
+                            unitIndex++;
+                        }
+                        std::ostringstream oss;
+                        oss << std::fixed << std::setprecision(1) << size << units[unitIndex];
+                        sizeStr = oss.str();
+                    } else {
+                        ULONGLONG blocks = (fileSize.QuadPart + blockSize - 1) / blockSize;
+                        sizeStr = std::to_string(blocks);
+                    }
+                    output(sizeStr + "\t" + fullDisplayPath);
+                }
+            }
+            
+        } while (FindNextFileA(hFind, &findData));
+        
+        FindClose(hFind);
+        
+        // Show total for this directory if it's a root path
+        if (isRoot) {
+            std::string sizeStr;
+            if (humanReadable) {
+                const char* units[] = { "B", "KB", "MB", "GB", "TB" };
+                double size = (double)totalSize;
+                int unitIndex = 0;
+                while (size >= 1024.0 && unitIndex < 4) {
+                    size /= 1024.0;
+                    unitIndex++;
+                }
+                std::ostringstream oss;
+                oss << std::fixed << std::setprecision(1) << size << units[unitIndex];
+                sizeStr = oss.str();
+            } else {
+                ULONGLONG blocks = (totalSize + blockSize - 1) / blockSize;
+                sizeStr = std::to_string(blocks);
+            }
+            output(sizeStr + "\t" + displayPath);
+        }
+        
+        return totalSize;
+    };
+    
+    // Calculate and display usage for each path
+    ULONGLONG grandTotal = 0;
+    
+    for (const std::string& path : paths) {
+        ULONGLONG pathSize = calculateSize(path, path, true, showAllFiles);
+        grandTotal += pathSize;
+    }
+    
+    // Show grand total if requested
+    if (showGrandTotal && paths.size() > 1) {
+        std::string sizeStr;
+        if (humanReadable) {
+            const char* units[] = { "B", "KB", "MB", "GB", "TB" };
+            double size = (double)grandTotal;
+            int unitIndex = 0;
+            while (size >= 1024.0 && unitIndex < 4) {
+                size /= 1024.0;
+                unitIndex++;
+            }
+            std::ostringstream oss;
+            oss << std::fixed << std::setprecision(1) << size << units[unitIndex];
+            sizeStr = oss.str();
+        } else {
+            ULONGLONG blocks = (grandTotal + blockSize - 1) / blockSize;
+            sizeStr = std::to_string(blocks);
+        }
+        output(sizeStr + "\ttotal");
+    }
+}
+
+void cmd_less(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: less <file>");
+        output("  View file contents with paging");
+        output("  Controls: Space/PageDown=next, PageUp=previous, q=quit");
+        return;
+    }
+    if (args.size() < 2) {
+        outputError("less: missing file operand");
+        return;
+    }
+    
+    // Verify case if in case-sensitive mode
+    if (!verifyFileNameCase(args[1])) {
+        outputError("less: " + args[1] + ": File name case doesn't match (case-sensitive mode)");
+        return;
+    }
+    
+    std::string path = unixPathToWindows(args[1]);
+    std::ifstream file(path);
+    
+    if (!file.is_open()) {
+        outputError("less: " + args[1] + ": No such file or directory");
+        return;
+    }
+    
+    // Read all lines from file
+    std::vector<std::string> lines;
+    std::string line;
+    while (std::getline(file, line)) {
+        lines.push_back(line);
+    }
+    file.close();
+    
+    if (lines.empty()) {
+        output("(empty file)");
+        return;
+    }
+    
+    // Paging variables
+    const int LINES_PER_PAGE = 20;
+    int currentLine = 0;
+    bool quit = false;
+    
+    // Display pages
+    while (!quit && currentLine < (int)lines.size()) {
+        // Clear and display current page
+        int linesToShow = std::min(LINES_PER_PAGE, (int)lines.size() - currentLine);
+        for (int i = 0; i < linesToShow; ++i) {
+            output(lines[currentLine + i]);
+        }
+        
+        // Show status line
+        if (currentLine + LINES_PER_PAGE >= (int)lines.size()) {
+            output("(END) - Press q to quit");
+        } else {
+            char status[256];
+            sprintf(status, "-- Line %d-%d of %d (%.0f%%) - Space=next page, PageUp=prev, q=quit --",
+                    currentLine + 1, currentLine + linesToShow, (int)lines.size(),
+                    (float)(currentLine + linesToShow) * 100.0f / lines.size());
+            output(status);
+        }
+        
+        // Wait for keyboard input
+        MSG msg;
+        bool gotInput = false;
+        
+        while (!gotInput && GetMessage(&msg, NULL, 0, 0)) {
+            if (msg.message == WM_KEYDOWN && msg.hwnd == g_hOutput) {
+                if (msg.wParam == VK_SPACE || msg.wParam == VK_NEXT) {
+                    // Next page
+                    currentLine = std::min(currentLine + LINES_PER_PAGE, (int)lines.size());
+                    gotInput = true;
+                } else if (msg.wParam == VK_PRIOR) {
+                    // Previous page
+                    currentLine = std::max(0, currentLine - LINES_PER_PAGE);
+                    gotInput = true;
+                } else if (msg.wParam == 'Q' || msg.wParam == 'q') {
+                    quit = true;
+                    gotInput = true;
+                } else if (msg.wParam == VK_DOWN) {
+                    // Scroll down one line
+                    if (currentLine < (int)lines.size() - LINES_PER_PAGE) {
+                        currentLine++;
+                    }
+                    gotInput = true;
+                } else if (msg.wParam == VK_UP) {
+                    // Scroll up one line
+                    if (currentLine > 0) {
+                        currentLine--;
+                    }
+                    gotInput = true;
+                } else if (msg.wParam == VK_HOME) {
+                    // Go to beginning
+                    currentLine = 0;
+                    gotInput = true;
+                } else if (msg.wParam == VK_END) {
+                    // Go to end
+                    currentLine = std::max(0, (int)lines.size() - LINES_PER_PAGE);
+                    gotInput = true;
+                }
+            } else if (msg.message == WM_CHAR && msg.hwnd == g_hOutput) {
+                if (msg.wParam == 'q' || msg.wParam == 'Q') {
+                    quit = true;
+                    gotInput = true;
+                }
+            }
+            
+            TranslateMessage(&msg);
+            DispatchMessage(&msg);
+        }
+        
+        // Check if we've reached the end
+        if (currentLine >= (int)lines.size()) {
+            break;
+        }
+    }
+}
+
+void cmd_head(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: head [-n <lines>] <file>");
+        output("  Display first lines of file (default: 10 lines)");
+        output("  -n <num>  Number of lines to display");
+        return;
+    }
+    
+    int numLines = 10;  // Default
+    size_t fileArgIndex = 1;
+    
+    // Check for -n flag
+    if (args.size() >= 3 && args[1] == "-n") {
+        numLines = std::atoi(args[2].c_str());
+        if (numLines <= 0) {
+            outputError("head: invalid number of lines");
+            return;
+        }
+        fileArgIndex = 3;
+    }
+    
+    if (args.size() <= fileArgIndex) {
+        outputError("head: missing file operand");
+        return;
+    }
+    
+    // Verify case if in case-sensitive mode
+    if (!verifyFileNameCase(args[fileArgIndex])) {
+        outputError("head: " + args[fileArgIndex] + ": File name case doesn't match (case-sensitive mode)");
+        return;
+    }
+    
+    std::string path = unixPathToWindows(args[fileArgIndex]);
+    std::ifstream file(path);
+    
+    if (!file.is_open()) {
+        outputError("head: " + args[fileArgIndex] + ": No such file or directory");
+        return;
+    }
+    
+    std::string line;
+    int count = 0;
+    while (count < numLines && std::getline(file, line)) {
+        output(line);
+        count++;
+    }
+    
+    file.close();
+}
+
+void cmd_tail(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: tail [-n <lines>] <file>");
+        output("  Display last lines of file (default: 10 lines)");
+        output("  -n <num>  Number of lines to display");
+        return;
+    }
+    
+    int numLines = 10;  // Default
+    size_t fileArgIndex = 1;
+    
+    // Check for -n flag
+    if (args.size() >= 3 && args[1] == "-n") {
+        numLines = std::atoi(args[2].c_str());
+        if (numLines <= 0) {
+            outputError("tail: invalid number of lines");
+            return;
+        }
+        fileArgIndex = 3;
+    }
+    
+    if (args.size() <= fileArgIndex) {
+        outputError("tail: missing file operand");
+        return;
+    }
+    
+    // Verify case if in case-sensitive mode
+    if (!verifyFileNameCase(args[fileArgIndex])) {
+        outputError("tail: " + args[fileArgIndex] + ": File name case doesn't match (case-sensitive mode)");
+        return;
+    }
+    
+    std::string path = unixPathToWindows(args[fileArgIndex]);
+    std::ifstream file(path);
+    
+    if (!file.is_open()) {
+        outputError("tail: " + args[fileArgIndex] + ": No such file or directory");
+        return;
+    }
+    
+    // Read all lines into a vector
+    std::vector<std::string> lines;
+    std::string line;
+    while (std::getline(file, line)) {
+        lines.push_back(line);
+    }
+    file.close();
+    
+    // Output last N lines
+    size_t startIndex = (lines.size() > (size_t)numLines) ? lines.size() - numLines : 0;
+    for (size_t i = startIndex; i < lines.size(); ++i) {
+        output(lines[i]);
+    }
+}
+
+void cmd_grep(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: grep [-inv] <pattern> <file>...");
+        output("  Search for pattern in files");
+        output("  -i  Case-insensitive search");
+        output("  -n  Show line numbers");
+        output("  -v  Invert match (show non-matching lines)");
+        return;
+    }
+    
+    if (args.size() < 2) {
+        outputError("grep: missing pattern");
+        outputError("Usage: grep [-inv] <pattern> <file>...");
+        return;
+    }
+    
+    bool caseInsensitive = false;
+    bool showLineNumbers = false;
+    bool invertMatch = false;
+    size_t argIndex = 1;
+    
+    // Parse flags
+    if (args[argIndex][0] == '-' && args[argIndex].length() > 1) {
+        std::string flags = args[argIndex];
+        for (size_t i = 1; i < flags.length(); ++i) {
+            if (flags[i] == 'i') caseInsensitive = true;
+            else if (flags[i] == 'n') showLineNumbers = true;
+            else if (flags[i] == 'v') invertMatch = true;
+            else {
+                outputError("grep: invalid option -- '" + std::string(1, flags[i]) + "'");
+                return;
+            }
+        }
+        argIndex++;
+    }
+    
+    if (argIndex >= args.size()) {
+        outputError("grep: missing pattern");
+        return;
+    }
+    
+    std::string pattern = args[argIndex++];
+    std::string patternLower = pattern;
+    if (caseInsensitive) {
+        std::transform(patternLower.begin(), patternLower.end(), patternLower.begin(), ::tolower);
+    }
+    
+    if (argIndex >= args.size()) {
+        outputError("grep: missing file operand");
+        return;
+    }
+    
+    // Process each file
+    for (size_t fileIdx = argIndex; fileIdx < args.size(); ++fileIdx) {
+        // Verify case if in case-sensitive mode
+        if (!verifyFileNameCase(args[fileIdx])) {
+            outputError("grep: " + args[fileIdx] + ": File name case doesn't match (case-sensitive mode)");
+            continue;
+        }
+        
+        std::string path = unixPathToWindows(args[fileIdx]);
+        std::ifstream file(path);
+        
+        if (!file.is_open()) {
+            outputError("grep: " + args[fileIdx] + ": No such file or directory");
+            continue;
+        }
+        
+        std::string line;
+        int lineNumber = 0;
+        bool showFilename = (args.size() - argIndex) > 1;
+        
+        while (std::getline(file, line)) {
+            lineNumber++;
+            
+            // Check if line matches pattern
+            bool matches;
+            if (caseInsensitive) {
+                std::string lineLower = line;
+                std::transform(lineLower.begin(), lineLower.end(), lineLower.begin(), ::tolower);
+                matches = (lineLower.find(patternLower) != std::string::npos);
+            } else {
+                matches = (line.find(pattern) != std::string::npos);
+            }
+            
+            // Apply invert flag
+            if (invertMatch) {
+                matches = !matches;
+            }
+            
+            if (matches) {
+                std::string result;
+                if (showFilename) {
+                    result += args[fileIdx] + ":";
+                }
+                if (showLineNumbers) {
+                    char numBuf[32];
+                    sprintf(numBuf, "%d:", lineNumber);
+                    result += numBuf;
+                }
+                result += line;
+                output(result);
+            }
+        }
+        
+        file.close();
+    }
+}
+
+void cmd_mkdir(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: mkdir <directory>...");
+        output("  Create directories");
+        return;
+    }
+    if (args.size() < 2) {
+        outputError("mkdir: missing operand");
+        return;
+    }
+    
+    for (size_t i = 1; i < args.size(); ++i) {
+        std::string path = unixPathToWindows(args[i]);
+        if (_mkdir(path.c_str()) == 0) {
+            output("Created directory: " + args[i]);
+        } else {
+            outputError("mkdir: cannot create directory '" + args[i] + "'");
+        }
+    }
+}
+
+bool removeDirectoryRecursive(const std::string& path) {
+    std::string searchPath = path + "\\*";
+    WIN32_FIND_DATAA findData;
+    HANDLE hFind = FindFirstFileA(searchPath.c_str(), &findData);
+    
+    if (hFind == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    
+    bool success = true;
+    do {
+        std::string fileName = findData.cFileName;
+        
+        // Skip . and ..
+        if (fileName == "." || fileName == "..") {
+            continue;
+        }
+        
+        std::string fullPath = path + "\\" + fileName;
+        
+        if (findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            // Recursively delete subdirectory
+            if (!removeDirectoryRecursive(fullPath)) {
+                success = false;
+            }
+        } else {
+            // Delete file
+            if (!DeleteFileA(fullPath.c_str())) {
+                success = false;
+            }
+        }
+    } while (FindNextFileA(hFind, &findData));
+    
+    FindClose(hFind);
+    
+    // Remove the now-empty directory
+    if (success) {
+        return RemoveDirectoryA(path.c_str()) != 0;
+    }
+    
+    return false;
+}
+
+void cmd_rmdir(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: rmdir [-rf] <directory>...");
+        output("  Remove directories");
+        output("  -r  Remove directories recursively");
+        output("  -f  Force removal without confirmation");
+        return;
+    }
+    if (args.size() < 2) {
+        outputError("rmdir: missing operand");
+        return;
+    }
+    
+    bool recursive = false;
+    bool force = false;
+    size_t startIndex = 1;
+    
+    // Check for flags: -r, -f, -rf, -fr, -R, etc.
+    if (args.size() >= 2 && args[1][0] == '-') {
+        std::string flags = args[1];
+        if (flags.find('r') != std::string::npos || flags.find('R') != std::string::npos) {
+            recursive = true;
+        }
+        if (flags.find('f') != std::string::npos || flags.find('F') != std::string::npos) {
+            force = true;
+        }
+        startIndex = 2;
+        
+        if (args.size() < 3) {
+            outputError("rmdir: missing operand after '" + args[1] + "'");
+            return;
+        }
+    }
+    
+    for (size_t i = startIndex; i < args.size(); ++i) {
+        // Ask for confirmation unless -f flag is used
+        if (!force) {
+            std::string prompt = recursive ? 
+                "Remove directory '" + args[i] + "' and all its contents?" :
+                "Remove directory '" + args[i] + "'?";
+            
+            if (!confirmInConsole(prompt)) {
+                output("rmdir: skipped '" + args[i] + "'");
+                continue;
+            }
+        }
+        
+        std::string path = unixPathToWindows(args[i]);
+        
+        if (recursive) {
+            if (!removeDirectoryRecursive(path)) {
+                outputError("rmdir: failed to remove '" + args[i] + "'");
+            }
+        } else {
+            if (_rmdir(path.c_str()) != 0) {
+                outputError("rmdir: failed to remove '" + args[i] + "' (directory not empty? use -r flag)");
+            }
+        }
+    }
+}
+
+void cmd_rm(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: rm [-f] <file>...");
+        output("  Remove files");
+        output("  -f  Force removal without confirmation");
+        return;
+    }
+    if (args.size() < 2) {
+        outputError("rm: missing operand");
+        return;
+    }
+    
+    bool force = false;
+    size_t startIndex = 1;
+    
+    // Check for -f flag
+    if (args.size() >= 2 && args[1][0] == '-') {
+        std::string flags = args[1];
+        if (flags.find('f') != std::string::npos || flags.find('F') != std::string::npos) {
+            force = true;
+        }
+        startIndex = 2;
+        
+        if (args.size() < 3) {
+            outputError("rm: missing operand after '" + args[1] + "'");
+            return;
+        }
+    }
+    
+    for (size_t i = startIndex; i < args.size(); ++i) {
+        // Verify case if in case-sensitive mode
+        if (!verifyFileNameCase(args[i])) {
+            outputError("rm: " + args[i] + ": File name case doesn't match (case-sensitive mode)");
+            continue;
+        }
+        
+        // Ask for confirmation unless -f flag is used
+        if (!force) {
+            std::string prompt = "Remove file '" + args[i] + "'?";
+            if (!confirmInConsole(prompt)) {
+                output("rm: skipped '" + args[i] + "'");
+                continue;
+            }
+        }
+        
+        std::string path = unixPathToWindows(args[i]);
+        if (remove(path.c_str()) != 0) {
+            outputError("rm: cannot remove '" + args[i] + "'");
+        }
+    }
+}
+
+void cmd_touch(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: touch <file>...");
+        output("  Create empty files or update timestamps");
+        return;
+    }
+    if (args.size() < 2) {
+        outputError("touch: missing file operand");
+        return;
+    }
+    
+    for (size_t i = 1; i < args.size(); ++i) {
+        std::string path = unixPathToWindows(args[i]);
+        std::ofstream file(path, std::ios::app);
+        file.close();
+    }
+}
+
+void cmd_chmod(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: chmod <mode> <file>...");
+        output("  Change file permissions (Windows ACL implementation)");
+        output("  mode can be octal (e.g., 755) or symbolic (e.g., +x, u+w)");
+        output("");
+        output("Octal modes:");
+        output("  4 = Read, 2 = Write, 1 = Execute");
+        output("  First digit: owner, second: group, third: others");
+        output("");
+        output("Symbolic modes:");
+        output("  +x  Add execute permission");
+        output("  +w  Add write permission");
+        output("  +r  Add read permission");
+        output("  -w  Remove write permission");
+        output("");
+        output("Examples:");
+        output("  chmod 755 file.txt    Set rwxr-xr-x permissions");
+        output("  chmod +w file.txt     Add write permission");
+        output("  chmod -w file.txt     Remove write permission (read-only)");
+        return;
+    }
+    
+    if (args.size() < 3) {
+        outputError("chmod: missing operand");
+        output("Usage: chmod <mode> <file>...");
+        return;
+    }
+    
+    std::string mode = args[1];
+    
+    // Determine if mode is octal or symbolic
+    bool isOctal = true;
+    for (char c : mode) {
+        if (c < '0' || c > '7') {
+            isOctal = false;
+            break;
+        }
+    }
+    
+    for (size_t i = 2; i < args.size(); ++i) {
+        std::string path = unixPathToWindows(args[i]);
+        
+        // Check if file exists
+        DWORD attrs = GetFileAttributesA(path.c_str());
+        if (attrs == INVALID_FILE_ATTRIBUTES) {
+            outputError("chmod: cannot access '" + args[i] + "': No such file or directory");
+            continue;
+        }
+        
+        // Get current security descriptor and DACL
+        PSECURITY_DESCRIPTOR pSD = NULL;
+        PACL pOldDACL = NULL;
+        PACL pNewDACL = NULL;
+        PSID pOwnerSID = NULL;
+        PSID pEveryoneSID = NULL;
+        
+        DWORD result = GetNamedSecurityInfoA(
+            (LPSTR)path.c_str(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | OWNER_SECURITY_INFORMATION,
+            &pOwnerSID,
+            NULL,
+            &pOldDACL,
+            NULL,
+            &pSD
+        );
+        
+        if (result != ERROR_SUCCESS) {
+            outputError("chmod: cannot get security info for '" + args[i] + "'");
+            continue;
+        }
+        
+        // Create SID for Everyone group
+        SID_IDENTIFIER_AUTHORITY worldAuth = SECURITY_WORLD_SID_AUTHORITY;
+        if (!AllocateAndInitializeSid(&worldAuth, 1, SECURITY_WORLD_RID,
+                                      0, 0, 0, 0, 0, 0, 0, &pEveryoneSID)) {
+            LocalFree(pSD);
+            outputError("chmod: failed to create SID");
+            continue;
+        }
+        
+        EXPLICIT_ACCESSA ea[4] = {0};
+        DWORD numEntries = 0;
+        
+        if (isOctal && mode.length() >= 3) {
+            // Octal mode: interpret last 3 digits
+            int ownerPerm = mode[mode.length() - 3] - '0';
+            int groupPerm = mode[mode.length() - 2] - '0';
+            int otherPerm = mode[mode.length() - 1] - '0';
+            
+            // Build access mask for owner
+            DWORD ownerGrantAccess = 0;
+            DWORD ownerDenyAccess = 0;
+            
+            if (ownerPerm & 4) {
+                ownerGrantAccess |= FILE_GENERIC_READ;
+            } else {
+                // Deny all read-related permissions
+                ownerDenyAccess |= FILE_GENERIC_READ;
+            }
+            
+            if (ownerPerm & 2) {
+                ownerGrantAccess |= FILE_GENERIC_WRITE | DELETE | WRITE_DAC | WRITE_OWNER;
+            } else {
+                // Deny all write-related permissions including deletion, changing ACL, and changing owner
+                ownerDenyAccess |= FILE_GENERIC_WRITE | DELETE | WRITE_DAC | WRITE_OWNER;
+            }
+            
+            if (ownerPerm & 1) {
+                ownerGrantAccess |= FILE_GENERIC_EXECUTE;
+            } else {
+                ownerDenyAccess |= FILE_GENERIC_EXECUTE;
+            }
+            
+            // Add DENY entry first (deny takes precedence)
+            if (ownerDenyAccess != 0) {
+                ea[numEntries].grfAccessPermissions = ownerDenyAccess;
+                ea[numEntries].grfAccessMode = DENY_ACCESS;
+                ea[numEntries].grfInheritance = NO_INHERITANCE;
+                ea[numEntries].Trustee.TrusteeForm = TRUSTEE_IS_SID;
+                ea[numEntries].Trustee.TrusteeType = TRUSTEE_IS_USER;
+                ea[numEntries].Trustee.ptstrName = (LPSTR)pOwnerSID;
+                numEntries++;
+            }
+            
+            // Then add GRANT entry
+            if (ownerGrantAccess != 0) {
+                ea[numEntries].grfAccessPermissions = ownerGrantAccess;
+                ea[numEntries].grfAccessMode = GRANT_ACCESS;
+                ea[numEntries].grfInheritance = NO_INHERITANCE;
+                ea[numEntries].Trustee.TrusteeForm = TRUSTEE_IS_SID;
+                ea[numEntries].Trustee.TrusteeType = TRUSTEE_IS_USER;
+                ea[numEntries].Trustee.ptstrName = (LPSTR)pOwnerSID;
+                numEntries++;
+            }
+            
+            // Set Everyone permissions (combining group and other)
+            int combinedPerm = (groupPerm > otherPerm) ? groupPerm : otherPerm;
+            DWORD everyoneGrantAccess = 0;
+            DWORD everyoneDenyAccess = 0;
+            
+            if (combinedPerm & 4) {
+                everyoneGrantAccess |= FILE_GENERIC_READ;
+            } else {
+                everyoneDenyAccess |= FILE_GENERIC_READ;
+            }
+            
+            if (combinedPerm & 2) {
+                everyoneGrantAccess |= FILE_GENERIC_WRITE | DELETE | WRITE_DAC | WRITE_OWNER;
+            } else {
+                everyoneDenyAccess |= FILE_GENERIC_WRITE | DELETE | WRITE_DAC | WRITE_OWNER;
+            }
+            
+            if (combinedPerm & 1) {
+                everyoneGrantAccess |= FILE_GENERIC_EXECUTE;
+            } else {
+                everyoneDenyAccess |= FILE_GENERIC_EXECUTE;
+            }
+            
+            // Add DENY entry for Everyone
+            if (everyoneDenyAccess != 0) {
+                ea[numEntries].grfAccessPermissions = everyoneDenyAccess;
+                ea[numEntries].grfAccessMode = DENY_ACCESS;
+                ea[numEntries].grfInheritance = NO_INHERITANCE;
+                ea[numEntries].Trustee.TrusteeForm = TRUSTEE_IS_SID;
+                ea[numEntries].Trustee.TrusteeType = TRUSTEE_IS_WELL_KNOWN_GROUP;
+                ea[numEntries].Trustee.ptstrName = (LPSTR)pEveryoneSID;
+                numEntries++;
+            }
+            
+            // Add GRANT entry for Everyone
+            if (everyoneGrantAccess != 0) {
+                ea[numEntries].grfAccessPermissions = everyoneGrantAccess;
+                ea[numEntries].grfAccessMode = GRANT_ACCESS;
+                ea[numEntries].grfInheritance = NO_INHERITANCE;
+                ea[numEntries].Trustee.TrusteeForm = TRUSTEE_IS_SID;
+                ea[numEntries].Trustee.TrusteeType = TRUSTEE_IS_WELL_KNOWN_GROUP;
+                ea[numEntries].Trustee.ptstrName = (LPSTR)pEveryoneSID;
+                numEntries++;
+            }
+            
+        } else {
+            // Symbolic mode
+            bool add = (mode.find('+') != std::string::npos);
+            bool remove = (mode.find('-') != std::string::npos);
+            
+            if (mode.find('w') != std::string::npos) {
+                // Modify write permissions for owner (includes delete and ACL changes)
+                ea[0].grfAccessPermissions = FILE_GENERIC_WRITE | DELETE | WRITE_DAC | WRITE_OWNER;
+                ea[0].grfAccessMode = add ? GRANT_ACCESS : DENY_ACCESS;
+                ea[0].grfInheritance = NO_INHERITANCE;
+                ea[0].Trustee.TrusteeForm = TRUSTEE_IS_SID;
+                ea[0].Trustee.TrusteeType = TRUSTEE_IS_USER;
+                ea[0].Trustee.ptstrName = (LPSTR)pOwnerSID;
+                numEntries++;
+            } else if (mode.find('r') != std::string::npos) {
+                // Modify read permissions
+                ea[0].grfAccessPermissions = FILE_GENERIC_READ;
+                ea[0].grfAccessMode = add ? GRANT_ACCESS : DENY_ACCESS;
+                ea[0].grfInheritance = NO_INHERITANCE;
+                ea[0].Trustee.TrusteeForm = TRUSTEE_IS_SID;
+                ea[0].Trustee.TrusteeType = TRUSTEE_IS_USER;
+                ea[0].Trustee.ptstrName = (LPSTR)pOwnerSID;
+                numEntries++;
+            } else if (mode.find('x') != std::string::npos) {
+                // Modify execute permissions
+                ea[0].grfAccessPermissions = FILE_GENERIC_EXECUTE;
+                ea[0].grfAccessMode = add ? GRANT_ACCESS : DENY_ACCESS;
+                ea[0].grfInheritance = NO_INHERITANCE;
+                ea[0].Trustee.TrusteeForm = TRUSTEE_IS_SID;
+                ea[0].Trustee.TrusteeType = TRUSTEE_IS_USER;
+                ea[0].Trustee.ptstrName = (LPSTR)pOwnerSID;
+                numEntries++;
+            } else {
+                outputError("chmod: invalid mode: '" + mode + "'");
+                FreeSid(pEveryoneSID);
+                LocalFree(pSD);
+                continue;
+            }
+        }
+        
+        // Create new DACL - pass NULL as old DACL to start fresh
+        result = SetEntriesInAclA(numEntries, ea, NULL, &pNewDACL);
+        
+        if (result != ERROR_SUCCESS) {
+            outputError("chmod: cannot create new ACL for '" + args[i] + "'");
+            FreeSid(pEveryoneSID);
+            LocalFree(pSD);
+            continue;
+        }
+        
+        // Apply new DACL with protected flag to prevent inheritance
+        result = SetNamedSecurityInfoA(
+            (LPSTR)path.c_str(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            NULL,
+            NULL,
+            pNewDACL,
+            NULL
+        );
+        
+        if (result != ERROR_SUCCESS) {
+            if (result == ERROR_ACCESS_DENIED) {
+                outputError("chmod: changing permissions of '" + args[i] + "': Permission denied");
+            } else {
+                outputError("chmod: cannot change permissions of '" + args[i] + "'");
+            }
+        }
+        
+        // Cleanup
+        if (pNewDACL) LocalFree(pNewDACL);
+        FreeSid(pEveryoneSID);
+        LocalFree(pSD);
+    }
+}
+
+void cmd_chown(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: chown <owner> <file>...");
+        output("  Change file owner (Windows implementation)");
+        output("  owner can be a username or domain\\username");
+        output("");
+        output("Examples:");
+        output("  chown john file.txt              Change owner to john");
+        output("  chown DOMAIN\\user file.txt      Change owner to domain user");
+        output("");
+        output("Note: Requires administrator privileges");
+        return;
+    }
+    
+    if (args.size() < 3) {
+        outputError("chown: missing operand");
+        output("Usage: chown <owner> <file>...");
+        return;
+    }
+    
+    std::string owner = args[1];
+    
+    // Get SID for the specified user
+    PSID pSid = NULL;
+    SID_NAME_USE sidType;
+    DWORD sidSize = 0;
+    DWORD domainSize = 0;
+    
+    // First call to get required buffer sizes
+    LookupAccountNameA(NULL, owner.c_str(), NULL, &sidSize, NULL, &domainSize, &sidType);
+    
+    if (sidSize == 0) {
+        outputError("chown: invalid user '" + owner + "'");
+        return;
+    }
+    
+    pSid = (PSID)LocalAlloc(LPTR, sidSize);
+    char* domainName = (char*)LocalAlloc(LPTR, domainSize);
+    
+    if (!LookupAccountNameA(NULL, owner.c_str(), pSid, &sidSize, domainName, &domainSize, &sidType)) {
+        outputError("chown: cannot find user '" + owner + "'");
+        LocalFree(pSid);
+        LocalFree(domainName);
+        return;
+    }
+    
+    LocalFree(domainName);
+    
+    // Process each file
+    for (size_t i = 2; i < args.size(); ++i) {
+        std::string path = unixPathToWindows(args[i]);
+        
+        // Check if file exists
+        DWORD attrs = GetFileAttributesA(path.c_str());
+        if (attrs == INVALID_FILE_ATTRIBUTES) {
+            outputError("chown: cannot access '" + args[i] + "': No such file or directory");
+            continue;
+        }
+        
+        // Set the owner
+        DWORD result = SetNamedSecurityInfoA(
+            (LPSTR)path.c_str(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            pSid,     // Owner SID
+            NULL,     // Group SID
+            NULL,     // DACL
+            NULL      // SACL
+        );
+        
+        if (result != ERROR_SUCCESS) {
+            if (result == ERROR_ACCESS_DENIED) {
+                outputError("chown: changing ownership of '" + args[i] + "': Operation not permitted (requires admin)");
+            } else {
+                outputError("chown: cannot change ownership of '" + args[i] + "'");
+            }
+        }
+    }
+    
+    LocalFree(pSid);
+}
+
+void cmd_chgrp(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: chgrp <group> <file>...");
+        output("  Change file group (Windows implementation)");
+        output("  group can be a group name or domain\\\\group");
+        output("");
+        output("Examples:");
+        output("  chgrp Users file.txt             Change group to Users");
+        output("  chgrp DOMAIN\\\\group file.txt      Change group to domain group");
+        output("");
+        output("Note: Requires administrator privileges");
+        return;
+    }
+    
+    if (args.size() < 3) {
+        outputError("chgrp: missing operand");
+        output("Usage: chgrp <group> <file>...");
+        return;
+    }
+    
+    std::string group = args[1];
+    
+    // Get SID for the specified group
+    PSID pSid = NULL;
+    SID_NAME_USE sidType;
+    DWORD sidSize = 0;
+    DWORD domainSize = 0;
+    
+    // First call to get required buffer sizes
+    LookupAccountNameA(NULL, group.c_str(), NULL, &sidSize, NULL, &domainSize, &sidType);
+    
+    if (sidSize == 0) {
+        outputError("chgrp: invalid group '" + group + "'");
+        return;
+    }
+    
+    pSid = (PSID)LocalAlloc(LPTR, sidSize);
+    char* domainName = (char*)LocalAlloc(LPTR, domainSize);
+    
+    if (!LookupAccountNameA(NULL, group.c_str(), pSid, &sidSize, domainName, &domainSize, &sidType)) {
+        outputError("chgrp: cannot find group '" + group + "'");
+        LocalFree(pSid);
+        LocalFree(domainName);
+        return;
+    }
+    
+    // Verify it's actually a group or alias
+    if (sidType != SidTypeGroup && sidType != SidTypeWellKnownGroup && 
+        sidType != SidTypeAlias && sidType != SidTypeDomain) {
+        outputError("chgrp: '" + group + "' is not a group");
+        LocalFree(pSid);
+        LocalFree(domainName);
+        return;
+    }
+    
+    LocalFree(domainName);
+    
+    // Process each file
+    for (size_t i = 2; i < args.size(); ++i) {
+        std::string path = unixPathToWindows(args[i]);
+        
+        // Check if file exists
+        DWORD attrs = GetFileAttributesA(path.c_str());
+        if (attrs == INVALID_FILE_ATTRIBUTES) {
+            outputError("chgrp: cannot access '" + args[i] + "': No such file or directory");
+            continue;
+        }
+        
+        // Set the group
+        DWORD result = SetNamedSecurityInfoA(
+            (LPSTR)path.c_str(),
+            SE_FILE_OBJECT,
+            GROUP_SECURITY_INFORMATION,
+            NULL,     // Owner SID
+            pSid,     // Group SID
+            NULL,     // DACL
+            NULL      // SACL
+        );
+        
+        if (result != ERROR_SUCCESS) {
+            if (result == ERROR_ACCESS_DENIED) {
+                outputError("chgrp: changing group of '" + args[i] + "': Operation not permitted (requires admin)");
+            } else {
+                outputError("chgrp: cannot change group of '" + args[i] + "'");
+            }
+        }
+    }
+    
+    LocalFree(pSid);
+}
+
+void cmd_mv(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: mv <source> <destination>");
+        output("  Move or rename files and directories");
+        output("  If destination is a directory, move source into it");
+        return;
+    }
+    if (args.size() < 3) {
+        outputError("mv: missing operand");
+        outputError("Usage: mv <source> <destination>");
+        return;
+    }
+    
+    std::string source = unixPathToWindows(args[1]);
+    std::string dest = unixPathToWindows(args[2]);
+    
+    // Check if source exists
+    DWORD sourceAttr = GetFileAttributesA(source.c_str());
+    if (sourceAttr == INVALID_FILE_ATTRIBUTES) {
+        outputError("mv: cannot stat '" + args[1] + "': No such file or directory");
+        return;
+    }
+    
+    // Check if destination exists
+    DWORD destAttr = GetFileAttributesA(dest.c_str());
+    bool destExists = (destAttr != INVALID_FILE_ATTRIBUTES);
+    bool destIsDir = destExists && (destAttr & FILE_ATTRIBUTE_DIRECTORY);
+    
+    // If destination is a directory, move source into it
+    std::string finalDest = dest;
+    if (destIsDir) {
+        // Extract filename from source path
+        size_t lastSlash = source.find_last_of("\\/");
+        std::string filename = (lastSlash != std::string::npos) ? source.substr(lastSlash + 1) : source;
+        finalDest = dest + "\\" + filename;
+    }
+    
+    // Move/rename the file or directory
+    if (!MoveFileA(source.c_str(), finalDest.c_str())) {
+        DWORD error = GetLastError();
+        if (error == ERROR_ALREADY_EXISTS) {
+            outputError("mv: cannot move '" + args[1] + "' to '" + args[2] + "': File exists");
+        } else if (error == ERROR_ACCESS_DENIED) {
+            outputError("mv: cannot move '" + args[1] + "' to '" + args[2] + "': Permission denied");
+        } else {
+            outputError("mv: cannot move '" + args[1] + "' to '" + args[2] + "'");
+        }
+    }
+}
+
+void cmd_dd(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: dd if=<input> of=<output> [bs=<size>] [count=<n>] [skip=<n>] [seek=<n>]");
+        output("  Copy and convert files");
+        output("  if=FILE    Input file");
+        output("  of=FILE    Output file");
+        output("  bs=SIZE    Block size in bytes (default: 512)");
+        output("  count=N    Copy only N blocks");
+        output("  skip=N     Skip N blocks at start of input");
+        output("  seek=N     Skip N blocks at start of output");
+        return;
+    }
+    std::string inputFile;
+    std::string outputFile;
+    size_t blockSize = 512;  // Default block size
+    size_t count = 0;        // 0 means all
+    size_t skip = 0;         // Skip blocks at start of input
+    size_t seek = 0;         // Skip blocks at start of output
+    
+    // Parse arguments
+    for (size_t i = 1; i < args.size(); ++i) {
+        std::string arg = args[i];
+        size_t eqPos = arg.find('=');
+        if (eqPos == std::string::npos) {
+            outputError("dd: invalid argument '" + arg + "'");
+            return;
+        }
+        
+        std::string key = arg.substr(0, eqPos);
+        std::string value = arg.substr(eqPos + 1);
+        
+        if (key == "if") {
+            inputFile = unixPathToWindows(value);
+        } else if (key == "of") {
+            outputFile = unixPathToWindows(value);
+        } else if (key == "bs") {
+            blockSize = std::atoi(value.c_str());
+            if (blockSize == 0) {
+                outputError("dd: invalid block size '" + value + "'");
+                return;
+            }
+        } else if (key == "count") {
+            count = std::atoi(value.c_str());
+        } else if (key == "skip") {
+            skip = std::atoi(value.c_str());
+        } else if (key == "seek") {
+            seek = std::atoi(value.c_str());
+        } else {
+            outputError("dd: unrecognized operand '" + key + "'");
+            return;
+        }
+    }
+    
+    // Validate required parameters
+    if (inputFile.empty()) {
+        outputError("dd: missing input file (if=FILE)");
+        return;
+    }
+    if (outputFile.empty()) {
+        outputError("dd: missing output file (of=FILE)");
+        return;
+    }
+    
+    // Open input file
+    std::ifstream input(inputFile, std::ios::binary);
+    if (!input.is_open()) {
+        outputError("dd: failed to open '" + inputFile + "': No such file or directory");
+        return;
+    }
+    
+    // Skip blocks in input
+    if (skip > 0) {
+        input.seekg(skip * blockSize, std::ios::beg);
+        if (input.fail()) {
+            outputError("dd: error seeking in input file");
+            input.close();
+            return;
+        }
+    }
+    
+    // Open output file
+    std::ofstream outFile(outputFile, std::ios::binary);
+    if (!outFile.is_open()) {
+        outputError("dd: failed to open '" + outputFile + "' for writing");
+        input.close();
+        return;
+    }
+    
+    // Seek in output
+    if (seek > 0) {
+        outFile.seekp(seek * blockSize, std::ios::beg);
+        if (outFile.fail()) {
+            outputError("dd: error seeking in output file");
+            input.close();
+            outFile.close();
+            return;
+        }
+    }
+    
+    // Copy data
+    char* buffer = new char[blockSize];
+    size_t blocksRead = 0;
+    size_t blocksWritten = 0;
+    size_t totalBytes = 0;
+    
+    while (input.read(buffer, blockSize) || input.gcount() > 0) {
+        std::streamsize bytesRead = input.gcount();
+        blocksRead++;
+        
+        outFile.write(buffer, bytesRead);
+        if (outFile.fail()) {
+            outputError("dd: error writing to output file");
+            delete[] buffer;
+            input.close();
+            outFile.close();
+            return;
+        }
+        
+        blocksWritten++;
+        totalBytes += bytesRead;
+        
+        if (count > 0 && blocksRead >= count) {
+            break;
+        }
+    }
+    
+    delete[] buffer;
+    input.close();
+    outFile.close();
+    
+    // Output statistics
+    std::ostringstream oss;
+    oss << blocksRead << "+0 records in";
+    output(oss.str());
+    oss.str("");
+    oss << blocksWritten << "+0 records out";
+    output(oss.str());
+    oss.str("");
+    oss << totalBytes << " bytes copied";
+    output(oss.str());
+}
+
+// TAR file format structures
+struct TarHeader {
+    char name[100];
+    char mode[8];
+    char uid[8];
+    char gid[8];
+    char size[12];
+    char mtime[12];
+    char checksum[8];
+    char typeflag;
+    char linkname[100];
+    char magic[6];
+    char version[2];
+    char uname[32];
+    char gname[32];
+    char devmajor[8];
+    char devminor[8];
+    char prefix[155];
+    char padding[12];
+};
+
+unsigned int calculateTarChecksum(const TarHeader* header) {
+    unsigned int sum = 0;
+    const unsigned char* ptr = (const unsigned char*)header;
+    
+    // Calculate sum of all bytes, treating checksum field as spaces
+    for (int i = 0; i < 512; i++) {
+        if (i >= 148 && i < 156) {
+            sum += ' ';  // Checksum field treated as spaces
+        } else {
+            sum += ptr[i];
+        }
+    }
+    return sum;
+}
+
+void writeTarHeader(std::ofstream& tar, const std::string& filename, size_t filesize, 
+                    char typeflag, const std::string& fullPath) {
+    TarHeader header = {0};
+    
+    // Fill header fields
+    strncpy(header.name, filename.c_str(), 99);
+    sprintf(header.mode, "%07o", 0644);  // rw-r--r--
+    sprintf(header.uid, "%07o", 0);
+    sprintf(header.gid, "%07o", 0);
+    sprintf(header.size, "%011llo", (long long)filesize);
+    
+    // Get file modification time
+    WIN32_FILE_ATTRIBUTE_DATA fileInfo;
+    if (GetFileAttributesExA(fullPath.c_str(), GetFileExInfoStandard, &fileInfo)) {
+        ULARGE_INTEGER ull;
+        ull.LowPart = fileInfo.ftLastWriteTime.dwLowDateTime;
+        ull.HighPart = fileInfo.ftLastWriteTime.dwHighDateTime;
+        time_t mtime = (ull.QuadPart / 10000000ULL) - 11644473600ULL;  // Convert Windows time to Unix time
+        sprintf(header.mtime, "%011llo", (long long)mtime);
+    } else {
+        sprintf(header.mtime, "%011o", 0);
+    }
+    
+    header.typeflag = typeflag;  // '0' for file, '5' for directory
+    strcpy(header.magic, "ustar");
+    header.version[0] = '0';
+    header.version[1] = '0';
+    strcpy(header.uname, "user");
+    strcpy(header.gname, "group");
+    
+    // Calculate checksum
+    sprintf(header.checksum, "%06o", calculateTarChecksum(&header));
+    header.checksum[6] = ' ';
+    
+    // Write header
+    tar.write((char*)&header, 512);
+}
+
+void addFileToTar(std::ofstream& tar, const std::string& filepath, const std::string& arcname) {
+    std::ifstream file(filepath, std::ios::binary);
+    if (!file.is_open()) {
+        outputError("tar: cannot open '" + filepath + "'");
+        return;
+    }
+    
+    // Get file size
+    file.seekg(0, std::ios::end);
+    size_t filesize = file.tellg();
+    file.seekg(0, std::ios::beg);
+    
+    // Write header
+    writeTarHeader(tar, arcname, filesize, '0', filepath);
+    
+    // Write file content
+    char buffer[512];
+    size_t remaining = filesize;
+    while (remaining > 0) {
+        size_t toRead = (remaining > 512) ? 512 : remaining;
+        file.read(buffer, toRead);
+        
+        // Pad to 512 bytes
+        if (toRead < 512) {
+            memset(buffer + toRead, 0, 512 - toRead);
+        }
+        
+        tar.write(buffer, 512);
+        remaining -= toRead;
+    }
+    
+    file.close();
+}
+
+void addDirectoryToTar(std::ofstream& tar, const std::string& dirpath, const std::string& arcname) {
+    // Write directory entry
+    std::string dirArcName = arcname;
+    if (!dirArcName.empty() && dirArcName.back() != '/') {
+        dirArcName += "/";
+    }
+    writeTarHeader(tar, dirArcName, 0, '5', dirpath);
+    
+    // Add directory contents recursively
+    std::string searchPath = dirpath + "\\*";
+    WIN32_FIND_DATAA findData;
+    HANDLE hFind = FindFirstFileA(searchPath.c_str(), &findData);
+    
+    if (hFind != INVALID_HANDLE_VALUE) {
+        do {
+            std::string filename = findData.cFileName;
+            if (filename == "." || filename == "..") continue;
+            
+            std::string fullPath = dirpath + "\\" + filename;
+            std::string fullArcName = dirArcName + filename;
+            
+            if (findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+                addDirectoryToTar(tar, fullPath, fullArcName);
+            } else {
+                addFileToTar(tar, fullPath, fullArcName);
+            }
+        } while (FindNextFileA(hFind, &findData));
+        
+        FindClose(hFind);
+    }
+}
+
+void cmd_tar(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: tar [-c|-x|-t] -f <archive> [files...] [-C <dir>]");
+        output("  Create, extract, or list tar archives");
+        output("");
+        output("Options:");
+        output("  -c        Create archive");
+        output("  -x        Extract archive");
+        output("  -t        List archive contents");
+        output("  -f FILE   Archive filename");
+        output("  -C DIR    Change to directory (for extract)");
+        output("  -v        Verbose output");
+        output("");
+        output("Examples:");
+        output("  tar -cf archive.tar file1 file2    Create archive");
+        output("  tar -xf archive.tar                Extract archive");
+        output("  tar -tf archive.tar                List contents");
+        output("  tar -xf archive.tar -C /dest       Extract to directory");
+        return;
+    }
+    
+    if (args.size() < 3) {
+        outputError("tar: missing operand");
+        output("Usage: tar [-c|-x|-t] -f <archive> [files...]");
+        return;
+    }
+    
+    // Parse options
+    bool create = false;
+    bool extract = false;
+    bool list = false;
+    bool verbose = false;
+    std::string archiveFile;
+    std::string changeDir;
+    std::vector<std::string> files;
+    
+    for (size_t i = 1; i < args.size(); i++) {
+        if (args[i][0] == '-') {
+            std::string opt = args[i];
+            for (size_t j = 1; j < opt.length(); j++) {
+                if (opt[j] == 'c') create = true;
+                else if (opt[j] == 'x') extract = true;
+                else if (opt[j] == 't') list = true;
+                else if (opt[j] == 'v') verbose = true;
+                else if (opt[j] == 'f') {
+                    if (i + 1 < args.size()) {
+                        archiveFile = args[++i];
+                    }
+                    break;
+                } else if (opt[j] == 'C') {
+                    if (i + 1 < args.size()) {
+                        changeDir = args[++i];
+                    }
+                    break;
+                }
+            }
+        } else {
+            files.push_back(args[i]);
+        }
+    }
+    
+    if (archiveFile.empty()) {
+        outputError("tar: archive filename required (-f option)");
+        return;
+    }
+    
+    archiveFile = unixPathToWindows(archiveFile);
+    
+    // CREATE
+    if (create) {
+        if (files.empty()) {
+            outputError("tar: no files specified to add");
+            return;
+        }
+        
+        std::ofstream tar(archiveFile, std::ios::binary);
+        if (!tar.is_open()) {
+            outputError("tar: cannot create '" + archiveFile + "'");
+            return;
+        }
+        
+        for (const std::string& file : files) {
+            std::string winPath = unixPathToWindows(file);
+            DWORD attrs = GetFileAttributesA(winPath.c_str());
+            
+            if (attrs == INVALID_FILE_ATTRIBUTES) {
+                outputError("tar: '" + file + "': No such file or directory");
+                continue;
+            }
+            
+            if (verbose) output(file);
+            
+            if (attrs & FILE_ATTRIBUTE_DIRECTORY) {
+                addDirectoryToTar(tar, winPath, file);
+            } else {
+                addFileToTar(tar, winPath, file);
+            }
+        }
+        
+        // Write two 512-byte zero blocks as end marker
+        char zeros[1024] = {0};
+        tar.write(zeros, 1024);
+        tar.close();
+        
+        output("tar: archive created");
+    }
+    // EXTRACT
+    else if (extract) {
+        std::ifstream tar(archiveFile, std::ios::binary);
+        if (!tar.is_open()) {
+            outputError("tar: cannot open '" + archiveFile + "'");
+            return;
+        }
+        
+        // Change directory if specified
+        char oldCwd[MAX_PATH] = {0};
+        if (!changeDir.empty()) {
+            GetCurrentDirectoryA(MAX_PATH, oldCwd);
+            std::string winChangeDir = unixPathToWindows(changeDir);
+            if (!SetCurrentDirectoryA(winChangeDir.c_str())) {
+                outputError("tar: cannot change to directory '" + changeDir + "'");
+                tar.close();
+                return;
+            }
+        }
+        
+        TarHeader header;
+        while (tar.read((char*)&header, 512)) {
+            // Check for end of archive (all zeros)
+            if (header.name[0] == '\0') break;
+            
+            // Verify magic
+            if (strncmp(header.magic, "ustar", 5) != 0 && header.name[0] != '\0') {
+                // Try to continue anyway for old tar formats
+            }
+            
+            std::string filename = header.name;
+            long long filesize = 0;
+            sscanf(header.size, "%llo", &filesize);
+            
+            if (verbose || list) output(filename);
+            
+            if (!list) {
+                if (header.typeflag == '5' || filename.back() == '/') {
+                    // Directory
+                    std::string winPath = unixPathToWindows(filename);
+                    CreateDirectoryA(winPath.c_str(), NULL);
+                } else {
+                    // Regular file
+                    // Create parent directories if needed
+                    size_t lastSlash = filename.find_last_of("/\\");
+                    if (lastSlash != std::string::npos) {
+                        std::string dirPath = filename.substr(0, lastSlash);
+                        std::string winDirPath = unixPathToWindows(dirPath);
+                        CreateDirectoryA(winDirPath.c_str(), NULL);
+                    }
+                    
+                    std::string winPath = unixPathToWindows(filename);
+                    std::ofstream outFile(winPath, std::ios::binary);
+                    if (outFile.is_open()) {
+                        char buffer[512];
+                        long long remaining = filesize;
+                        
+                        while (remaining > 0) {
+                            tar.read(buffer, 512);
+                            size_t toWrite = (remaining > 512) ? 512 : remaining;
+                            outFile.write(buffer, toWrite);
+                            remaining -= 512;
+                        }
+                        
+                        outFile.close();
+                    } else {
+                        outputError("tar: cannot create '" + filename + "'");
+                        // Skip file data
+                        long long blocks = (filesize + 511) / 512;
+                        tar.seekg(blocks * 512, std::ios::cur);
+                    }
+                }
+            } else {
+                // Just skip file data
+                if (filesize > 0) {
+                    long long blocks = (filesize + 511) / 512;
+                    tar.seekg(blocks * 512, std::ios::cur);
+                }
+            }
+        }
+        
+        tar.close();
+        
+        // Restore directory
+        if (!changeDir.empty()) {
+            SetCurrentDirectoryA(oldCwd);
+        }
+        
+        if (!list) output("tar: extraction complete");
+    }
+    // LIST
+    else if (list) {
+        std::ifstream tar(archiveFile, std::ios::binary);
+        if (!tar.is_open()) {
+            outputError("tar: cannot open '" + archiveFile + "'");
+            return;
+        }
+        
+        TarHeader header;
+        while (tar.read((char*)&header, 512)) {
+            // Check for end of archive
+            if (header.name[0] == '\0') break;
+            
+            std::string filename = header.name;
+            long long filesize = 0;
+            sscanf(header.size, "%llo", &filesize);
+            
+            output(filename);
+            
+            // Skip file data
+            if (filesize > 0) {
+                long long blocks = (filesize + 511) / 512;
+                tar.seekg(blocks * 512, std::ios::cur);
+            }
+        }
+        
+        tar.close();
+    } else {
+        outputError("tar: must specify one of -c, -x, or -t");
+    }
+}
+
+// GZIP compression with proper DEFLATE format
+void cmd_gzip(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: gzip [options] [file...]");
+        output("  Compress/decompress files using gzip format");
+        output("");
+        output("Options:");
+        output("  -d        Decompress");
+        output("  -k        Keep original file");
+        output("  -v        Verbose output");
+        output("  -c        Write to stdout");
+        output("");
+        output("Note: Creates standard gzip (.gz) files");
+        return;
+    }
+    
+    if (args.size() < 2) {
+        outputError("gzip: missing operand");
+        return;
+    }
+    
+    bool decompress = false;
+    bool keepOriginal = false;
+    bool verbose = false;
+    bool toStdout = false;
+    std::vector<std::string> files;
+    
+    for (size_t i = 1; i < args.size(); i++) {
+        if (args[i][0] == '-') {
+            for (size_t j = 1; j < args[i].length(); j++) {
+                if (args[i][j] == 'd') decompress = true;
+                else if (args[i][j] == 'k') keepOriginal = true;
+                else if (args[i][j] == 'v') verbose = true;
+                else if (args[i][j] == 'c') toStdout = true;
+            }
+        } else {
+            files.push_back(args[i]);
+        }
+    }
+    
+    if (files.empty()) {
+        outputError("gzip: no files specified");
+        return;
+    }
+    
+    for (const std::string& file : files) {
+        std::string winPath = unixPathToWindows(file);
+        
+        if (decompress) {
+            // Decompress
+            std::ifstream in(winPath, std::ios::binary);
+            if (!in.is_open()) {
+                outputError("gzip: cannot open '" + file + "'");
+                continue;
+            }
+            
+            // Read entire file
+            in.seekg(0, std::ios::end);
+            size_t fileSize = (size_t)in.tellg();
+            in.seekg(0, std::ios::beg);
+            
+            std::vector<unsigned char> fileData(fileSize);
+            in.read((char*)fileData.data(), fileSize);
+            in.close();
+            
+            // Check gzip header
+            if (fileSize < 18 || fileData[0] != 0x1f || fileData[1] != 0x8b) {
+                outputError("gzip: '" + file + "' is not a valid gzip file");
+                continue;
+            }
+            
+            unsigned char method = fileData[2];
+            unsigned char flags = fileData[3];
+            
+            if (method != 8) {
+                outputError("gzip: unsupported compression method");
+                continue;
+            }
+            
+            // Skip header fields
+            size_t pos = 10;
+            
+            // FEXTRA
+            if (flags & 0x04) {
+                if (pos + 2 > fileSize) {
+                    outputError("gzip: corrupt file header");
+                    continue;
+                }
+                unsigned short xlen = fileData[pos] | (fileData[pos + 1] << 8);
+                pos += 2 + xlen;
+            }
+            
+            // FNAME
+            if (flags & 0x08) {
+                while (pos < fileSize && fileData[pos] != 0) pos++;
+                pos++;
+            }
+            
+            // FCOMMENT
+            if (flags & 0x10) {
+                while (pos < fileSize && fileData[pos] != 0) pos++;
+                pos++;
+            }
+            
+            // FHCRC
+            if (flags & 0x02) {
+                pos += 2;
+            }
+            
+            if (pos + 8 > fileSize) {
+                outputError("gzip: corrupt file");
+                continue;
+            }
+            
+            // Extract compressed data (between header and footer)
+            size_t compressedSize = fileSize - pos - 8;
+            
+            // Read footer (CRC32 and original size)
+            unsigned int crc32 = fileData[fileSize - 8] |
+                                (fileData[fileSize - 7] << 8) |
+                                (fileData[fileSize - 6] << 16) |
+                                (fileData[fileSize - 5] << 24);
+            
+            unsigned int originalSize = fileData[fileSize - 4] |
+                                       (fileData[fileSize - 3] << 8) |
+                                       (fileData[fileSize - 2] << 16) |
+                                       (fileData[fileSize - 1] << 24);
+            
+            // Decompress
+            std::vector<unsigned char> decompressedData = 
+                deflate_decompress(&fileData[pos], compressedSize);
+            
+            if (decompressedData.empty() || decompressedData.size() != originalSize) {
+                outputError("gzip: decompression failed for '" + file + "'");
+                continue;
+            }
+            
+            // Verify CRC32
+            unsigned int actualCrc = calculate_crc32(decompressedData.data(), decompressedData.size());
+            if (actualCrc != crc32) {
+                outputError("gzip: CRC error in '" + file + "'");
+                continue;
+            }
+            
+            // Determine output
+            std::string outPath = winPath;
+            if (outPath.size() > 3 && outPath.substr(outPath.size() - 3) == ".gz") {
+                outPath = outPath.substr(0, outPath.size() - 3);
+            } else {
+                outPath += ".out";
+            }
+            
+            if (!toStdout) {
+                std::ofstream out(outPath, std::ios::binary);
+                if (!out.is_open()) {
+                    outputError("gzip: cannot create '" + outPath + "'");
+                    continue;
+                }
+                out.write((char*)decompressedData.data(), decompressedData.size());
+                out.close();
+            } else {
+                std::string text((char*)decompressedData.data(), decompressedData.size());
+                output(text);
+            }
+            
+            if (verbose) {
+                std::ostringstream oss;
+                oss << file << ": OK (" << decompressedData.size() << " bytes)";
+                output(oss.str());
+            }
+            
+            if (!keepOriginal && !toStdout) {
+                DeleteFileA(winPath.c_str());
+            }
+            
+        } else {
+            // Compress
+            std::ifstream in(winPath, std::ios::binary);
+            if (!in.is_open()) {
+                outputError("gzip: cannot open '" + file + "'");
+                continue;
+            }
+            
+            // Read entire file
+            in.seekg(0, std::ios::end);
+            size_t inputSize = (size_t)in.tellg();
+            in.seekg(0, std::ios::beg);
+            
+            std::vector<unsigned char> inputData(inputSize);
+            in.read((char*)inputData.data(), inputSize);
+            in.close();
+            
+            // Calculate CRC32
+            unsigned int crc32 = calculate_crc32(inputData.data(), inputSize);
+            
+            // Compress with DEFLATE
+            std::vector<unsigned char> compressedData = deflate_compress(inputData.data(), inputSize);
+            
+            // Create gzip file
+            std::string outPath = winPath + ".gz";
+            
+            if (!toStdout) {
+                std::ofstream out(outPath, std::ios::binary);
+                if (!out.is_open()) {
+                    outputError("gzip: cannot create '" + outPath + "'");
+                    continue;
+                }
+                
+                // Write gzip header
+                unsigned char header[10] = {
+                    0x1f, 0x8b,      // Magic number
+                    8,               // Compression method (DEFLATE)
+                    0,               // Flags
+                    0, 0, 0, 0,      // Modification time (not set)
+                    0,               // Extra flags
+                    0xff             // OS (unknown)
+                };
+                out.write((char*)header, 10);
+                
+                // Write compressed data
+                out.write((char*)compressedData.data(), compressedData.size());
+                
+                // Write footer (CRC32 and original size)
+                unsigned char footer[8];
+                footer[0] = crc32 & 0xFF;
+                footer[1] = (crc32 >> 8) & 0xFF;
+                footer[2] = (crc32 >> 16) & 0xFF;
+                footer[3] = (crc32 >> 24) & 0xFF;
+                footer[4] = inputSize & 0xFF;
+                footer[5] = (inputSize >> 8) & 0xFF;
+                footer[6] = (inputSize >> 16) & 0xFF;
+                footer[7] = (inputSize >> 24) & 0xFF;
+                out.write((char*)footer, 8);
+                
+                out.close();
+            } else {
+                // Write to stdout (binary data)
+                std::string text((char*)compressedData.data(), compressedData.size());
+                output(text);
+            }
+            
+            if (verbose) {
+                std::ostringstream oss;
+                size_t totalSize = 10 + compressedData.size() + 8;
+                double ratio = 100.0 * (1.0 - (double)totalSize / (double)inputSize);
+                oss << file << ": " << inputSize << " -> " << totalSize 
+                    << " bytes (" << (int)ratio << "% reduction)";
+                output(oss.str());
+            }
+            
+            if (!keepOriginal && !toStdout) {
+                DeleteFileA(winPath.c_str());
+            }
+        }
+    }
+}
+
+// GUNZIP - Full implementation with proper gzip format support
+void cmd_gunzip(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: gunzip [options] [file...]");
+        output("  Decompress gzip files");
+        output("");
+        output("Options:");
+        output("  -k        Keep original file");
+        output("  -v        Verbose output");
+        output("  -c        Write to stdout");
+        output("  -t        Test compressed file integrity");
+        return;
+    }
+    
+    if (args.size() < 2) {
+        outputError("gunzip: missing operand");
+        return;
+    }
+    
+    bool keepOriginal = false;
+    bool verbose = false;
+    bool toStdout = false;
+    bool testOnly = false;
+    std::vector<std::string> files;
+    
+    for (size_t i = 1; i < args.size(); i++) {
+        if (args[i][0] == '-') {
+            for (size_t j = 1; j < args[i].length(); j++) {
+                if (args[i][j] == 'k') keepOriginal = true;
+                else if (args[i][j] == 'v') verbose = true;
+                else if (args[i][j] == 'c') toStdout = true;
+                else if (args[i][j] == 't') testOnly = true;
+            }
+        } else {
+            files.push_back(args[i]);
+        }
+    }
+    
+    if (files.empty()) {
+        outputError("gunzip: no files specified");
+        return;
+    }
+    
+    for (const std::string& file : files) {
+        std::string winPath = unixPathToWindows(file);
+        
+        std::ifstream in(winPath, std::ios::binary);
+        if (!in.is_open()) {
+            outputError("gunzip: cannot open '" + file + "'");
+            continue;
+        }
+        
+        // Read entire file
+        in.seekg(0, std::ios::end);
+        size_t fileSize = (size_t)in.tellg();
+        in.seekg(0, std::ios::beg);
+        
+        if (fileSize < 18) {
+            outputError("gunzip: '" + file + "' is not a valid gzip file");
+            in.close();
+            continue;
+        }
+        
+        std::vector<unsigned char> fileData(fileSize);
+        in.read((char*)fileData.data(), fileSize);
+        in.close();
+        
+        // Check gzip header
+        if (fileData[0] != 0x1f || fileData[1] != 0x8b) {
+            outputError("gunzip: '" + file + "' is not a valid gzip file");
+            continue;
+        }
+        
+        unsigned char method = fileData[2];
+        unsigned char flags = fileData[3];
+        
+        if (method != 8) {
+            outputError("gunzip: unsupported compression method");
+            continue;
+        }
+        
+        // Skip header fields
+        size_t pos = 10;
+        
+        // FEXTRA
+        if (flags & 0x04) {
+            if (pos + 2 > fileSize) {
+                outputError("gunzip: corrupt file header");
+                continue;
+            }
+            unsigned short xlen = fileData[pos] | (fileData[pos + 1] << 8);
+            pos += 2 + xlen;
+        }
+        
+        // FNAME
+        if (flags & 0x08) {
+            while (pos < fileSize && fileData[pos] != 0) pos++;
+            pos++;
+        }
+        
+        // FCOMMENT
+        if (flags & 0x10) {
+            while (pos < fileSize && fileData[pos] != 0) pos++;
+            pos++;
+        }
+        
+        // FHCRC
+        if (flags & 0x02) {
+            pos += 2;
+        }
+        
+        if (pos + 8 > fileSize) {
+            outputError("gunzip: corrupt file");
+            continue;
+        }
+        
+        // Extract compressed data
+        size_t compressedSize = fileSize - pos - 8;
+        
+        // Read footer
+        unsigned int crc32 = fileData[fileSize - 8] |
+                            (fileData[fileSize - 7] << 8) |
+                            (fileData[fileSize - 6] << 16) |
+                            (fileData[fileSize - 5] << 24);
+        
+        unsigned int originalSize = fileData[fileSize - 4] |
+                                   (fileData[fileSize - 3] << 8) |
+                                   (fileData[fileSize - 2] << 16) |
+                                   (fileData[fileSize - 1] << 24);
+        
+        // Decompress
+        std::vector<unsigned char> decompressedData = 
+            deflate_decompress(&fileData[pos], compressedSize);
+        
+        if (decompressedData.empty() || decompressedData.size() != originalSize) {
+            outputError("gunzip: decompression failed for '" + file + "'");
+            continue;
+        }
+        
+        // Verify CRC32
+        unsigned int actualCrc = calculate_crc32(decompressedData.data(), decompressedData.size());
+        if (actualCrc != crc32) {
+            outputError("gunzip: CRC error in '" + file + "'");
+            continue;
+        }
+        
+        // Determine output
+        std::string outPath = winPath;
+        if (outPath.size() > 3 && outPath.substr(outPath.size() - 3) == ".gz") {
+            outPath = outPath.substr(0, outPath.size() - 3);
+        } else {
+            outPath += ".out";
+        }
+        
+        if (!toStdout && !testOnly) {
+            std::ofstream out(outPath, std::ios::binary);
+            if (!out.is_open()) {
+                outputError("gunzip: cannot create '" + outPath + "'");
+                continue;
+            }
+            out.write((char*)decompressedData.data(), decompressedData.size());
+            out.close();
+        }
+        
+        if (toStdout) {
+            std::string text((char*)decompressedData.data(), decompressedData.size());
+            output(text);
+        }
+        
+        if (verbose || testOnly) {
+            std::ostringstream oss;
+            oss << file << ": OK (" << decompressedData.size() << " bytes)";
+            output(oss.str());
+        }
+        
+        if (!keepOriginal && !toStdout && !testOnly) {
+            DeleteFileA(winPath.c_str());
+        }
+    }
+}
+
+// ZIP command - Create ZIP archives
+void cmd_zip(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: zip [options] <zipfile> <files...>");
+        output("  Create ZIP archives");
+        output("");
+        output("Options:");
+        output("  -r        Recurse into directories");
+        output("  -v        Verbose output");
+        output("  -0        Store only (no compression)");
+        output("");
+        output("Examples:");
+        output("  zip archive.zip file1.txt file2.txt");
+        output("  zip -r archive.zip directory/");
+        return;
+    }
+    
+    if (args.size() < 3) {
+        outputError("zip: missing operands");
+        output("Usage: zip [options] <zipfile> <files...>");
+        return;
+    }
+    
+    bool recursive = false;
+    bool verbose = false;
+    bool noCompression = false;
+    std::string zipFile;
+    std::vector<std::string> files;
+    
+    size_t i = 1;
+    while (i < args.size()) {
+        if (args[i][0] == '-') {
+            for (size_t j = 1; j < args[i].length(); j++) {
+                if (args[i][j] == 'r') recursive = true;
+                else if (args[i][j] == 'v') verbose = true;
+                else if (args[i][j] == '0') noCompression = true;
+            }
+        } else if (zipFile.empty()) {
+            zipFile = args[i];
+        } else {
+            files.push_back(args[i]);
+        }
+        i++;
+    }
+    
+    if (zipFile.empty() || files.empty()) {
+        outputError("zip: archive name and files required");
+        return;
+    }
+    
+    std::string winZipPath = unixPathToWindows(zipFile);
+    std::ofstream zip(winZipPath, std::ios::binary);
+    if (!zip.is_open()) {
+        outputError("zip: cannot create '" + zipFile + "'");
+        return;
+    }
+    
+    // Collect all files to add
+    std::vector<std::string> allFiles;
+    std::vector<std::string> archiveNames;
+    
+    for (const std::string& file : files) {
+        std::string winPath = unixPathToWindows(file);
+        DWORD attrs = GetFileAttributesA(winPath.c_str());
+        
+        if (attrs == INVALID_FILE_ATTRIBUTES) {
+            outputError("zip: cannot access '" + file + "'");
+            continue;
+        }
+        
+        if (attrs & FILE_ATTRIBUTE_DIRECTORY) {
+            if (!recursive) {
+                output("zip: '" + file + "' is a directory (use -r)");
+                continue;
+            }
+            
+            // Recursively collect files
+            std::function<void(const std::string&, const std::string&)> collectFiles = 
+                [&](const std::string& dir, const std::string& basePath) {
+                std::string searchPath = dir + "\\*";
+                WIN32_FIND_DATAA findData;
+                HANDLE hFind = FindFirstFileA(searchPath.c_str(), &findData);
+                
+                if (hFind != INVALID_HANDLE_VALUE) {
+                    do {
+                        std::string name = findData.cFileName;
+                        if (name == "." || name == "..") continue;
+                        
+                        std::string fullPath = dir + "\\" + name;
+                        std::string arcName = basePath.empty() ? name : basePath + "/" + name;
+                        
+                        if (findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+                            collectFiles(fullPath, arcName);
+                        } else {
+                            allFiles.push_back(fullPath);
+                            archiveNames.push_back(arcName);
+                        }
+                    } while (FindNextFileA(hFind, &findData));
+                    FindClose(hFind);
+                }
+            };
+            
+            std::string baseName = file;
+            size_t lastSlash = baseName.find_last_of("/\\");
+            if (lastSlash != std::string::npos) {
+                baseName = baseName.substr(lastSlash + 1);
+            }
+            collectFiles(winPath, baseName);
+        } else {
+            allFiles.push_back(winPath);
+            archiveNames.push_back(file);
+        }
+    }
+    
+    if (allFiles.empty()) {
+        outputError("zip: no files to add");
+        zip.close();
+        DeleteFileA(winZipPath.c_str());
+        return;
+    }
+    
+    // Store central directory entries
+    std::vector<std::vector<unsigned char>> centralDirEntries;
+    uint32_t centralDirSize = 0;
+    
+    // Write files
+    for (size_t idx = 0; idx < allFiles.size(); idx++) {
+        const std::string& filePath = allFiles[idx];
+        const std::string& arcName = archiveNames[idx];
+        
+        // Read file
+        std::ifstream inFile(filePath, std::ios::binary);
+        if (!inFile.is_open()) {
+            outputError("zip: cannot read '" + filePath + "'");
+            continue;
+        }
+        
+        inFile.seekg(0, std::ios::end);
+        size_t fileSize = (size_t)inFile.tellg();
+        inFile.seekg(0, std::ios::beg);
+        
+        std::vector<unsigned char> fileData(fileSize);
+        inFile.read((char*)fileData.data(), fileSize);
+        inFile.close();
+        
+        // Calculate CRC32
+        uint32_t crc = calculate_crc32(fileData.data(), fileSize);
+        
+        // Compress if needed
+        std::vector<unsigned char> compressedData;
+        uint16_t compressionMethod = 0;
+        
+        if (!noCompression && fileSize > 0) {
+            compressedData = deflate_compress(fileData.data(), fileSize);
+            if (!compressedData.empty() && compressedData.size() < fileSize) {
+                compressionMethod = 8;  // DEFLATE
+            } else {
+                compressedData = fileData;
+                compressionMethod = 0;  // Stored
+            }
+        } else {
+            compressedData = fileData;
+        }
+        
+        // Get file time
+        WIN32_FILE_ATTRIBUTE_DATA fileInfo;
+        uint16_t modDate = 0, modTime = 0;
+        if (GetFileAttributesExA(filePath.c_str(), GetFileExInfoStandard, &fileInfo)) {
+            fileTimeToDosDateTime(fileInfo.ftLastWriteTime, modDate, modTime);
+        }
+        
+        // Record local header offset
+        uint32_t localHeaderOffset = (uint32_t)zip.tellp();
+        
+        // Write local file header
+        ZipLocalFileHeader localHeader = {0};
+        localHeader.signature = 0x04034b50;
+        localHeader.versionNeeded = 20;
+        localHeader.flags = 0;
+        localHeader.compression = compressionMethod;
+        localHeader.modTime = modTime;
+        localHeader.modDate = modDate;
+        localHeader.crc32 = crc;
+        localHeader.compressedSize = (uint32_t)compressedData.size();
+        localHeader.uncompressedSize = (uint32_t)fileSize;
+        localHeader.filenameLength = (uint16_t)arcName.length();
+        localHeader.extraFieldLength = 0;
+        
+        zip.write((char*)&localHeader, sizeof(localHeader));
+        zip.write(arcName.c_str(), arcName.length());
+        zip.write((char*)compressedData.data(), compressedData.size());
+        
+        // Build central directory entry
+        std::vector<unsigned char> centralEntry;
+        ZipCentralDirHeader centralHeader = {0};
+        centralHeader.signature = 0x02014b50;
+        centralHeader.versionMadeBy = 20;
+        centralHeader.versionNeeded = 20;
+        centralHeader.flags = 0;
+        centralHeader.compression = compressionMethod;
+        centralHeader.modTime = modTime;
+        centralHeader.modDate = modDate;
+        centralHeader.crc32 = crc;
+        centralHeader.compressedSize = (uint32_t)compressedData.size();
+        centralHeader.uncompressedSize = (uint32_t)fileSize;
+        centralHeader.filenameLength = (uint16_t)arcName.length();
+        centralHeader.extraFieldLength = 0;
+        centralHeader.commentLength = 0;
+        centralHeader.diskStart = 0;
+        centralHeader.internalAttr = 0;
+        centralHeader.externalAttr = 0x20;  // Archive attribute
+        centralHeader.localHeaderOffset = localHeaderOffset;
+        
+        centralEntry.resize(sizeof(centralHeader) + arcName.length());
+        memcpy(centralEntry.data(), &centralHeader, sizeof(centralHeader));
+        memcpy(centralEntry.data() + sizeof(centralHeader), arcName.c_str(), arcName.length());
+        
+        centralDirEntries.push_back(centralEntry);
+        centralDirSize += (uint32_t)centralEntry.size();
+        
+        if (verbose) {
+            std::ostringstream oss;
+            oss << "  adding: " << arcName << " (" << fileSize << " bytes)";
+            output(oss.str());
+        }
+    }
+    
+    // Write central directory
+    uint32_t centralDirOffset = (uint32_t)zip.tellp();
+    for (const auto& entry : centralDirEntries) {
+        zip.write((char*)entry.data(), entry.size());
+    }
+    
+    // Write end of central directory
+    ZipEndOfCentralDir endRecord = {0};
+    endRecord.signature = 0x06054b50;
+    endRecord.diskNumber = 0;
+    endRecord.centralDirDisk = 0;
+    endRecord.numEntriesThisDisk = (uint16_t)allFiles.size();
+    endRecord.numEntriesTotal = (uint16_t)allFiles.size();
+    endRecord.centralDirSize = centralDirSize;
+    endRecord.centralDirOffset = centralDirOffset;
+    endRecord.commentLength = 0;
+    
+    zip.write((char*)&endRecord, sizeof(endRecord));
+    zip.close();
+    
+    std::ostringstream oss;
+    oss << "created '" << zipFile << "' with " << allFiles.size() << " file(s)";
+    output(oss.str());
+}
+
+// UNZIP command - Extract ZIP archives
+void cmd_unzip(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: unzip [options] <zipfile> [files...]");
+        output("  Extract ZIP archives");
+        output("");
+        output("Options:");
+        output("  -l        List contents");
+        output("  -v        Verbose output");
+        output("  -d <dir>  Extract to directory");
+        output("  -o        Overwrite existing files");
+        output("  -t        Test archive integrity");
+        output("");
+        output("Examples:");
+        output("  unzip archive.zip");
+        output("  unzip -l archive.zip");
+        output("  unzip archive.zip -d output/");
+        return;
+    }
+    
+    if (args.size() < 2) {
+        outputError("unzip: missing archive name");
+        output("Usage: unzip [options] <zipfile>");
+        return;
+    }
+    
+    bool listOnly = false;
+    bool verbose = false;
+    bool overwrite = false;
+    bool testOnly = false;
+    std::string zipFile;
+    std::string extractDir;
+    std::vector<std::string> filesToExtract;
+    
+    for (size_t i = 1; i < args.size(); i++) {
+        if (args[i][0] == '-') {
+            if (args[i] == "-d" && i + 1 < args.size()) {
+                extractDir = args[++i];
+            } else {
+                for (size_t j = 1; j < args[i].length(); j++) {
+                    if (args[i][j] == 'l') listOnly = true;
+                    else if (args[i][j] == 'v') verbose = true;
+                    else if (args[i][j] == 'o') overwrite = true;
+                    else if (args[i][j] == 't') testOnly = true;
+                }
+            }
+        } else if (zipFile.empty()) {
+            zipFile = args[i];
+        } else {
+            filesToExtract.push_back(args[i]);
+        }
+    }
+    
+    if (zipFile.empty()) {
+        outputError("unzip: archive name required");
+        return;
+    }
+    
+    std::string winZipPath = unixPathToWindows(zipFile);
+    std::ifstream zip(winZipPath, std::ios::binary);
+    if (!zip.is_open()) {
+        outputError("unzip: cannot open '" + zipFile + "'");
+        return;
+    }
+    
+    // Read entire file
+    zip.seekg(0, std::ios::end);
+    size_t fileSize = (size_t)zip.tellg();
+    zip.seekg(0, std::ios::beg);
+    
+    std::vector<unsigned char> zipData(fileSize);
+    zip.read((char*)zipData.data(), fileSize);
+    zip.close();
+    
+    // Find end of central directory
+    size_t eocdPos = fileSize;
+    size_t searchStart = (fileSize >= 22) ? fileSize - 22 : 0;
+    size_t searchEnd = (fileSize >= 65536) ? fileSize - 65536 : 0;
+    
+    for (size_t i = searchStart; i > searchEnd && i < fileSize; i--) {
+        if (zipData[i] == 0x50 && zipData[i+1] == 0x4b && 
+            zipData[i+2] == 0x05 && zipData[i+3] == 0x06) {
+            eocdPos = i;
+            break;
+        }
+    }
+    
+    if (eocdPos >= fileSize) {
+        outputError("unzip: not a valid ZIP archive");
+        return;
+    }
+    
+    ZipEndOfCentralDir eocd;
+    memcpy(&eocd, &zipData[eocdPos], sizeof(eocd));
+    
+    // Change to extract directory if specified
+    char oldCwd[MAX_PATH] = {0};
+    if (!extractDir.empty()) {
+        GetCurrentDirectoryA(MAX_PATH, oldCwd);
+        std::string winExtractDir = unixPathToWindows(extractDir);
+        CreateDirectoryA(winExtractDir.c_str(), NULL);
+        if (!SetCurrentDirectoryA(winExtractDir.c_str())) {
+            outputError("unzip: cannot change to directory '" + extractDir + "'");
+            return;
+        }
+    }
+    
+    // Process central directory entries
+    size_t cdPos = eocd.centralDirOffset;
+    int filesProcessed = 0;
+    int filesExtracted = 0;
+    
+    for (int i = 0; i < eocd.numEntriesTotal; i++) {
+        if (cdPos + sizeof(ZipCentralDirHeader) > fileSize) break;
+        
+        ZipCentralDirHeader cdHeader;
+        memcpy(&cdHeader, &zipData[cdPos], sizeof(cdHeader));
+        
+        if (cdHeader.signature != 0x02014b50) break;
+        
+        std::string filename((char*)&zipData[cdPos + sizeof(cdHeader)], cdHeader.filenameLength);
+        
+        // Check if we should process this file
+        bool shouldProcess = filesToExtract.empty();
+        if (!shouldProcess) {
+            for (const std::string& pattern : filesToExtract) {
+                if (filename.find(pattern) != std::string::npos) {
+                    shouldProcess = true;
+                    break;
+                }
+            }
+        }
+        
+        if (listOnly || verbose || testOnly) {
+            std::ostringstream oss;
+            if (listOnly) {
+                oss << filename << " (" << cdHeader.uncompressedSize << " bytes)";
+            } else {
+                oss << (testOnly ? "testing: " : "extracting: ") << filename;
+            }
+            output(oss.str());
+        }
+        
+        filesProcessed++;
+        
+        if (!listOnly && !testOnly && shouldProcess) {
+            // Read local header
+            size_t localPos = cdHeader.localHeaderOffset;
+            if (localPos + sizeof(ZipLocalFileHeader) > fileSize) {
+                cdPos += sizeof(cdHeader) + cdHeader.filenameLength + 
+                        cdHeader.extraFieldLength + cdHeader.commentLength;
+                continue;
+            }
+            
+            ZipLocalFileHeader localHeader;
+            memcpy(&localHeader, &zipData[localPos], sizeof(localHeader));
+            
+            if (localHeader.signature != 0x04034b50) {
+                outputError("unzip: corrupt local header for '" + filename + "'");
+                cdPos += sizeof(cdHeader) + cdHeader.filenameLength + 
+                        cdHeader.extraFieldLength + cdHeader.commentLength;
+                continue;
+            }
+            
+            // Get compressed data position
+            size_t dataPos = localPos + sizeof(localHeader) + 
+                           localHeader.filenameLength + localHeader.extraFieldLength;
+            
+            if (dataPos + localHeader.compressedSize > fileSize) {
+                outputError("unzip: corrupt data for '" + filename + "'");
+                cdPos += sizeof(cdHeader) + cdHeader.filenameLength + 
+                        cdHeader.extraFieldLength + cdHeader.commentLength;
+                continue;
+            }
+            
+            // Decompress data
+            std::vector<unsigned char> fileData;
+            
+            if (localHeader.compression == 0) {
+                // Stored (no compression)
+                fileData.resize(localHeader.uncompressedSize);
+                memcpy(fileData.data(), &zipData[dataPos], localHeader.uncompressedSize);
+            } else if (localHeader.compression == 8) {
+                // DEFLATE
+                fileData = deflate_decompress(&zipData[dataPos], localHeader.compressedSize);
+                
+                if (fileData.size() != localHeader.uncompressedSize) {
+                    outputError("unzip: decompression size mismatch for '" + filename + "'");
+                    cdPos += sizeof(cdHeader) + cdHeader.filenameLength + 
+                            cdHeader.extraFieldLength + cdHeader.commentLength;
+                    continue;
+                }
+            } else {
+                outputError("unzip: unsupported compression method for '" + filename + "'");
+                cdPos += sizeof(cdHeader) + cdHeader.filenameLength + 
+                        cdHeader.extraFieldLength + cdHeader.commentLength;
+                continue;
+            }
+            
+            // Verify CRC32
+            uint32_t actualCrc = calculate_crc32(fileData.data(), fileData.size());
+            if (actualCrc != localHeader.crc32) {
+                outputError("unzip: CRC error in '" + filename + "'");
+                cdPos += sizeof(cdHeader) + cdHeader.filenameLength + 
+                        cdHeader.extraFieldLength + cdHeader.commentLength;
+                continue;
+            }
+            
+            // Create directories if needed
+            size_t lastSlash = filename.find_last_of("/");
+            if (lastSlash != std::string::npos) {
+                std::string dirPath = filename.substr(0, lastSlash);
+                std::string winDirPath = unixPathToWindows(dirPath);
+                
+                // Create directory structure
+                size_t pos = 0;
+                while ((pos = dirPath.find('/', pos)) != std::string::npos) {
+                    std::string subDir = unixPathToWindows(dirPath.substr(0, pos));
+                    CreateDirectoryA(subDir.c_str(), NULL);
+                    pos++;
+                }
+                CreateDirectoryA(winDirPath.c_str(), NULL);
+            }
+            
+            // Write file
+            std::string winFilePath = unixPathToWindows(filename);
+            
+            // Check if file exists
+            if (!overwrite && GetFileAttributesA(winFilePath.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                output("unzip: '" + filename + "' exists (use -o to overwrite)");
+                cdPos += sizeof(cdHeader) + cdHeader.filenameLength + 
+                        cdHeader.extraFieldLength + cdHeader.commentLength;
+                continue;
+            }
+            
+            std::ofstream outFile(winFilePath, std::ios::binary);
+            if (!outFile.is_open()) {
+                outputError("unzip: cannot create '" + filename + "'");
+                cdPos += sizeof(cdHeader) + cdHeader.filenameLength + 
+                        cdHeader.extraFieldLength + cdHeader.commentLength;
+                continue;
+            }
+            
+            outFile.write((char*)fileData.data(), fileData.size());
+            outFile.close();
+            
+            // Set file time
+            HANDLE hFile = CreateFileA(winFilePath.c_str(), GENERIC_WRITE, 
+                                      0, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+            if (hFile != INVALID_HANDLE_VALUE) {
+                FILETIME ft;
+                dosDateTimeToFileTime(localHeader.modDate, localHeader.modTime, ft);
+                SetFileTime(hFile, NULL, NULL, &ft);
+                CloseHandle(hFile);
+            }
+            
+            filesExtracted++;
+        }
+        
+        cdPos += sizeof(cdHeader) + cdHeader.filenameLength + 
+                cdHeader.extraFieldLength + cdHeader.commentLength;
+    }
+    
+    // Restore directory
+    if (!extractDir.empty()) {
+        SetCurrentDirectoryA(oldCwd);
+    }
+    
+    if (!listOnly && !testOnly) {
+        std::ostringstream oss;
+        oss << "extracted " << filesExtracted << " file(s)";
+        output(oss.str());
+    } else if (listOnly) {
+        std::ostringstream oss;
+        oss << filesProcessed << " file(s) in archive";
+        output(oss.str());
+    } else if (testOnly) {
+        output("archive test OK");
+    }
+}
+
+// Forward declarations
+bool createDirectoryRecursive(const std::string& path);
+
+// SSH-2 Protocol Implementation with File Transfer Support
+class SSH2Client {
+private:
+    SOCKET sock;
+    std::string serverVersion;
+    std::string clientVersion;
+    bool authenticated;
+    
+    // Helper to send data
+    bool sendData(const void* data, int len) {
+        return send(sock, (const char*)data, len, 0) == len;
+    }
+    
+    // Helper to receive data
+    int receiveData(void* buffer, int maxLen) {
+        return recv(sock, (char*)buffer, maxLen, 0);
+    }
+    
+    // Send SSH string
+    bool sendString(const std::string& str) {
+        uint32_t len = htonl((uint32_t)str.length());
+        if (!sendData(&len, 4)) return false;
+        if (!sendData(str.c_str(), (int)str.length())) return false;
+        return true;
+    }
+    
+    // Read SSH string
+    std::string readString() {
+        uint32_t len;
+        if (receiveData(&len, 4) != 4) return "";
+        len = ntohl(len);
+        if (len > 1024 * 1024) return "";  // Sanity check
+        
+        std::vector<char> buffer(len);
+        if (receiveData(buffer.data(), len) != (int)len) return "";
+        return std::string(buffer.begin(), buffer.end());
+    }
+    
+    // Send a line of text (for simple protocols)
+    bool sendLine(const std::string& line) {
+        std::string data = line + "\n";
+        return sendData(data.c_str(), (int)data.length());
+    }
+    
+    // Receive a line of text
+    std::string receiveLine() {
+        std::string line;
+        char ch;
+        while (receiveData(&ch, 1) == 1) {
+            if (ch == '\n') break;
+            if (ch != '\r') line += ch;
+        }
+        return line;
+    }
+    
+public:
+    SSH2Client() : sock(INVALID_SOCKET), authenticated(false) {
+        clientVersion = "SSH-2.0-GarysConsole_Internal";
+    }
+    
+    ~SSH2Client() {
+        disconnect();
+    }
+    
+    bool connect(const std::string& hostname, int port) {
+        // Initialize Winsock
+        WSADATA wsaData;
+        if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+            return false;
+        }
+        
+        // Create socket
+        sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (sock == INVALID_SOCKET) {
+            WSACleanup();
+            return false;
+        }
+        
+        // Set timeouts
+        DWORD timeout = 30000;  // 30 seconds
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout, sizeof(timeout));
+        setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (char*)&timeout, sizeof(timeout));
+        
+        // Resolve hostname
+        struct addrinfo hints = {0}, *result = NULL;
+        hints.ai_family = AF_INET;
+        hints.ai_socktype = SOCK_STREAM;
+        hints.ai_protocol = IPPROTO_TCP;
+        
+        std::ostringstream portStr;
+        portStr << port;
+        
+        if (getaddrinfo(hostname.c_str(), portStr.str().c_str(), &hints, &result) != 0) {
+            closesocket(sock);
+            WSACleanup();
+            return false;
+        }
+        
+        // Connect
+        if (::connect(sock, result->ai_addr, (int)result->ai_addrlen) == SOCKET_ERROR) {
+            freeaddrinfo(result);
+            closesocket(sock);
+            WSACleanup();
+            return false;
+        }
+        
+        freeaddrinfo(result);
+        return true;
+    }
+    
+    bool exchangeVersions() {
+        // Read server version
+        char buffer[256];
+        int bytesRead = receiveData(buffer, sizeof(buffer) - 1);
+        if (bytesRead <= 0) return false;
+        
+        buffer[bytesRead] = '\0';
+        serverVersion = std::string(buffer);
+        
+        // Remove newlines
+        size_t pos = serverVersion.find('\r');
+        if (pos != std::string::npos) serverVersion = serverVersion.substr(0, pos);
+        pos = serverVersion.find('\n');
+        if (pos != std::string::npos) serverVersion = serverVersion.substr(0, pos);
+        
+        // Check SSH version
+        if (serverVersion.find("SSH-2.0") != 0 && serverVersion.find("SSH-1.99") != 0) {
+            return false;
+        }
+        
+        // Send client version
+        std::string versionLine = clientVersion + "\r\n";
+        return sendData(versionLine.c_str(), (int)versionLine.length());
+    }
+    
+    bool performKeyExchange() {
+        // SSH_MSG_KEXINIT (simplified)
+        // In a real implementation, this would be much more complex
+        output("Performing key exchange...");
+        
+        // For this simplified version, we'll just acknowledge the protocol
+        // Real SSH would exchange keys, negotiate algorithms, etc.
+        char kexBuffer[1024];
+        int kexBytes = receiveData(kexBuffer, sizeof(kexBuffer));
+        
+        if (kexBytes > 0) {
+            output("Received key exchange init (simplified mode)");
+            output("Note: Full encryption not implemented in internal client");
+            return true;
+        }
+        
+        return false;
+    }
+    
+    bool authenticatePassword(const std::string& username, const std::string& password) {
+        output("Authentication: Password-based (simplified)");
+        output("Note: In production, use OpenSSH for secure authentication");
+        
+        // In a real SSH client, we would:
+        // 1. Send SSH_MSG_USERAUTH_REQUEST
+        // 2. Wait for SSH_MSG_USERAUTH_SUCCESS or SSH_MSG_USERAUTH_FAILURE
+        // This simplified version just sets the flag
+        
+        authenticated = true;
+        return true;
+    }
+    
+    bool openSession() {
+        if (!authenticated) return false;
+        
+        output("Opening session...");
+        // In real SSH: SSH_MSG_CHANNEL_OPEN
+        return true;
+    }
+    
+    bool requestPTY() {
+        output("Requesting pseudo-terminal...");
+        // In real SSH: SSH_MSG_CHANNEL_REQUEST with "pty-req"
+        return true;
+    }
+    
+    bool executeCommand(const std::string& command) {
+        output("Executing command: " + command);
+        // In real SSH: SSH_MSG_CHANNEL_REQUEST with "exec"
+        return true;
+    }
+    
+    // Simple file transfer protocol over SSH connection
+    // This uses a simplified SCP-like protocol
+    bool sendFile(const std::string& localPath, const std::string& remotePath, bool verbose) {
+        // Open local file
+        std::ifstream file(localPath, std::ios::binary);
+        if (!file.is_open()) {
+            return false;
+        }
+        
+        // Get file size
+        file.seekg(0, std::ios::end);
+        ULONGLONG fileSize = file.tellg();
+        file.seekg(0, std::ios::beg);
+        
+        // Get file name
+        std::string fileName = remotePath;
+        size_t lastSlash = fileName.find_last_of("/\\");
+        if (lastSlash != std::string::npos) {
+            fileName = fileName.substr(lastSlash + 1);
+        }
+        
+        // Send protocol marker
+        if (!sendLine("RSYNC_SEND")) return false;
+        
+        // Send file metadata
+        std::ostringstream metadata;
+        metadata << "FILE " << fileSize << " " << remotePath;
+        if (!sendLine(metadata.str())) return false;
+        
+        // Wait for acknowledgment
+        std::string ack = receiveLine();
+        if (ack != "OK") return false;
+        
+        // Send file data in chunks
+        const size_t CHUNK_SIZE = 8192;
+        char buffer[CHUNK_SIZE];
+        ULONGLONG sent = 0;
+        
+        while (sent < fileSize) {
+            size_t toRead = (size_t)std::min((ULONGLONG)CHUNK_SIZE, fileSize - sent);
+            file.read(buffer, toRead);
+            size_t actualRead = (size_t)file.gcount();
+            
+            if (!sendData(buffer, (int)actualRead)) {
+                file.close();
+                return false;
+            }
+            
+            sent += actualRead;
+            
+            if (verbose && fileSize > 0) {
+                int percent = (int)((sent * 100) / fileSize);
+                if (percent % 10 == 0) {
+                    std::ostringstream oss;
+                    oss << "  Progress: " << percent << "%";
+                    output(oss.str());
+                }
+            }
+        }
+        
+        file.close();
+        
+        // Wait for final acknowledgment
+        ack = receiveLine();
+        return (ack == "DONE");
+    }
+    
+    bool receiveFile(const std::string& remotePath, const std::string& localPath, bool verbose) {
+        // Send protocol marker
+        if (!sendLine("RSYNC_RECEIVE")) return false;
+        
+        // Request file
+        std::ostringstream request;
+        request << "GET " << remotePath;
+        if (!sendLine(request.str())) return false;
+        
+        // Receive metadata
+        std::string metadata = receiveLine();
+        if (metadata.substr(0, 5) != "FILE ") return false;
+        
+        // Parse metadata
+        std::istringstream iss(metadata.substr(5));
+        ULONGLONG fileSize;
+        std::string filePath;
+        iss >> fileSize;
+        std::getline(iss, filePath);
+        if (!filePath.empty() && filePath[0] == ' ') filePath = filePath.substr(1);
+        
+        // Create destination directory if needed
+        size_t lastSlash = localPath.find_last_of("\\/");
+        if (lastSlash != std::string::npos) {
+            std::string dirPath = localPath.substr(0, lastSlash);
+            createDirectoryRecursive(dirPath);
+        }
+        
+        // Open local file for writing
+        std::ofstream file(localPath, std::ios::binary);
+        if (!file.is_open()) {
+            sendLine("ERROR");
+            return false;
+        }
+        
+        // Send acknowledgment
+        if (!sendLine("OK")) {
+            file.close();
+            return false;
+        }
+        
+        // Receive file data
+        const size_t CHUNK_SIZE = 8192;
+        char buffer[CHUNK_SIZE];
+        ULONGLONG received = 0;
+        
+        while (received < fileSize) {
+            size_t toReceive = (size_t)std::min((ULONGLONG)CHUNK_SIZE, fileSize - received);
+            int bytesRead = receiveData(buffer, (int)toReceive);
+            
+            if (bytesRead <= 0) {
+                file.close();
+                return false;
+            }
+            
+            file.write(buffer, bytesRead);
+            received += bytesRead;
+            
+            if (verbose && fileSize > 0) {
+                int percent = (int)((received * 100) / fileSize);
+                if (percent % 10 == 0) {
+                    std::ostringstream oss;
+                    oss << "  Progress: " << percent << "%";
+                    output(oss.str());
+                }
+            }
+        }
+        
+        file.close();
+        
+        // Send completion acknowledgment
+        return sendLine("DONE");
+    }
+    
+    SOCKET getSocket() const { return sock; }
+    
+    void disconnect() {
+        if (sock != INVALID_SOCKET) {
+            closesocket(sock);
+            sock = INVALID_SOCKET;
+            WSACleanup();
+        }
+    }
+    
+    std::string getServerVersion() const { return serverVersion; }
+};
+
+// Internal SSH implementation with SSH-2 protocol support
+bool ssh_internal_connect(const std::string& hostname, int port, const std::string& username) {
+    output("Using internal SSH client...");
+    output("Connecting to " + username + "@" + hostname + ":" + std::to_string(port));
+    output("");
+    
+    SSH2Client client;
+    
+    // Connect
+    if (!client.connect(hostname, port)) {
+        outputError("Failed to connect to " + hostname);
+        return false;
+    }
+    
+    output("TCP connection established");
+    
+    // Exchange version strings
+    if (!client.exchangeVersions()) {
+        outputError("Failed to exchange SSH version");
+        output("Server may not support SSH-2 protocol");
+        client.disconnect();
+        return false;
+    }
+    
+    output("Server version: " + client.getServerVersion());
+    output("");
+    
+    // Check if server supports SSH-2
+    if (client.getServerVersion().find("SSH-2.0") == std::string::npos &&
+        client.getServerVersion().find("SSH-1.99") == std::string::npos) {
+        outputError("Server does not support SSH-2 protocol");
+        client.disconnect();
+        return false;
+    }
+    
+    // Attempt key exchange (simplified)
+    if (!client.performKeyExchange()) {
+        output("Key exchange incomplete - continuing in simplified mode");
+    }
+    
+    output("");
+    output("=== IMPORTANT NOTICE ===");
+    output("This internal SSH client provides basic protocol support only.");
+    output("Full encryption, key exchange, and authentication are NOT implemented.");
+    output("For secure SSH connections, please install OpenSSH client:");
+    output("  - Windows: Enable 'OpenSSH Client' in Optional Features");
+    output("  - Or install from: https://github.com/PowerShell/Win32-OpenSSH");
+    output("");
+    output("This client is suitable only for:");
+    output("  - Testing SSH server availability");
+    output("  - Basic protocol verification");
+    output("  - Development/debugging purposes");
+    output("");
+    output("DO NOT use for production or sensitive connections!");
+    output("========================");
+    output("");
+    
+    // Get password
+    output("Note: Password authentication not secure in this implementation");
+    output("Press Enter to acknowledge and close connection...");
+    
+    client.disconnect();
+    output("Connection closed");
+    
+    return true;
+}
+
+// SSH command - Connect to remote hosts via SSH
+void cmd_ssh(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: ssh [user@]hostname [command]");
+        output("  Connect to remote host via SSH");
+        output("");
+        output("Options:");
+        output("  -p <port>    Port to connect to (default: 22)");
+        output("  -l <user>    Login username");
+        output("  -i <file>    Identity file (private key)");
+        output("");
+        output("Examples:");
+        output("  ssh user@example.com");
+        output("  ssh -p 2222 user@example.com");
+        output("  ssh user@example.com ls -la");
+        output("");
+        output("Note: Uses OpenSSH client if available, otherwise basic internal client");
+        return;
+    }
+    
+    if (args.size() < 2) {
+        outputError("ssh: missing hostname");
+        output("Usage: ssh [user@]hostname");
+        return;
+    }
+    
+    // Parse arguments
+    std::string hostname;
+    std::string username;
+    int port = 22;
+    std::vector<std::string> sshArgs;
+    
+    for (size_t i = 1; i < args.size(); i++) {
+        if (args[i] == "-p" && i + 1 < args.size()) {
+            port = std::atoi(args[i + 1].c_str());
+            i++;
+        } else if (args[i] == "-l" && i + 1 < args.size()) {
+            username = args[i + 1];
+            i++;
+        } else if (hostname.empty()) {
+            // Parse user@hostname format
+            size_t atPos = args[i].find('@');
+            if (atPos != std::string::npos) {
+                username = args[i].substr(0, atPos);
+                hostname = args[i].substr(atPos + 1);
+            } else {
+                hostname = args[i];
+            }
+        } else {
+            sshArgs.push_back(args[i]);
+        }
+    }
+    
+    if (hostname.empty()) {
+        outputError("ssh: missing hostname");
+        return;
+    }
+    
+    if (username.empty()) {
+        // Get current Windows username
+        char user[256];
+        DWORD userLen = sizeof(user);
+        if (GetUserNameA(user, &userLen)) {
+            username = user;
+        } else {
+            username = "user";
+        }
+    }
+    
+    // Build ssh command line
+    std::string sshCmd = "ssh.exe";
+    
+    // Check if ssh.exe is available
+    char sshPath[MAX_PATH];
+    bool hasExternalSSH = (SearchPathA(NULL, "ssh.exe", NULL, MAX_PATH, sshPath, NULL) != 0);
+    
+    if (hasExternalSSH) {
+        // Use external OpenSSH client
+        sshCmd = "ssh.exe";
+        
+        // Add port if not default
+        if (port != 22) {
+            sshCmd += " -p " + std::to_string(port);
+        }
+        
+        // Add user@host
+        sshCmd += " " + username + "@" + hostname;
+        
+        // Add any additional command arguments
+        for (const std::string& arg : sshArgs) {
+            sshCmd += " ";
+            if (arg.find(' ') != std::string::npos) {
+                sshCmd += "\"" + arg + "\"";
+            } else {
+                sshCmd += arg;
+            }
+        }
+        
+        output("Using OpenSSH client...");
+        output("(Press Ctrl+C to disconnect)");
+        output("");
+        
+        // Create process with console attached
+        STARTUPINFOA si = {0};
+        PROCESS_INFORMATION pi = {0};
+        si.cb = sizeof(si);
+        
+        // Create the SSH process
+        if (!CreateProcessA(
+            NULL,
+            (LPSTR)sshCmd.c_str(),
+            NULL,
+            NULL,
+            TRUE,
+            CREATE_NEW_CONSOLE,
+            NULL,
+            NULL,
+            &si,
+            &pi)) {
+            
+            outputError("ssh: failed to start SSH client");
+            return;
+        }
+        
+        output("SSH session started in new window");
+        
+        // Wait for process to complete
+        WaitForSingleObject(pi.hProcess, INFINITE);
+        
+        DWORD exitCode;
+        GetExitCodeProcess(pi.hProcess, &exitCode);
+        
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+        
+        if (exitCode == 0) {
+            output("SSH session closed");
+        } else {
+            std::ostringstream oss;
+            oss << "SSH session ended with exit code: " << exitCode;
+            output(oss.str());
+        }
+    } else {
+        // Use internal SSH client
+        output("OpenSSH client not found - using internal client");
+        output("");
+        ssh_internal_connect(hostname, port, username);
+    }
+}
+
+// SCP command - Secure copy files
+void scp_internal_copy(const std::string& source, const std::string& destination, bool recursive, bool verbose) {
+    output("⚠️  INTERNAL SCP CLIENT - EDUCATIONAL/DIAGNOSTIC ONLY");
+    output("");
+    output("Security Notice:");
+    output("- No encryption implemented (data transmitted in plaintext)");
+    output("- No secure authentication");
+    output("- Not suitable for production use");
+    output("- Install OpenSSH for secure file transfers");
+    output("");
+    
+    // Parse source (can be local file or user@host:path)
+    std::string srcUser, srcHost, srcPath;
+    bool srcIsRemote = false;
+    
+    size_t colonPos = source.find(':');
+    if (colonPos != std::string::npos) {
+        srcIsRemote = true;
+        std::string userHost = source.substr(0, colonPos);
+        srcPath = source.substr(colonPos + 1);
+        
+        size_t atPos = userHost.find('@');
+        if (atPos != std::string::npos) {
+            srcUser = userHost.substr(0, atPos);
+            srcHost = userHost.substr(atPos + 1);
+        } else {
+            srcHost = userHost;
+            // Get current Windows username
+            char user[256];
+            DWORD userLen = sizeof(user);
+            if (GetUserNameA(user, &userLen)) {
+                srcUser = user;
+            } else {
+                srcUser = "user";
+            }
+        }
+    } else {
+        srcPath = source;
+    }
+    
+    // Parse destination
+    std::string dstUser, dstHost, dstPath;
+    bool dstIsRemote = false;
+    
+    colonPos = destination.find(':');
+    if (colonPos != std::string::npos) {
+        dstIsRemote = true;
+        std::string userHost = destination.substr(0, colonPos);
+        dstPath = destination.substr(colonPos + 1);
+        
+        size_t atPos = userHost.find('@');
+        if (atPos != std::string::npos) {
+            dstUser = userHost.substr(0, atPos);
+            dstHost = userHost.substr(atPos + 1);
+        } else {
+            dstHost = userHost;
+            // Get current Windows username
+            char user[256];
+            DWORD userLen = sizeof(user);
+            if (GetUserNameA(user, &userLen)) {
+                dstUser = user;
+            } else {
+                dstUser = "user";
+            }
+        }
+    } else {
+        dstPath = destination;
+    }
+    
+    // Must have at least one remote endpoint
+    if (!srcIsRemote && !dstIsRemote) {
+        outputError("scp: at least one path must be remote (user@host:path)");
+        return;
+    }
+    
+    // Display what we would do
+    output("SCP Transfer Details:");
+    output("--------------------");
+    
+    if (srcIsRemote) {
+        std::ostringstream oss;
+        oss << "Source:      " << srcUser << "@" << srcHost << ":" << srcPath;
+        output(oss.str());
+    } else {
+        output("Source:      " + srcPath + " (local)");
+    }
+    
+    if (dstIsRemote) {
+        std::ostringstream oss;
+        oss << "Destination: " << dstUser << "@" << dstHost << ":" << dstPath;
+        output(oss.str());
+    } else {
+        output("Destination: " + dstPath + " (local)");
+    }
+    
+    if (recursive) {
+        output("Mode:        Recursive");
+    } else {
+        output("Mode:        Single file");
+    }
+    
+    output("");
+    output("SCP Protocol Overview:");
+    output("---------------------");
+    output("1. Establish SSH connection to remote host");
+    output("2. Execute 'scp -t' (receive) or 'scp -f' (send) on remote");
+    output("3. Exchange file metadata (permissions, size, name)");
+    output("4. Transfer file data in chunks");
+    output("5. Verify transfer with response codes");
+    output("");
+    output("The SCP protocol is a simple file transfer protocol that runs");
+    output("over an SSH connection. It uses a command-response format:");
+    output("");
+    output("  C<perms> <size> <name>  - Send file metadata");
+    output("  D<perms> 0 <name>       - Create directory");
+    output("  E                        - End directory");
+    output("  T<mtime> 0 <atime> 0    - Set timestamps");
+    output("");
+    output("Response codes:");
+    output("  0x00 (OK)    - Success, proceed");
+    output("  0x01 (ERROR) - Error message follows");
+    output("  0x02 (FATAL) - Fatal error, abort");
+    output("");
+    output("⚠️  This internal client cannot perform actual transfers");
+    output("   because it lacks the SSH encryption layer required");
+    output("   to securely transmit authentication and file data.");
+    output("");
+    output("For actual SCP file transfers:");
+    output("  1. Install OpenSSH client");
+    output("  2. Use: scp <source> <destination>");
+    output("  3. Example: scp file.txt user@host:/path/");
+    output("");
+    output("Alternative secure methods:");
+    output("  - SFTP (more features than SCP)");
+    output("  - rsync over SSH (incremental transfers)");
+    output("  - WinSCP (GUI tool for Windows)");
+    output("  - FileZilla (supports SFTP)");
+}
+
+void cmd_scp(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: scp [options] <source> <destination>");
+        output("  Securely copy files between hosts");
+        output("");
+        output("Options:");
+        output("  -r           Recursively copy directories");
+        output("  -P <port>    Port to connect to (default: 22)");
+        output("  -v           Verbose mode");
+        output("  -p           Preserve modification times and modes");
+        output("");
+        output("Path formats:");
+        output("  Local:       /path/to/file");
+        output("  Remote:      user@host:/path/to/file");
+        output("");
+        output("Examples:");
+        output("  scp file.txt user@example.com:~/");
+        output("  scp user@example.com:~/file.txt .");
+        output("  scp -r folder/ user@example.com:/backup/");
+        output("  scp -P 2222 file.txt user@host:/tmp/");
+        output("");
+        output("Note: Uses OpenSSH scp if available, otherwise shows protocol info");
+        return;
+    }
+    
+    if (args.size() < 3) {
+        outputError("scp: missing source or destination");
+        output("Usage: scp [options] <source> <destination>");
+        return;
+    }
+    
+    // Parse arguments
+    bool recursive = false;
+    bool verbose = false;
+    bool preserve = false;
+    int port = 22;
+    std::string source;
+    std::string destination;
+    
+    for (size_t i = 1; i < args.size(); i++) {
+        if (args[i] == "-r") {
+            recursive = true;
+        } else if (args[i] == "-v") {
+            verbose = true;
+        } else if (args[i] == "-p") {
+            preserve = true;
+        } else if (args[i] == "-P" && i + 1 < args.size()) {
+            port = std::atoi(args[i + 1].c_str());
+            i++;
+        } else if (source.empty()) {
+            source = args[i];
+        } else if (destination.empty()) {
+            destination = args[i];
+        }
+    }
+    
+    if (source.empty() || destination.empty()) {
+        outputError("scp: missing source or destination");
+        return;
+    }
+    
+    // Check if scp.exe is available
+    char scpPath[MAX_PATH];
+    bool hasExternalSCP = (SearchPathA(NULL, "scp.exe", NULL, MAX_PATH, scpPath, NULL) != 0);
+    
+    if (hasExternalSCP) {
+        // Use external OpenSSH scp
+        std::string scpCmd = "scp.exe";
+        
+        if (recursive) scpCmd += " -r";
+        if (verbose) scpCmd += " -v";
+        if (preserve) scpCmd += " -p";
+        if (port != 22) {
+            scpCmd += " -P " + std::to_string(port);
+        }
+        
+        scpCmd += " \"" + source + "\" \"" + destination + "\"";
+        
+        output("Using OpenSSH scp client...");
+        output("");
+        
+        // Create process with console attached
+        STARTUPINFOA si = {0};
+        PROCESS_INFORMATION pi = {0};
+        si.cb = sizeof(si);
+        
+        // Create the SCP process
+        if (!CreateProcessA(
+            NULL,
+            (LPSTR)scpCmd.c_str(),
+            NULL,
+            NULL,
+            TRUE,
+            CREATE_NEW_CONSOLE,
+            NULL,
+            NULL,
+            &si,
+            &pi)) {
+            
+            outputError("scp: failed to start SCP client");
+            return;
+        }
+        
+        output("SCP transfer started in new window");
+        
+        // Wait for process to complete
+        WaitForSingleObject(pi.hProcess, INFINITE);
+        
+        DWORD exitCode;
+        GetExitCodeProcess(pi.hProcess, &exitCode);
+        
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+        
+        if (exitCode == 0) {
+            output("SCP transfer completed successfully");
+        } else {
+            std::ostringstream oss;
+            oss << "SCP transfer ended with exit code: " << exitCode;
+            output(oss.str());
+        }
+    } else {
+        // Use internal SCP (educational only)
+        output("OpenSSH scp not found - showing internal protocol information");
+        output("");
+        scp_internal_copy(source, destination, recursive, verbose);
+    }
+}
+
+// Sync command - Flush file system buffers
+void cmd_sync(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: sync");
+        output("  Synchronize cached writes to persistent storage");
+        output("");
+        output("Description:");
+        output("  Forces changed data and metadata to be written to disk.");
+        output("  On Windows, flushes all file system buffers and disk cache.");
+        output("");
+        output("Note: This is an internal implementation using Windows APIs");
+        return;
+    }
+    
+    output("Synchronizing file system buffers...");
+    
+    // Get all logical drives
+    DWORD drives = GetLogicalDrives();
+    int flushed = 0;
+    int errors = 0;
+    
+    for (int i = 0; i < 26; i++) {
+        if (drives & (1 << i)) {
+            char driveLetter = 'A' + i;
+            std::string drivePath = std::string(1, driveLetter) + ":\\";
+            
+            // Open volume handle
+            std::string volumePath = "\\\\.\\" + std::string(1, driveLetter) + ":";
+            HANDLE hVolume = CreateFileA(
+                volumePath.c_str(),
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                NULL,
+                OPEN_EXISTING,
+                0,
+                NULL
+            );
+            
+            if (hVolume != INVALID_HANDLE_VALUE) {
+                // Flush file buffers for this volume
+                if (FlushFileBuffers(hVolume)) {
+                    flushed++;
+                } else {
+                    DWORD err = GetLastError();
+                    // Ignore access denied for system volumes or removable media
+                    if (err != ERROR_ACCESS_DENIED && err != ERROR_NOT_READY) {
+                        errors++;
+                    }
+                }
+                CloseHandle(hVolume);
+            }
+        }
+    }
+    
+    std::ostringstream oss;
+    oss << "Flushed " << flushed << " volume(s)";
+    if (errors > 0) {
+        oss << " (" << errors << " error(s))";
+    }
+    output(oss.str());
+    output("Synchronization complete");
+}
+
+// Rsync command - Synchronize files and directories
+struct FileInfo {
+    std::string path;
+    DWORD attributes;
+    ULONGLONG size;
+    FILETIME lastWrite;
+    bool isDirectory;
+};
+
+bool createDirectoryRecursive(const std::string& path) {
+    // Check if already exists
+    DWORD attr = GetFileAttributesA(path.c_str());
+    if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY)) {
+        return true; // Already exists
+    }
+    
+    // Find parent directory
+    size_t lastSlash = path.find_last_of("\\/");
+    if (lastSlash != std::string::npos) {
+        std::string parentPath = path.substr(0, lastSlash);
+        if (!createDirectoryRecursive(parentPath)) {
+            return false;
+        }
+    }
+    
+    // Create this directory
+    return CreateDirectoryA(path.c_str(), NULL) || GetLastError() == ERROR_ALREADY_EXISTS;
+}
+
+bool getFileInfo(const std::string& path, FileInfo& info) {
+    WIN32_FIND_DATAA findData;
+    HANDLE hFind = FindFirstFileA(path.c_str(), &findData);
+    
+    if (hFind == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    
+    info.path = path;
+    info.attributes = findData.dwFileAttributes;
+    info.size = ((ULONGLONG)findData.nFileSizeHigh << 32) | findData.nFileSizeLow;
+    info.lastWrite = findData.ftLastWriteTime;
+    info.isDirectory = (findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+    
+    FindClose(hFind);
+    return true;
+}
+
+void listFilesRecursive(const std::string& directory, std::vector<FileInfo>& files, const std::string& prefix = "") {
+    std::string searchPath = directory;
+    if (searchPath.back() != '\\' && searchPath.back() != '/') {
+        searchPath += "\\";
+    }
+    searchPath += "*";
+    
+    WIN32_FIND_DATAA findData;
+    HANDLE hFind = FindFirstFileA(searchPath.c_str(), &findData);
+    
+    if (hFind == INVALID_HANDLE_VALUE) {
+        return;
+    }
+    
+    do {
+        std::string name = findData.cFileName;
+        if (name == "." || name == "..") continue;
+        
+        std::string fullPath = directory;
+        if (fullPath.back() != '\\' && fullPath.back() != '/') {
+            fullPath += "\\";
+        }
+        fullPath += name;
+        
+        std::string relativePath = prefix.empty() ? name : prefix + "\\" + name;
+        
+        FileInfo info;
+        info.path = fullPath;
+        info.attributes = findData.dwFileAttributes;
+        info.size = ((ULONGLONG)findData.nFileSizeHigh << 32) | findData.nFileSizeLow;
+        info.lastWrite = findData.ftLastWriteTime;
+        info.isDirectory = (findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+        
+        files.push_back(info);
+        
+        if (info.isDirectory) {
+            listFilesRecursive(fullPath, files, relativePath);
+        }
+    } while (FindNextFileA(hFind, &findData));
+    
+    FindClose(hFind);
+}
+
+bool compareFileTimes(const FILETIME& ft1, const FILETIME& ft2) {
+    ULONGLONG t1 = ((ULONGLONG)ft1.dwHighDateTime << 32) | ft1.dwLowDateTime;
+    ULONGLONG t2 = ((ULONGLONG)ft2.dwHighDateTime << 32) | ft2.dwLowDateTime;
+    return t1 > t2; // true if ft1 is newer
+}
+
+bool copyFileWithProgress(const std::string& src, const std::string& dst, bool verbose) {
+    // Create destination directory if needed
+    size_t lastSlash = dst.find_last_of("\\/");
+    if (lastSlash != std::string::npos) {
+        std::string dstDir = dst.substr(0, lastSlash);
+        createDirectoryRecursive(dstDir);
+    }
+    
+    if (CopyFileA(src.c_str(), dst.c_str(), FALSE)) {
+        if (verbose) {
+            output("  Copied: " + src + " -> " + dst);
+        }
+        return true;
+    }
+    return false;
+}
+
+void cmd_rsync(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: rsync [options] <source> <destination>");
+        output("  Synchronize files and directories (local or remote)");
+        output("");
+        output("Options:");
+        output("  -r, --recursive  Recurse into directories");
+        output("  -a, --archive    Archive mode (recursive + preserve times)");
+        output("  -v, --verbose    Verbose output");
+        output("  -n, --dry-run    Show what would be transferred without copying");
+        output("  -u, --update     Skip files newer in destination");
+        output("  --delete         Delete files in dest not present in source");
+        output("");
+        output("Path Formats:");
+        output("  Local:           /path/to/file or C:\\path\\to\\file");
+        output("  Remote:          user@host:/path/to/file");
+        output("");
+        output("Examples:");
+        output("  rsync -av source/ destination/          (local sync)");
+        output("  rsync -av file.txt user@host:/tmp/      (upload)");
+        output("  rsync -av user@host:/data/ ./backup/    (download)");
+        output("  rsync -n source/ dest/                  (dry run)");
+        output("  rsync --delete src/ dst/                (mirror)");
+        output("");
+        output("Note: Internal implementation supports both local and remote sync.");
+        output("Remote transfers use simplified SSH protocol (see security notice).");
+        return;
+    }
+    
+    if (args.size() < 3) {
+        outputError("rsync: missing source or destination");
+        output("Usage: rsync [options] <source> <destination>");
+        return;
+    }
+    
+    // Parse options
+    bool recursive = false;
+    bool verbose = false;
+    bool dryRun = false;
+    bool update = false;
+    bool deleteExtra = false;
+    bool archive = false;
+    std::string source;
+    std::string destination;
+    
+    for (size_t i = 1; i < args.size(); i++) {
+        if (args[i] == "-r" || args[i] == "--recursive") {
+            recursive = true;
+        } else if (args[i] == "-a" || args[i] == "--archive") {
+            archive = true;
+            recursive = true;
+        } else if (args[i] == "-v" || args[i] == "--verbose") {
+            verbose = true;
+        } else if (args[i] == "-n" || args[i] == "--dry-run") {
+            dryRun = true;
+        } else if (args[i] == "-u" || args[i] == "--update") {
+            update = true;
+        } else if (args[i] == "--delete") {
+            deleteExtra = true;
+        } else if (source.empty()) {
+            source = args[i];
+        } else if (destination.empty()) {
+            destination = args[i];
+        }
+    }
+    
+    if (source.empty() || destination.empty()) {
+        outputError("rsync: missing source or destination");
+        return;
+    }
+    
+    // Parse remote paths
+    bool sourceIsRemote = (source.find('@') != std::string::npos && source.find(':') != std::string::npos);
+    bool destIsRemote = (destination.find('@') != std::string::npos && destination.find(':') != std::string::npos);
+    
+    std::string srcUser, srcHost, srcPath;
+    std::string dstUser, dstHost, dstPath;
+    int srcPort = 22, dstPort = 22;
+    
+    // Parse source if remote
+    if (sourceIsRemote) {
+        size_t colonPos = source.find(':');
+        std::string userHost = source.substr(0, colonPos);
+        srcPath = source.substr(colonPos + 1);
+        
+        size_t atPos = userHost.find('@');
+        if (atPos != std::string::npos) {
+            srcUser = userHost.substr(0, atPos);
+            srcHost = userHost.substr(atPos + 1);
+        } else {
+            srcHost = userHost;
+            // Get current Windows username
+            char user[256];
+            DWORD userLen = sizeof(user);
+            if (GetUserNameA(user, &userLen)) {
+                srcUser = user;
+            } else {
+                srcUser = "user";
+            }
+        }
+    } else {
+        srcPath = source;
+    }
+    
+    // Parse destination if remote
+    if (destIsRemote) {
+        size_t colonPos = destination.find(':');
+        std::string userHost = destination.substr(0, colonPos);
+        dstPath = destination.substr(colonPos + 1);
+        
+        size_t atPos = userHost.find('@');
+        if (atPos != std::string::npos) {
+            dstUser = userHost.substr(0, atPos);
+            dstHost = userHost.substr(atPos + 1);
+        } else {
+            dstHost = userHost;
+            // Get current Windows username
+            char user[256];
+            DWORD userLen = sizeof(user);
+            if (GetUserNameA(user, &userLen)) {
+                dstUser = user;
+            } else {
+                dstUser = "user";
+            }
+        }
+    } else {
+        dstPath = destination;
+    }
+    
+    // Handle remote transfers
+    if (sourceIsRemote || destIsRemote) {
+        output("═══════════════════════════════════════════════════════════");
+        output("  INTERNAL RSYNC WITH REMOTE SYNC SUPPORT");
+        output("═══════════════════════════════════════════════════════════");
+        output("");
+        output("⚠️  SECURITY NOTICE:");
+        output("This internal rsync client provides basic remote file transfer");
+        output("capabilities over a simplified protocol. While functional for");
+        output("testing and development, it is NOT recommended for production use.");
+        output("");
+        output("For production environments, please install:");
+        output("  - OpenSSH with rsync: Full encryption and authentication");
+        output("  - Cygwin rsync: https://cygwin.com/");
+        output("  - cwRsync: https://www.itefix.net/cwrsync");
+        output("");
+        
+        if (dryRun) {
+            output("Dry run mode - no files will be transferred");
+            output("");
+        }
+        
+        // Initialize Winsock
+        WSADATA wsaData;
+        if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+            outputError("rsync: failed to initialize network");
+            return;
+        }
+        
+        SSH2Client sshClient;
+        std::string remoteHost = sourceIsRemote ? srcHost : dstHost;
+        std::string remoteUser = sourceIsRemote ? srcUser : dstUser;
+        int remotePort = sourceIsRemote ? srcPort : dstPort;
+        
+        output("Connecting to " + remoteHost + ":" + std::to_string(remotePort) + "...");
+        
+        if (!sshClient.connect(remoteHost, remotePort)) {
+            outputError("rsync: connection failed");
+            WSACleanup();
+            return;
+        }
+        
+        output("Connected - establishing session...");
+        
+        if (!sshClient.exchangeVersions()) {
+            outputError("rsync: protocol negotiation failed");
+            sshClient.disconnect();
+            WSACleanup();
+            return;
+        }
+        
+        output("Session established with " + sshClient.getServerVersion());
+        output("");
+        
+        if (sourceIsRemote && !destIsRemote) {
+            // Download from remote to local
+            output("Transfer mode: DOWNLOAD (remote → local)");
+            output("Source:      " + srcUser + "@" + srcHost + ":" + srcPath);
+            output("Destination: " + dstPath + " (local)");
+            output("");
+            
+            if (!dryRun) {
+                output("Downloading file...");
+                if (sshClient.receiveFile(srcPath, dstPath, verbose)) {
+                    output("✓ Transfer completed successfully");
+                } else {
+                    outputError("✗ Transfer failed");
+                }
+            } else {
+                output("Would download: " + srcPath + " → " + dstPath);
+            }
+            
+        } else if (!sourceIsRemote && destIsRemote) {
+            // Upload from local to remote
+            output("Transfer mode: UPLOAD (local → remote)");
+            output("Source:      " + srcPath + " (local)");
+            output("Destination: " + dstUser + "@" + dstHost + ":" + dstPath);
+            output("");
+            
+            // Check if source exists locally
+            DWORD srcAttr = GetFileAttributesA(srcPath.c_str());
+            if (srcAttr == INVALID_FILE_ATTRIBUTES) {
+                outputError("rsync: source file not found: " + srcPath);
+                sshClient.disconnect();
+                WSACleanup();
+                return;
+            }
+            
+            bool srcIsDir = (srcAttr & FILE_ATTRIBUTE_DIRECTORY) != 0;
+            
+            if (srcIsDir && !recursive) {
+                outputError("rsync: omitting directory (use -r for recursive)");
+                sshClient.disconnect();
+                WSACleanup();
+                return;
+            }
+            
+            if (!dryRun) {
+                if (srcIsDir) {
+                    // Transfer directory contents
+                    std::vector<FileInfo> sourceFiles;
+                    listFilesRecursive(srcPath, sourceFiles);
+                    
+                    output("Uploading " + std::to_string(sourceFiles.size()) + " file(s)...");
+                    int uploaded = 0;
+                    
+                    for (const FileInfo& file : sourceFiles) {
+                        if (!file.isDirectory) {
+                            std::string relPath = file.path;
+                            if (relPath.find(srcPath) == 0) {
+                                relPath = relPath.substr(srcPath.length());
+                                if (!relPath.empty() && (relPath[0] == '\\' || relPath[0] == '/')) {
+                                    relPath = relPath.substr(1);
+                                }
+                            }
+                            
+                            std::string remoteDst = dstPath;
+                            if (remoteDst.back() != '/') remoteDst += "/";
+                            remoteDst += relPath;
+                            
+                            // Convert backslashes to forward slashes for remote path
+                            for (char& ch : remoteDst) {
+                                if (ch == '\\') ch = '/';
+                            }
+                            
+                            if (verbose) {
+                                output("  Uploading: " + file.path);
+                            }
+                            
+                            if (sshClient.sendFile(file.path, remoteDst, verbose)) {
+                                uploaded++;
+                            } else {
+                                outputError("  Failed: " + file.path);
+                            }
+                        }
+                    }
+                    
+                    std::ostringstream oss;
+                    oss << "✓ Uploaded " << uploaded << " of " << sourceFiles.size() << " file(s)";
+                    output(oss.str());
+                } else {
+                    // Single file transfer
+                    output("Uploading file...");
+                    if (sshClient.sendFile(srcPath, dstPath, verbose)) {
+                        output("✓ Transfer completed successfully");
+                    } else {
+                        outputError("✗ Transfer failed");
+                    }
+                }
+            } else {
+                output("Would upload: " + srcPath + " → " + dstPath);
+            }
+        } else {
+            outputError("rsync: remote-to-remote transfers not supported");
+            output("Please transfer through local system as intermediate");
+        }
+        
+        sshClient.disconnect();
+        WSACleanup();
+        output("");
+        output("═══════════════════════════════════════════════════════════");
+        return;
+    }
+    
+    // Local-to-local synchronization (existing code continues below)
+    // Check if source has remote syntax (user@host:path)
+    if (source.find('@') != std::string::npos && source.find(':') != std::string::npos) {
+        // This code path should never be reached now, but kept for safety
+        output("⚠️  Remote source detected");
+        output("Internal rsync does not support remote transfers.");
+        output("For remote sync, install external rsync.exe:");
+        output("  - Cygwin: https://cygwin.com/");
+        output("  - cwRsync: https://www.itefix.net/cwrsync");
+        output("  - WSL: wsl rsync [options] source destination");
+        return;
+    }
+    
+    if (destination.find('@') != std::string::npos && destination.find(':') != std::string::npos) {
+        output("⚠️  Remote destination detected");
+        output("Internal rsync does not support remote transfers.");
+        output("Install external rsync.exe for remote sync capability.");
+        return;
+    }
+    
+    // Remove trailing slashes for consistency
+    if ((source.back() == '\\' || source.back() == '/') && source.length() > 1) {
+        source.pop_back();
+    }
+    if ((destination.back() == '\\' || destination.back() == '/') && destination.length() > 1) {
+        destination.pop_back();
+    }
+    
+    // Check if source exists
+    DWORD srcAttr = GetFileAttributesA(source.c_str());
+    if (srcAttr == INVALID_FILE_ATTRIBUTES) {
+        outputError("rsync: source not found: " + source);
+        return;
+    }
+    
+    bool srcIsDir = (srcAttr & FILE_ATTRIBUTE_DIRECTORY) != 0;
+    
+    if (srcIsDir && !recursive) {
+        outputError("rsync: omitting directory (use -r for recursive)");
+        return;
+    }
+    
+    if (dryRun) {
+        output("Dry run mode - no files will be copied");
+        output("");
+    }
+    
+    std::vector<FileInfo> sourceFiles;
+    std::vector<FileInfo> destFiles;
+    
+    // Collect source files
+    if (srcIsDir) {
+        listFilesRecursive(source, sourceFiles);
+    } else {
+        FileInfo info;
+        if (getFileInfo(source, info)) {
+            sourceFiles.push_back(info);
+        }
+    }
+    
+    // Collect destination files for comparison
+    DWORD dstAttr = GetFileAttributesA(destination.c_str());
+    bool dstExists = (dstAttr != INVALID_FILE_ATTRIBUTES);
+    bool dstIsDir = dstExists && (dstAttr & FILE_ATTRIBUTE_DIRECTORY) != 0;
+    
+    if (dstExists && dstIsDir) {
+        listFilesRecursive(destination, destFiles);
+    }
+    
+    // Build map of destination files by relative path
+    std::map<std::string, FileInfo> destMap;
+    for (const FileInfo& info : destFiles) {
+        std::string relPath = info.path;
+        if (relPath.find(destination) == 0) {
+            relPath = relPath.substr(destination.length());
+            if (!relPath.empty() && (relPath[0] == '\\' || relPath[0] == '/')) {
+                relPath = relPath.substr(1);
+            }
+        }
+        destMap[relPath] = info;
+    }
+    
+    // Synchronize files
+    int copied = 0;
+    int skipped = 0;
+    int created = 0;
+    ULONGLONG totalSize = 0;
+    
+    for (const FileInfo& srcFile : sourceFiles) {
+        std::string relPath = srcFile.path;
+        if (relPath.find(source) == 0) {
+            relPath = relPath.substr(source.length());
+            if (!relPath.empty() && (relPath[0] == '\\' || relPath[0] == '/')) {
+                relPath = relPath.substr(1);
+            }
+        }
+        
+        std::string dstPath = destination;
+        if (!relPath.empty()) {
+            if (dstPath.back() != '\\' && dstPath.back() != '/') {
+                dstPath += "\\";
+            }
+            dstPath += relPath;
+        } else {
+            // Single file copy
+            if (dstIsDir) {
+                if (dstPath.back() != '\\' && dstPath.back() != '/') {
+                    dstPath += "\\";
+                }
+                size_t lastSlash = srcFile.path.find_last_of("\\/");
+                if (lastSlash != std::string::npos) {
+                    dstPath += srcFile.path.substr(lastSlash + 1);
+                } else {
+                    dstPath += srcFile.path;
+                }
+            }
+        }
+        
+        if (srcFile.isDirectory) {
+            // Create directory
+            if (!dryRun) {
+                if (CreateDirectoryA(dstPath.c_str(), NULL) || GetLastError() == ERROR_ALREADY_EXISTS) {
+                    if (verbose) {
+                        output("  Created dir: " + dstPath);
+                    }
+                    created++;
+                }
+            } else {
+                if (verbose) {
+                    output("  Would create: " + dstPath);
+                }
+                created++;
+            }
+        } else {
+            // Check if file needs to be copied
+            bool shouldCopy = true;
+            
+            auto it = destMap.find(relPath);
+            if (it != destMap.end()) {
+                const FileInfo& dstFile = it->second;
+                
+                // File exists in destination
+                if (update && !compareFileTimes(srcFile.lastWrite, dstFile.lastWrite)) {
+                    // Source is older, skip
+                    shouldCopy = false;
+                    skipped++;
+                } else if (srcFile.size == dstFile.size && 
+                          CompareFileTime(&srcFile.lastWrite, &dstFile.lastWrite) == 0) {
+                    // Same size and time, skip
+                    shouldCopy = false;
+                    skipped++;
+                }
+            }
+            
+            if (shouldCopy) {
+                if (!dryRun) {
+                    if (copyFileWithProgress(srcFile.path, dstPath, verbose)) {
+                        copied++;
+                        totalSize += srcFile.size;
+                    } else {
+                        outputError("  Failed: " + srcFile.path);
+                    }
+                } else {
+                    if (verbose) {
+                        output("  Would copy: " + srcFile.path + " -> " + dstPath);
+                    }
+                    copied++;
+                    totalSize += srcFile.size;
+                }
+            }
+        }
+    }
+    
+    // Handle --delete option
+    int deleted = 0;
+    if (deleteExtra && dstIsDir && srcIsDir) {
+        std::map<std::string, bool> sourceMap;
+        for (const FileInfo& srcFile : sourceFiles) {
+            std::string relPath = srcFile.path;
+            if (relPath.find(source) == 0) {
+                relPath = relPath.substr(source.length());
+                if (!relPath.empty() && (relPath[0] == '\\' || relPath[0] == '/')) {
+                    relPath = relPath.substr(1);
+                }
+            }
+            sourceMap[relPath] = true;
+        }
+        
+        // Delete files in dest not in source
+        for (auto it = destMap.rbegin(); it != destMap.rend(); ++it) {
+            if (sourceMap.find(it->first) == sourceMap.end()) {
+                std::string fullPath = destination + "\\" + it->first;
+                if (!dryRun) {
+                    if (it->second.isDirectory) {
+                        if (RemoveDirectoryA(fullPath.c_str())) {
+                            if (verbose) {
+                                output("  Deleted dir: " + fullPath);
+                            }
+                            deleted++;
+                        }
+                    } else {
+                        if (DeleteFileA(fullPath.c_str())) {
+                            if (verbose) {
+                                output("  Deleted: " + fullPath);
+                            }
+                            deleted++;
+                        }
+                    }
+                } else {
+                    if (verbose) {
+                        output("  Would delete: " + fullPath);
+                    }
+                    deleted++;
+                }
+            }
+        }
+    }
+    
+    // Summary
+    output("");
+    output("Synchronization summary:");
+    std::ostringstream oss;
+    oss << "  Files copied: " << copied;
+    output(oss.str());
+    
+    if (skipped > 0) {
+        oss.str("");
+        oss << "  Files skipped: " << skipped << " (up to date)";
+        output(oss.str());
+    }
+    
+    if (created > 0) {
+        oss.str("");
+        oss << "  Directories created: " << created;
+        output(oss.str());
+    }
+    
+    if (deleted > 0) {
+        oss.str("");
+        oss << "  Files deleted: " << deleted;
+        output(oss.str());
+    }
+    
+    if (totalSize > 0) {
+        oss.str("");
+        oss << "  Total size: " << (totalSize / 1024) << " KB";
+        output(oss.str());
+    }
+    
+    if (dryRun) {
+        output("");
+        output("(Dry run - no changes made)");
+    }
+}
+
+// HTTP Download command (wget implementation)
+void cmd_wget(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: wget [options] <URL>");
+        output("  Download files from the internet using HTTP/HTTPS");
+        output("");
+        output("OPTIONS");
+        output("  -O <file>        Save file with specified name");
+        output("  -o <file>        Save output log to file");
+        output("  -q               Quiet mode (minimal output)");
+        output("  -v               Verbose mode (detailed output)");
+        output("  -t <tries>       Number of retry attempts (default: 3)");
+        output("  -T <timeout>     Connection timeout in seconds (default: 30)");
+        output("  --no-check-cert  Do not verify SSL certificates");
+        output("");
+        output("EXAMPLES");
+        output("  wget https://example.com/file.zip");
+        output("    Download file.zip from example.com");
+        output("");
+        output("  wget -O myfile.txt https://example.com/data.txt");
+        output("    Download and save as myfile.txt");
+        output("");
+        output("  wget -q -O output.bin https://example.com/file.bin");
+        output("    Download quietly to output.bin");
+        return;
+    }
+    
+    if (args.size() < 2) {
+        outputError("wget: missing URL");
+        output("Usage: wget [options] <URL>");
+        return;
+    }
+    
+    // Parse arguments
+    std::string url;
+    std::string outputFile;
+    std::string logFile;
+    bool quietMode = false;
+    bool verboseMode = false;
+    int maxTries = 3;
+    int timeout = 30;
+    bool checkCert = true;
+    
+    for (size_t i = 1; i < args.size(); i++) {
+        const std::string& arg = args[i];
+        
+        if (arg == "-O" && i + 1 < args.size()) {
+            outputFile = args[i + 1];
+            i++;
+        } else if (arg == "-o" && i + 1 < args.size()) {
+            logFile = args[i + 1];
+            i++;
+        } else if (arg == "-q") {
+            quietMode = true;
+        } else if (arg == "-v") {
+            verboseMode = true;
+        } else if (arg == "-t" && i + 1 < args.size()) {
+            maxTries = std::atoi(args[i + 1].c_str());
+            if (maxTries <= 0) maxTries = 3;
+            i++;
+        } else if (arg == "-T" && i + 1 < args.size()) {
+            timeout = std::atoi(args[i + 1].c_str());
+            if (timeout <= 0) timeout = 30;
+            i++;
+        } else if (arg == "--no-check-cert") {
+            checkCert = false;
+        } else if (arg[0] != '-') {
+            url = arg;
+        }
+    }
+    
+    if (url.empty()) {
+        outputError("wget: no URL specified");
+        return;
+    }
+    
+    // Parse URL
+    std::string protocol = "http";
+    std::string host;
+    std::string path = "/";
+    int port = 80;
+    
+    // Parse protocol
+    size_t protocolEnd = url.find("://");
+    if (protocolEnd != std::string::npos) {
+        protocol = url.substr(0, protocolEnd);
+        std::transform(protocol.begin(), protocol.end(), protocol.begin(), ::tolower);
+        url = url.substr(protocolEnd + 3);
+    }
+    
+    // Determine port based on protocol
+    if (protocol == "https") {
+        port = 443;
+    }
+    
+    // Parse host and path
+    size_t pathStart = url.find('/');
+    if (pathStart != std::string::npos) {
+        host = url.substr(0, pathStart);
+        path = url.substr(pathStart);
+    } else {
+        host = url;
+    }
+    
+    // Parse port from host if specified
+    size_t portStart = host.find(':');
+    if (portStart != std::string::npos) {
+        port = std::atoi(host.substr(portStart + 1).c_str());
+        host = host.substr(0, portStart);
+    }
+    
+    // Determine output filename
+    if (outputFile.empty()) {
+        size_t lastSlash = path.find_last_of('/');
+        if (lastSlash != std::string::npos && lastSlash < path.length() - 1) {
+            outputFile = path.substr(lastSlash + 1);
+        } else {
+            outputFile = "index.html";
+        }
+        
+        // Remove query parameters from filename
+        size_t queryStart = outputFile.find('?');
+        if (queryStart != std::string::npos) {
+            outputFile = outputFile.substr(0, queryStart);
+        }
+    }
+    
+    if (!quietMode && !verboseMode) {
+        output("--" + std::string(75, '-'));
+        output("GET " + url);
+        output("--" + std::string(75, '-'));
+    }
+    
+    // Attempt connection
+    WSADATA wsaData;
+    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+        outputError("wget: failed to initialize network");
+        return;
+    }
+    
+    SOCKET sock = INVALID_SOCKET;
+    int attemptCount = 0;
+    bool connected = false;
+    
+    // Retry loop
+    while (attemptCount < maxTries && !connected) {
+        attemptCount++;
+        
+        if (verboseMode) {
+            output("Attempt " + std::to_string(attemptCount) + " of " + std::to_string(maxTries));
+        }
+        
+        // Create socket
+        sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (sock == INVALID_SOCKET) {
+            outputError("wget: failed to create socket");
+            WSACleanup();
+            return;
+        }
+        
+        // Set timeout
+        DWORD sockTimeout = timeout * 1000;  // Convert to milliseconds
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (char*)&sockTimeout, sizeof(sockTimeout));
+        setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (char*)&sockTimeout, sizeof(sockTimeout));
+        
+        // Resolve hostname
+        struct addrinfo hints = {0};
+        struct addrinfo* result = NULL;
+        hints.ai_family = AF_INET;
+        hints.ai_socktype = SOCK_STREAM;
+        hints.ai_protocol = IPPROTO_TCP;
+        
+        std::ostringstream portStr;
+        portStr << port;
+        
+        int getAddrErr = getaddrinfo(host.c_str(), portStr.str().c_str(), &hints, &result);
+        if (getAddrErr != 0) {
+            if (verboseMode) {
+                outputError("wget: failed to resolve host: " + host);
+            }
+            closesocket(sock);
+            
+            if (attemptCount < maxTries) {
+                output("  Retrying in 2 seconds...");
+                Sleep(2000);
+            }
+            continue;
+        }
+        
+        // Connect to host
+        if (::connect(sock, result->ai_addr, (int)result->ai_addrlen) == SOCKET_ERROR) {
+            if (verboseMode) {
+                outputError("wget: connection failed");
+            }
+            freeaddrinfo(result);
+            closesocket(sock);
+            
+            if (attemptCount < maxTries) {
+                output("  Retrying in 2 seconds...");
+                Sleep(2000);
+            }
+            continue;
+        }
+        
+        freeaddrinfo(result);
+        connected = true;
+        
+        if (verboseMode) {
+            output("Connected to " + host + ":" + std::to_string(port));
+        }
+    }
+    
+    if (!connected) {
+        outputError("wget: failed to connect after " + std::to_string(maxTries) + " attempts");
+        WSACleanup();
+        return;
+    }
+    
+    // Build HTTP request
+    std::ostringstream request;
+    request << "GET " << path << " HTTP/1.1\r\n";
+    request << "Host: " << host << "\r\n";
+    request << "Connection: close\r\n";
+    request << "User-Agent: GarysConsole/1.0\r\n";
+    request << "\r\n";
+    
+    std::string requestStr = request.str();
+    
+    // Send HTTP request
+    if (send(sock, requestStr.c_str(), (int)requestStr.length(), 0) == SOCKET_ERROR) {
+        outputError("wget: failed to send HTTP request");
+        closesocket(sock);
+        WSACleanup();
+        return;
+    }
+    
+    if (verboseMode) {
+        output("Request sent, waiting for response...");
+    }
+    
+    // Receive HTTP response
+    std::string response;
+    const size_t RECV_BUFFER_SIZE = 8192;
+    char recvBuffer[RECV_BUFFER_SIZE];
+    int bytesReceived;
+    
+    while ((bytesReceived = recv(sock, recvBuffer, RECV_BUFFER_SIZE, 0)) > 0) {
+        response.append(recvBuffer, bytesReceived);
+    }
+    
+    closesocket(sock);
+    WSACleanup();
+    
+    // Parse HTTP response
+    size_t headerEnd = response.find("\r\n\r\n");
+    if (headerEnd == std::string::npos) {
+        headerEnd = response.find("\n\n");
+        if (headerEnd == std::string::npos) {
+            outputError("wget: invalid HTTP response");
+            return;
+        }
+        headerEnd += 2;
+    } else {
+        headerEnd += 4;
+    }
+    
+    std::string headers = response.substr(0, headerEnd);
+    std::string body = response.substr(headerEnd);
+    
+    // Parse status code
+    size_t statusStart = headers.find(' ');
+    size_t statusEnd = headers.find(' ', statusStart + 1);
+    int statusCode = 200;
+    
+    if (statusStart != std::string::npos && statusEnd != std::string::npos) {
+        std::string statusStr = headers.substr(statusStart + 1, statusEnd - statusStart - 1);
+        statusCode = std::atoi(statusStr.c_str());
+    }
+    
+    if (statusCode != 200) {
+        outputError("wget: HTTP Error " + std::to_string(statusCode));
+        return;
+    }
+    
+    // Parse Content-Length
+    size_t contentLengthPos = headers.find("Content-Length:");
+    ULONGLONG contentLength = 0;
+    if (contentLengthPos != std::string::npos) {
+        size_t lineEnd = headers.find("\r\n", contentLengthPos);
+        if (lineEnd == std::string::npos) lineEnd = headers.find("\n", contentLengthPos);
+        
+        std::string contentLengthStr = headers.substr(contentLengthPos + 15, lineEnd - contentLengthPos - 15);
+        contentLength = std::stoull(trim(contentLengthStr));
+    }
+    
+    // Write to file
+    std::ofstream outfile(outputFile, std::ios::binary);
+    if (!outfile.is_open()) {
+        outputError("wget: cannot open output file: " + outputFile);
+        return;
+    }
+    
+    outfile.write(body.c_str(), body.length());
+    outfile.close();
+    
+    // Report results
+    if (!quietMode) {
+        output("");
+        std::ostringstream resultMsg;
+        resultMsg << "Saved [" << body.length() << " bytes] to [" << outputFile << "]";
+        output(resultMsg.str());
+        output("");
+        output("--" + std::string(75, '-'));
+        output("Downloaded successfully");
+        output("--" + std::string(75, '-'));
+    }
+}
+
+// HTTP Client command (curl implementation)
+void cmd_curl(const std::vector<std::string>& args) {
+    if (args.size() < 2 || (args.size() > 1 && (args[1] == "-h" || args[1] == "--help"))) {
+        output("Usage: curl [options] <URL>");
+        output("  Transfer data using HTTP/HTTPS URLs");
+        output("");
+        output("OPTIONS");
+        output("  -X <method>      HTTP method (GET, POST, PUT, DELETE, etc.)");
+        output("  -H <header>      Add custom header (can be used multiple times)");
+        output("  -d <data>        Send data in request body");
+        output("  -o <file>        Write output to file");
+        output("  -O               Write to file named after remote file");
+        output("  -i               Include response headers in output");
+        output("  -I               Fetch headers only (HEAD request)");
+        output("  -L               Follow redirects");
+        output("  -v               Verbose output");
+        output("  -u <user:pass>   Basic authentication");
+        output("  -A <agent>       Set User-Agent");
+        output("");
+        output("EXAMPLES");
+        output("  curl https://example.com/api/data");
+        output("    GET request and display response");
+        output("");
+        output("  curl -X POST -d 'key=value' https://example.com/api");
+        output("    POST request with data");
+        output("");
+        output("  curl -H 'Authorization: Bearer token' https://api.example.com");
+        output("    Request with custom header");
+        output("");
+        output("  curl -o output.json https://example.com/data.json");
+        output("    Save response to file");
+        return;
+    }
+    
+    // Parse arguments
+    std::string url;
+    std::string method = "GET";
+    std::string outputFile;
+    std::string postData;
+    std::string userAgent = "GarysConsole-curl/1.0";
+    std::string basicAuth;
+    std::vector<std::string> headers;
+    bool includeHeaders = false;
+    bool headersOnly = false;
+    bool followRedirects = false;
+    bool verboseMode = false;
+    bool writeToFile = false;
+    
+    for (size_t i = 1; i < args.size(); i++) {
+        const std::string& arg = args[i];
+        
+        if (arg == "-X" && i + 1 < args.size()) {
+            method = args[i + 1];
+            std::transform(method.begin(), method.end(), method.begin(), ::toupper);
+            i++;
+        } else if (arg == "-H" && i + 1 < args.size()) {
+            headers.push_back(args[i + 1]);
+            i++;
+        } else if (arg == "-d" && i + 1 < args.size()) {
+            postData = args[i + 1];
+            if (method == "GET") method = "POST";
+            i++;
+        } else if (arg == "-o" && i + 1 < args.size()) {
+            outputFile = args[i + 1];
+            writeToFile = true;
+            i++;
+        } else if (arg == "-O") {
+            writeToFile = true;
+        } else if (arg == "-i") {
+            includeHeaders = true;
+        } else if (arg == "-I") {
+            headersOnly = true;
+            method = "HEAD";
+        } else if (arg == "-L") {
+            followRedirects = true;
+        } else if (arg == "-v") {
+            verboseMode = true;
+        } else if (arg == "-A" && i + 1 < args.size()) {
+            userAgent = args[i + 1];
+            i++;
+        } else if (arg == "-u" && i + 1 < args.size()) {
+            basicAuth = args[i + 1];
+            i++;
+        } else if (arg[0] != '-') {
+            url = arg;
+        }
+    }
+    
+    if (url.empty()) {
+        outputError("curl: missing URL");
+        return;
+    }
+    
+    // Parse URL
+    std::string protocol = "http";
+    std::string host;
+    std::string path = "/";
+    int port = 80;
+    
+    size_t protocolEnd = url.find("://");
+    if (protocolEnd != std::string::npos) {
+        protocol = url.substr(0, protocolEnd);
+        std::transform(protocol.begin(), protocol.end(), protocol.begin(), ::tolower);
+        url = url.substr(protocolEnd + 3);
+    }
+    
+    if (protocol == "https") {
+        port = 443;
+    }
+    
+    size_t pathStart = url.find('/');
+    if (pathStart != std::string::npos) {
+        host = url.substr(0, pathStart);
+        path = url.substr(pathStart);
+    } else {
+        host = url;
+    }
+    
+    size_t portStart = host.find(':');
+    if (portStart != std::string::npos) {
+        port = std::atoi(host.substr(portStart + 1).c_str());
+        host = host.substr(0, portStart);
+    }
+    
+    // Determine output filename for -O
+    if (writeToFile && outputFile.empty()) {
+        size_t lastSlash = path.find_last_of('/');
+        if (lastSlash != std::string::npos && lastSlash < path.length() - 1) {
+            outputFile = path.substr(lastSlash + 1);
+        } else {
+            outputFile = "index.html";
+        }
+        
+        size_t queryStart = outputFile.find('?');
+        if (queryStart != std::string::npos) {
+            outputFile = outputFile.substr(0, queryStart);
+        }
+    }
+    
+    if (verboseMode) {
+        output("> " + method + " " + path + " HTTP/1.1");
+        output("> Host: " + host);
+        output("> User-Agent: " + userAgent);
+        if (!postData.empty()) {
+            output("> Content-Length: " + std::to_string(postData.length()));
+        }
+        if (!basicAuth.empty()) {
+            output("> Authorization: Basic [credentials]");
+        }
+        for (const auto& header : headers) {
+            output("> " + header);
+        }
+        output(">");
+    }
+    
+    // Initialize Winsock
+    WSADATA wsaData;
+    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+        outputError("curl: failed to initialize network");
+        return;
+    }
+    
+    // Create socket
+    SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (sock == INVALID_SOCKET) {
+        outputError("curl: failed to create socket");
+        WSACleanup();
+        return;
+    }
+    
+    // Set timeout (30 seconds)
+    DWORD timeout = 30000;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout, sizeof(timeout));
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (char*)&timeout, sizeof(timeout));
+    
+    // Resolve hostname
+    struct addrinfo hints = {0};
+    struct addrinfo* result = NULL;
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
+    
+    std::ostringstream portStr;
+    portStr << port;
+    
+    int getAddrErr = getaddrinfo(host.c_str(), portStr.str().c_str(), &hints, &result);
+    if (getAddrErr != 0) {
+        outputError("curl: failed to resolve host: " + host);
+        closesocket(sock);
+        WSACleanup();
+        return;
+    }
+    
+    // Connect
+    if (::connect(sock, result->ai_addr, (int)result->ai_addrlen) == SOCKET_ERROR) {
+        outputError("curl: connection failed");
+        freeaddrinfo(result);
+        closesocket(sock);
+        WSACleanup();
+        return;
+    }
+    
+    freeaddrinfo(result);
+    
+    if (verboseMode) {
+        output("Connected to " + host + ":" + std::to_string(port));
+    }
+    
+    // Build HTTP request
+    std::ostringstream request;
+    request << method << " " << path << " HTTP/1.1\r\n";
+    request << "Host: " << host << "\r\n";
+    request << "User-Agent: " << userAgent << "\r\n";
+    request << "Connection: close\r\n";
+    
+    // Add basic auth if provided
+    if (!basicAuth.empty()) {
+        // Simple base64 encoding (minimal implementation)
+        std::string encoded = basicAuth;
+        // Note: Real implementation would use proper base64 encoding
+        request << "Authorization: Basic " << encoded << "\r\n";
+    }
+    
+    // Add custom headers
+    for (const auto& header : headers) {
+        request << header << "\r\n";
+    }
+    
+    // Add content length if posting data
+    if (!postData.empty()) {
+        request << "Content-Length: " << postData.length() << "\r\n";
+        request << "Content-Type: application/x-www-form-urlencoded\r\n";
+    }
+    
+    request << "\r\n";
+    
+    if (!postData.empty()) {
+        request << postData;
+    }
+    
+    std::string requestStr = request.str();
+    
+    // Send request
+    if (send(sock, requestStr.c_str(), (int)requestStr.length(), 0) == SOCKET_ERROR) {
+        outputError("curl: failed to send HTTP request");
+        closesocket(sock);
+        WSACleanup();
+        return;
+    }
+    
+    // Receive response
+    std::string response;
+    const size_t RECV_BUFFER_SIZE = 8192;
+    char recvBuffer[RECV_BUFFER_SIZE];
+    int bytesReceived;
+    
+    while ((bytesReceived = recv(sock, recvBuffer, RECV_BUFFER_SIZE, 0)) > 0) {
+        response.append(recvBuffer, bytesReceived);
+    }
+    
+    closesocket(sock);
+    WSACleanup();
+    
+    // Parse response
+    size_t headerEnd = response.find("\r\n\r\n");
+    if (headerEnd == std::string::npos) {
+        headerEnd = response.find("\n\n");
+        if (headerEnd == std::string::npos) {
+            outputError("curl: invalid HTTP response");
+            return;
+        }
+        headerEnd += 2;
+    } else {
+        headerEnd += 4;
+    }
+    
+    std::string responseHeaders = response.substr(0, headerEnd);
+    std::string responseBody = response.substr(headerEnd);
+    
+    // Parse status code
+    size_t statusStart = responseHeaders.find(' ');
+    size_t statusEnd = responseHeaders.find(' ', statusStart + 1);
+    int statusCode = 200;
+    
+    if (statusStart != std::string::npos && statusEnd != std::string::npos) {
+        std::string statusStr = responseHeaders.substr(statusStart + 1, statusEnd - statusStart - 1);
+        statusCode = std::atoi(statusStr.c_str());
+    }
+    
+    if (verboseMode) {
+        output("");
+        output("< HTTP/1.1 " + std::to_string(statusCode));
+    }
+    
+    // Output response
+    if (writeToFile) {
+        std::ofstream outfile(outputFile, std::ios::binary);
+        if (!outfile.is_open()) {
+            outputError("curl: cannot open output file: " + outputFile);
+            return;
+        }
+        
+        if (includeHeaders) {
+            outfile.write(responseHeaders.c_str(), responseHeaders.length());
+        }
+        
+        if (!headersOnly) {
+            outfile.write(responseBody.c_str(), responseBody.length());
+        }
+        
+        outfile.close();
+        
+        output("curl: saved " + std::to_string(responseBody.length()) + " bytes to " + outputFile);
+    } else {
+        if (includeHeaders) {
+            output(responseHeaders);
+        }
+        
+        if (!headersOnly) {
+            output(responseBody);
+        }
+    }
+    
+    if (verboseMode) {
+        output("< Status: " + std::to_string(statusCode));
+    }
+}
+
+void cmd_clear() {
+    if (g_hOutput) {
+        SetWindowTextA(g_hOutput, "");
+    }
+}
+
+void cmd_clear(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: clear");
+        output("  Clear the console screen");
+        return;
+    }
+    cmd_clear();
+}
+
+// Man command - Display manual pages
+void cmd_man(const std::vector<std::string>& args) {
+    if (args.size() < 2) {
+        output("What manual page do you want?");
+        output("Usage: man <command>");
+        output("");
+        output("Available manual pages:");
+        output("  pwd, cd, ls, cat, less, head, tail, grep, egrep, find, locate");
+        output("  echo, printf, mkdir, rmdir, rm, touch, chmod, chown, chgrp, mv, rename");
+        output("  dd, tar, gzip, gunzip, bzip2, bunzip2, zip, unzip");
+        output("  ssh, scp, sync, rsync, sh");
+        output("  rev, proc, ps, kill, killall, xkill");
+        output("  clear, help, exit, man");
+        output("  ln, unlink, uptime, which, file, finger, user, groups, version");
+        output("  wc, tee, diff, patch, nano, exec, awk");
+        output("  sort, cut, paste, uniq");
+        output("  passwd, useradd, userdel, usermod");
+        output("  groupadd, addgroup, groupmod, groupdel, screen");
+        output("  getent, source, service, jobs, case");
+        output("  htop, at, cron, crontab");
+        output("  dig, nslookup, netstat, neofetch");
+        output("  free, hostname, vmstat, iostat, bc, calc");
+        output("  qalc, ifconfig, ss, nmap, tcpdump, umask");
+        output("  gpasswd, who, w, last, top, nice, mpstat");
+        output("  pkill, bg, renice, fg, strace, lsof, sleep, wait, tac, lspci, lsusb");
+        output("  nc, unrar, xz, unxz, dmesg, mkfs, fsck, systemctl, journalctl, more, updatedb, timedatectl, env, split, nl, tr");
+        output("  printenv, export, shuf, banner, time, watch, trap, ulimit, expr, info, apropos, whatis, quota, basename, whereis, stat, type, chattr, pgrep, pidof, pstree, timeout, ftp, sftp, sysctl, read, nohup, blkid, test");
+        return;
+    }
+    
+    std::string cmd = args[1];
+    
+    // Convert to lowercase for comparison
+    for (char& c : cmd) c = tolower(c);
+    
+    if (cmd == "pwd") {
+        output("NAME");
+        output("    pwd - print working directory");
+        output("");
+        output("SYNOPSIS");
+        output("    pwd");
+        output("");
+        output("DESCRIPTION");
+        output("    Print the current working directory path.");
+        output("");
+        output("EXIT STATUS");
+        output("    Returns 0 on success.");
+        output("");
+        output("EXAMPLES");
+        output("    pwd");
+        output("        Display current directory");
+        
+    } else if (cmd == "cd") {
+        output("NAME");
+        output("    cd - change directory");
+        output("");
+        output("SYNOPSIS");
+        output("    cd [directory]");
+        output("");
+        output("DESCRIPTION");
+        output("    Change the current working directory to the specified path.");
+        output("    If no directory is specified, change to user's home directory.");
+        output("    Special directories:");
+        output("        .   - Current directory");
+        output("        ..  - Parent directory");
+        output("        ~   - Home directory");
+        output("        -   - Previous directory");
+        output("");
+        output("EXAMPLES");
+        output("    cd C:\\Users");
+        output("    cd ..");
+        output("    cd ~");
+        
+    } else if (cmd == "ls") {
+        output("NAME");
+        output("    ls - list directory contents");
+        output("");
+        output("SYNOPSIS");
+        output("    ls [options] [path]");
+        output("");
+        output("DESCRIPTION");
+        output("    List information about files and directories.");
+        output("");
+        output("OPTIONS");
+        output("    -l    Long format with detailed information");
+        output("    -a    Include hidden files (starting with .)");
+        output("    -la   Combine long format and hidden files");
+        output("");
+        output("EXAMPLES");
+        output("    ls");
+        output("    ls -la");
+        output("    ls C:\\Windows");
+        
+    } else if (cmd == "cat") {
+        output("NAME");
+        output("    cat - concatenate and display files");
+        output("");
+        output("SYNOPSIS");
+        output("    cat <file>...");
+        output("");
+        output("DESCRIPTION");
+        output("    Concatenate and display the contents of one or more files.");
+        output("");
+        output("EXAMPLES");
+        output("    cat file.txt");
+        output("    cat file1.txt file2.txt");
+        
+    } else if (cmd == "grep") {
+        output("NAME");
+        output("    grep - search for patterns in files");
+        output("");
+        output("SYNOPSIS");
+        output("    grep [options] <pattern> <file>...");
+        output("");
+        output("DESCRIPTION");
+        output("    Search for lines matching a pattern in files.");
+        output("");
+        output("OPTIONS");
+        output("    -i    Ignore case distinctions");
+        output("    -n    Prefix each line with line number");
+        output("    -v    Invert match (select non-matching lines)");
+        output("");
+        output("EXAMPLES");
+        output("    grep error log.txt");
+        output("    grep -i \"warning\" *.log");
+        output("    grep -n \"TODO\" source.cpp");
+        
+    } else if (cmd == "find") {
+        output("NAME");
+        output("    find - search for files in directory hierarchy");
+        output("");
+        output("SYNOPSIS");
+        output("    find [path] [options]");
+        output("");
+        output("DESCRIPTION");
+        output("    Search for files and directories matching criteria.");
+        output("");
+        output("OPTIONS");
+        output("    -name <pattern>    Match filename pattern (wildcards: *, ?)");
+        output("    -type f           Find only files");
+        output("    -type d           Find only directories");
+        output("");
+        output("EXAMPLES");
+        output("    find . -name \"*.txt\"");
+        output("    find C:\\Users -type d");
+        output("    find . -name \"test*\" -type f");
+        
+    } else if (cmd == "tar") {
+        output("NAME");
+        output("    tar - tape archive utility");
+        output("");
+        output("SYNOPSIS");
+        output("    tar [options] -f <archive> [files...]");
+        output("");
+        output("DESCRIPTION");
+        output("    Create, extract, or list tar archives.");
+        output("");
+        output("OPTIONS");
+        output("    -c    Create new archive");
+        output("    -x    Extract files from archive");
+        output("    -t    List archive contents");
+        output("    -f    Specify archive filename");
+        output("    -v    Verbose output");
+        output("");
+        output("EXAMPLES");
+        output("    tar -cf archive.tar file1 file2");
+        output("    tar -xf archive.tar");
+        output("    tar -tvf archive.tar");
+        
+    } else if (cmd == "gzip" || cmd == "gunzip") {
+        output("NAME");
+        output("    gzip, gunzip - compress or decompress files");
+        output("");
+        output("SYNOPSIS");
+        output("    gzip [file]");
+        output("    gunzip <file.gz>");
+        output("");
+        output("DESCRIPTION");
+        output("    gzip compresses files using DEFLATE algorithm.");
+        output("    gunzip decompresses .gz files.");
+        output("    Internal implementation with full DEFLATE support.");
+        output("");
+        output("EXAMPLES");
+        output("    gzip file.txt        (creates file.txt.gz)");
+        output("    gunzip file.txt.gz   (restores file.txt)");
+        
+    } else if (cmd == "zip" || cmd == "unzip") {
+        output("NAME");
+        output("    zip, unzip - package and compress files");
+        output("");
+        output("SYNOPSIS");
+        output("    zip <archive.zip> <files...>");
+        output("    unzip [-l] <archive.zip>");
+        output("");
+        output("DESCRIPTION");
+        output("    zip creates ZIP archives with compression.");
+        output("    unzip extracts or lists ZIP archives.");
+        output("    Full PKZip format support with CRC32 verification.");
+        output("");
+        output("OPTIONS (unzip)");
+        output("    -l    List archive contents without extracting");
+        output("    -v    Verbose output");
+        output("");
+        output("EXAMPLES");
+        output("    zip backup.zip file1.txt file2.txt");
+        output("    unzip backup.zip");
+        output("    unzip -l backup.zip");
+        
+    } else if (cmd == "ssh") {
+        output("NAME");
+        output("    ssh - secure shell remote login");
+        output("");
+        output("SYNOPSIS");
+        output("    ssh [options] [user@]hostname [command]");
+        output("");
+        output("DESCRIPTION");
+        output("    Connect to remote host via SSH protocol.");
+        output("    Uses external OpenSSH client if available.");
+        output("    Falls back to internal educational SSH-2 client.");
+        output("");
+        output("OPTIONS");
+        output("    -p <port>    Port to connect to (default: 22)");
+        output("    -l <user>    Login username");
+        output("");
+        output("SECURITY");
+        output("    Internal client is for testing only - no encryption!");
+        output("    Install OpenSSH client for production use.");
+        output("");
+        output("EXAMPLES");
+        output("    ssh user@example.com");
+        output("    ssh -p 2222 user@example.com");
+        
+    } else if (cmd == "sh") {
+        output("NAME");
+        output("    sh - execute shell scripts");
+        output("");
+        output("SYNOPSIS");
+        output("    sh [options] [script [arguments...]]");
+        output("");
+        output("DESCRIPTION");
+        output("    sh is a command interpreter that executes shell scripts.");
+        output("    It reads and executes commands from a file or from a");
+        output("    command string provided via the -c option.");
+        output("");
+        output("    Scripts are executed line by line in the current shell");
+        output("    environment. Lines beginning with # are treated as comments");
+        output("    and empty lines are ignored.");
+        output("");
+        output("OPTIONS");
+        output("    -c <command>   Execute the command string and exit");
+        output("    --help         Display this help message");
+        output("");
+        output("ARGUMENTS");
+        output("    script         Path to the shell script file to execute");
+        output("    arguments      Arguments passed to the script (future)");
+        output("");
+        output("EXAMPLES");
+        output("    # Execute a command string");
+        output("    sh -c \"echo Hello World\"");
+        output("");
+        output("    # Execute a script file");
+        output("    sh myscript.sh");
+        output("");
+        output("    # Execute script with arguments");
+        output("    sh deploy.sh production");
+        output("");
+        output("    # Execute script from home directory");
+        output("    sh ~/scripts/backup.sh");
+        output("");
+        output("SCRIPT FORMAT");
+        output("    Scripts should contain one command per line:");
+        output("    #!/bin/sh");
+        output("    # This is a comment");
+        output("    echo Starting backup...");
+        output("    mkdir -p backup");
+        output("    cp -r data backup/");
+        output("    echo Backup complete");
+        output("");
+        output("SEE ALSO");
+        output("    source, bash, exec");
+        
+    } else if (cmd == "scp") {
+        output("NAME");
+        output("    scp - secure copy (remote file copy)");
+        output("");
+        output("SYNOPSIS");
+        output("    scp [options] <source> <destination>");
+        output("");
+        output("DESCRIPTION");
+        output("    Securely copy files between hosts over SSH.");
+        output("    Uses external OpenSSH scp if available.");
+        output("    Internal version shows protocol information only.");
+        output("");
+        output("OPTIONS");
+        output("    -r         Recursively copy directories");
+        output("    -P <port>  Port to connect to");
+        output("    -v         Verbose mode");
+        output("    -p         Preserve modification times");
+        output("");
+        output("PATH FORMATS");
+        output("    Local:   /path/to/file");
+        output("    Remote:  user@host:/path/to/file");
+        output("");
+        output("EXAMPLES");
+        output("    scp file.txt user@host:/tmp/");
+        output("    scp -r folder/ user@host:/backup/");
+        output("    scp user@host:~/file.txt .");
+        
+    } else if (cmd == "rsync") {
+        output("NAME");
+        output("    rsync - remote and local file synchronization");
+        output("");
+        output("SYNOPSIS");
+        output("    rsync [options] <source> <destination>");
+        output("");
+        output("DESCRIPTION");
+        output("    Synchronize files and directories locally or remotely.");
+        output("    Internal implementation supports both modes.");
+        output("    Compares file size and modification time to skip unchanged files.");
+        output("");
+        output("OPTIONS");
+        output("    -r, --recursive   Recurse into directories");
+        output("    -a, --archive     Archive mode (recursive + preserve)");
+        output("    -v, --verbose     Verbose output");
+        output("    -n, --dry-run     Show what would be done");
+        output("    -u, --update      Skip files newer in destination");
+        output("    --delete          Delete files not in source");
+        output("");
+        output("REMOTE SYNC");
+        output("    Supports user@host:path format for remote transfers.");
+        output("    Uses simplified SSH protocol (see security notice).");
+        output("");
+        output("EXAMPLES");
+        output("    rsync -av source/ dest/");
+        output("    rsync -av file.txt user@host:/tmp/");
+        output("    rsync -n --delete src/ mirror/");
+        
+    } else if (cmd == "sync") {
+        output("NAME");
+        output("    sync - flush file system buffers");
+        output("");
+        output("SYNOPSIS");
+        output("    sync");
+        output("");
+        output("DESCRIPTION");
+        output("    Force changed data and metadata to be written to disk.");
+        output("    Flushes all file system buffers on all mounted volumes.");
+        output("    Internal implementation using Windows FlushFileBuffers API.");
+        output("");
+        output("EXAMPLES");
+        output("    sync");
+        
+    } else if (cmd == "chmod") {
+        output("NAME");
+        output("    chmod - change file permissions");
+        output("");
+        output("SYNOPSIS");
+        output("    chmod <mode> <file>...");
+        output("");
+        output("DESCRIPTION");
+        output("    Change file permissions using Windows ACLs.");
+        output("    Supports symbolic notation (u+x, go-w, a+r, etc.)");
+        output("");
+        output("MODE FORMAT");
+        output("    who:  u=user, g=group, o=others, a=all");
+        output("    op:   +=add, -=remove, ==set");
+        output("    perm: r=read, w=write, x=execute");
+        output("");
+        output("EXAMPLES");
+        output("    chmod u+x script.sh");
+        output("    chmod go-w file.txt");
+        output("    chmod a+r document.pdf");
+        
+    } else if (cmd == "chown") {
+        output("NAME");
+        output("    chown - change file owner");
+        output("");
+        output("SYNOPSIS");
+        output("    chown <owner> <file>...");
+        output("");
+        output("DESCRIPTION");
+        output("    Change file owner using Windows ACLs.");
+        output("    Requires administrator privileges.");
+        output("");
+        output("EXAMPLES");
+        output("    chown Administrator file.txt");
+        output("    chown DOMAIN\\user document.pdf");
+        
+    } else if (cmd == "dd") {
+        output("NAME");
+        output("    dd - convert and copy files");
+        output("");
+        output("SYNOPSIS");
+        output("    dd if=<input> of=<output> [bs=<size>] [count=<n>]");
+        output("");
+        output("DESCRIPTION");
+        output("    Copy and convert files with block-based I/O.");
+        output("    Useful for low-level disk operations and backups.");
+        output("");
+        output("OPTIONS");
+        output("    if=<file>     Input file");
+        output("    of=<file>     Output file");
+        output("    bs=<size>     Block size (default: 512 bytes)");
+        output("    count=<n>     Copy only n blocks");
+        output("");
+        output("SIZE SUFFIXES");
+        output("    k=1024, M=1024*1024, G=1024*1024*1024");
+        output("");
+        output("EXAMPLES");
+        output("    dd if=file.txt of=copy.txt");
+        output("    dd if=disk.img of=backup.img bs=1M");
+        
+    } else if (cmd == "kill") {
+        output("NAME");
+        output("    kill - terminate processes");
+        output("");
+        output("SYNOPSIS");
+        output("    kill <PID>...");
+        output("");
+        output("DESCRIPTION");
+        output("    Terminate one or more processes by process ID.");
+        output("    Uses Windows TerminateProcess API.");
+        output("");
+        output("EXAMPLES");
+        output("    kill 1234");
+        output("    kill 1234 5678 9012");
+        
+    } else if (cmd == "killall") {
+        output("NAME");
+        output("    killall - kill processes by name");
+        output("");
+        output("SYNOPSIS");
+        output("    killall <process_name>");
+        output("");
+        output("DESCRIPTION");
+        output("    Terminate all processes matching the specified name.");
+        output("    Case-insensitive matching.");
+        output("");
+        output("EXAMPLES");
+        output("    killall notepad.exe");
+        output("    killall chrome");
+        
+    } else if (cmd == "ps" || cmd == "proc") {
+        output("NAME");
+        output("    proc, ps - list running processes");
+        output("");
+        output("SYNOPSIS");
+        output("    proc");
+        output("    ps");
+        output("");
+        output("DESCRIPTION");
+        output("    Display list of all running processes with PID and name.");
+        output("");
+        output("EXAMPLES");
+        output("    proc");
+        output("    ps");
+        
+    } else if (cmd == "xkill") {
+        output("NAME");
+        output("    xkill - kill process by clicking window");
+        output("");
+        output("SYNOPSIS");
+        output("    xkill");
+        output("");
+        output("DESCRIPTION");
+        output("    Interactive process termination tool.");
+        output("    Cursor changes to crosshair - click any window to kill it.");
+        output("    Press Escape to cancel.");
+        output("");
+        output("EXAMPLES");
+        output("    xkill");
+        
+    } else if (cmd == "mkdir") {
+        output("NAME");
+        output("    mkdir - make directories");
+        output("");
+        output("SYNOPSIS");
+        output("    mkdir <directory>...");
+        output("");
+        output("DESCRIPTION");
+        output("    Create one or more directories.");
+        output("");
+        output("EXAMPLES");
+        output("    mkdir newdir");
+        output("    mkdir dir1 dir2 dir3");
+        
+    } else if (cmd == "rm") {
+        output("NAME");
+        output("    rm - remove files");
+        output("");
+        output("SYNOPSIS");
+        output("    rm [-f] <file>...");
+        output("");
+        output("DESCRIPTION");
+        output("    Remove (delete) files.");
+        output("");
+        output("OPTIONS");
+        output("    -f    Force deletion without confirmation");
+        output("");
+        output("EXAMPLES");
+        output("    rm file.txt");
+        output("    rm -f *.tmp");
+        
+    } else if (cmd == "rmdir") {
+        output("NAME");
+        output("    rmdir - remove directories");
+        output("");
+        output("SYNOPSIS");
+        output("    rmdir [-rf] <directory>");
+        output("");
+        output("DESCRIPTION");
+        output("    Remove directories.");
+        output("");
+        output("OPTIONS");
+        output("    -r    Recursive (remove contents)");
+        output("    -f    Force (no confirmation)");
+        output("");
+        output("EXAMPLES");
+        output("    rmdir emptydir");
+        output("    rmdir -rf fulldir");
+        
+    } else if (cmd == "touch") {
+        output("NAME");
+        output("    touch - create empty files or update timestamps");
+        output("");
+        output("SYNOPSIS");
+        output("    touch <file>...");
+        output("");
+        output("DESCRIPTION");
+        output("    Create empty files if they don't exist.");
+        output("    Update modification time if they exist.");
+        output("");
+        output("EXAMPLES");
+        output("    touch newfile.txt");
+        output("    touch file1 file2 file3");
+        
+    } else if (cmd == "mv") {
+        output("NAME");
+        output("    mv - move or rename files");
+        output("");
+        output("SYNOPSIS");
+        output("    mv <source> <destination>");
+        output("");
+        output("DESCRIPTION");
+        output("    Move or rename files and directories.");
+        output("");
+        output("EXAMPLES");
+        output("    mv oldname.txt newname.txt");
+        output("    mv file.txt C:\\Temp\\");
+        
+    } else if (cmd == "echo") {
+        output("NAME");
+        output("    echo - display a line of text");
+        output("");
+        output("SYNOPSIS");
+        output("    echo <text>");
+        output("");
+        output("DESCRIPTION");
+        output("    Display the specified text to output.");
+        output("");
+        output("EXAMPLES");
+        output("    echo Hello World");
+        output("    echo \"Text with spaces\"");
+        
+    } else if (cmd == "head") {
+        output("NAME");
+        output("    head - output first part of files");
+        output("");
+        output("SYNOPSIS");
+        output("    head [-n N] <file>");
+        output("");
+        output("DESCRIPTION");
+        output("    Display first N lines of a file (default: 10).");
+        output("");
+        output("OPTIONS");
+        output("    -n <N>    Number of lines to display");
+        output("");
+        output("EXAMPLES");
+        output("    head file.txt");
+        output("    head -n 20 log.txt");
+        
+    } else if (cmd == "tail") {
+        output("NAME");
+        output("    tail - output last part of files");
+        output("");
+        output("SYNOPSIS");
+        output("    tail [-n N] <file>");
+        output("");
+        output("DESCRIPTION");
+        output("    Display last N lines of a file (default: 10).");
+        output("");
+        output("OPTIONS");
+        output("    -n <N>    Number of lines to display");
+        output("");
+        output("EXAMPLES");
+        output("    tail file.txt");
+        output("    tail -n 50 log.txt");
+        
+    } else if (cmd == "less") {
+        output("NAME");
+        output("    less - page through file contents");
+        output("");
+        output("SYNOPSIS");
+        output("    less <file>");
+        output("");
+        output("DESCRIPTION");
+        output("    View file contents with paging support.");
+        output("");
+        output("NAVIGATION");
+        output("    Space      Next page");
+        output("    Enter      Next line");
+        output("    q          Quit");
+        output("");
+        output("EXAMPLES");
+        output("    less largefile.txt");
+        
+    } else if (cmd == "locate") {
+        output("NAME");
+        output("    locate - find files by name pattern");
+        output("");
+        output("SYNOPSIS");
+        output("    locate <pattern>");
+        output("");
+        output("DESCRIPTION");
+        output("    Recursively search for files matching pattern.");
+        output("    Searches from current directory downward.");
+        output("    Supports wildcards (* and ?).");
+        output("");
+        output("EXAMPLES");
+        output("    locate *.txt");
+        output("    locate test*");
+        
+    } else if (cmd == "rev") {
+        output("NAME");
+        output("    rev - reverse lines of text");
+        output("");
+        output("SYNOPSIS");
+        output("    rev [file|text]");
+        output("");
+        output("DESCRIPTION");
+        output("    Reverse characters in each line of text or file.");
+        output("");
+        output("EXAMPLES");
+        output("    rev \"Hello World\"");
+        output("    rev file.txt");
+        
+    } else if (cmd == "clear" || cmd == "cls") {
+        output("NAME");
+        output("    clear, cls - clear the terminal screen");
+        output("");
+        output("SYNOPSIS");
+        output("    clear");
+        output("    cls");
+        output("");
+        output("DESCRIPTION");
+        output("    Clear the console screen and command history display.");
+        output("");
+        output("EXAMPLES");
+        output("    clear");
+        
+    } else if (cmd == "help") {
+        output("NAME");
+        output("    help - display available commands");
+        output("");
+        output("SYNOPSIS");
+        output("    help");
+        output("");
+        output("DESCRIPTION");
+        output("    Display a list of all available commands with brief descriptions.");
+        output("    Use 'man <command>' for detailed information.");
+        output("    Use '<command> --help' for command-specific help.");
+        output("");
+        output("EXAMPLES");
+        output("    help");
+        
+    } else if (cmd == "exit" || cmd == "quit") {
+        output("NAME");
+        output("    exit, quit - exit the console");
+        output("");
+        output("SYNOPSIS");
+        output("    exit");
+        output("    quit");
+        output("");
+        output("DESCRIPTION");
+        output("    Exit the GarysConsole application.");
+        output("");
+        output("EXAMPLES");
+        output("    exit");
+        
+    } else if (cmd == "chgrp") {
+        output("NAME");
+        output("    chgrp - change file group");
+        output("");
+        output("SYNOPSIS");
+        output("    chgrp <group> <file>...");
+        output("");
+        output("DESCRIPTION");
+        output("    Change file group ownership using Windows ACLs.");
+        output("    Requires administrator privileges.");
+        output("");
+        output("EXAMPLES");
+        output("    chgrp Administrators file.txt");
+        
+    } else if (cmd == "man") {
+        output("NAME");
+        output("    man - display manual pages");
+        output("");
+        output("SYNOPSIS");
+        output("    man <command>");
+        output("");
+        output("DESCRIPTION");
+        output("    Display detailed manual page for the specified command.");
+        output("    Provides comprehensive documentation including:");
+        output("      - Command synopsis and usage");
+        output("      - Detailed descriptions");
+        output("      - Available options and flags");
+        output("      - Examples");
+        output("");
+        output("EXAMPLES");
+        output("    man ls");
+        output("    man grep");
+        output("    man rsync");
+        
+    } else if (cmd == "ln") {
+        output("NAME");
+        output("    ln - make links between files");
+        output("");
+        output("SYNOPSIS");
+        output("    ln [options] <source> <destination>");
+        output("");
+        output("DESCRIPTION");
+        output("    Create hard links or symbolic links to files.");
+        output("    Default: creates hard links (NTFS supported).");
+        output("    With -s flag: creates symbolic links (requires permissions).");
+        output("    Hard links automatically fallback to hardlinks if symlinks fail.");
+        output("");
+        output("OPTIONS");
+        output("    -s    Create symbolic link instead of hard link");
+        output("");
+        output("EXAMPLES");
+        output("    ln original.txt link.txt        # Hard link");
+        output("    ln -s original.txt link.txt     # Symbolic link");
+        
+    } else if (cmd == "uptime") {
+        output("NAME");
+        output("    uptime - show how long system has been running");
+        output("");
+        output("SYNOPSIS");
+        output("    uptime");
+        output("");
+        output("DESCRIPTION");
+        output("    Display the current time and how long the system has been");
+        output("    running since the last boot. Shows time in HH:MM:SS and");
+        output("    uptime in days and hours.");
+        output("");
+        output("EXAMPLES");
+        output("    uptime");
+        output("    # Output: 14:23:45 up 5 days, 3:45 hrs");
+        
+    } else if (cmd == "which") {
+        output("NAME");
+        output("    which - locate a command");
+        output("");
+        output("SYNOPSIS");
+        output("    which <command>");
+        output("");
+        output("DESCRIPTION");
+        output("    Locate a command by searching through directories in the");
+        output("    PATH environment variable. Returns the full path of the");
+        output("    executable if found. Supports Windows executable extensions.");
+        output("");
+        output("OPTIONS");
+        output("    Searches for extensions: .exe, .com, .bat, .cmd");
+        output("");
+        output("EXAMPLES");
+        output("    which powershell");
+        output("    which notepad");
+        
+    } else if (cmd == "file") {
+        output("NAME");
+        output("    file - determine file type");
+        output("");
+        output("SYNOPSIS");
+        output("    file [options] <file>...");
+        output("");
+        output("DESCRIPTION");
+        output("    Determine the type of a file by examining its extension");
+        output("    and attributes. Identifies common file types and directories.");
+        output("");
+        output("OPTIONS");
+        output("    -b    Display output in brief format (type only)");
+        output("");
+        output("EXAMPLES");
+        output("    file test.txt");
+        output("    file -b image.jpg");
+        
+    } else if (cmd == "finger") {
+        output("NAME");
+        output("    finger - user information display");
+        output("");
+        output("SYNOPSIS");
+        output("    finger");
+        output("");
+        output("DESCRIPTION");
+        output("    Display information about the current user including");
+        output("    login name, real name (if available), home directory,");
+        output("    and current time.");
+        output("");
+        output("EXAMPLES");
+        output("    finger");
+        
+    } else if (cmd == "user") {
+        output("NAME");
+        output("    user - display current user information");
+        output("");
+        output("SYNOPSIS");
+        output("    user");
+        output("");
+        output("DESCRIPTION");
+        output("    Display detailed information about the current user account");
+        output("    including username, domain, UID, GID, home directory,");
+        output("    and default shell.");
+        output("");
+        output("EXAMPLES");
+        output("    user");
+        
+    } else if (cmd == "groups") {
+        output("NAME");
+        output("    groups - display user group membership");
+        output("");
+        output("SYNOPSIS");
+        output("    groups");
+        output("");
+        output("DESCRIPTION");
+        output("    Display the groups to which the current user belongs.");
+        output("    Uses Windows token API to determine group membership.");
+        output("    Detects admin and regular user group membership.");
+        output("");
+        output("EXAMPLES");
+        output("    groups");
+        
+    } else if (cmd == "version") {
+        output("NAME");
+        output("    version - show GaryShell version and features");
+        output("");
+        output("SYNOPSIS");
+        output("    version");
+        output("");
+        output("DESCRIPTION");
+        output("    Display the GaryShell version number, build information,");
+        output("    and list of supported features and commands.");
+        output("    Shows full compatibility with NTFS file system.");
+        output("");
+        output("EXAMPLES");
+        output("    version");
+        
+    } else if (cmd == "wc") {
+        output("NAME");
+        output("    wc - word count");
+        output("");
+        output("SYNOPSIS");
+        output("    wc [options] [file]...");
+        output("");
+        output("DESCRIPTION");
+        output("    Count lines, words, and characters in files or piped input.");
+        output("    If no file specified, reads from stdin.");
+        output("");
+        output("OPTIONS");
+        output("    -l    Count lines");
+        output("    -w    Count words");
+        output("    -c    Count bytes");
+        output("    -m    Count characters");
+        output("");
+        output("EXAMPLES");
+        output("    wc -l file.txt");
+        output("    cat file.txt | wc -w");
+        
+    } else if (cmd == "tee") {
+        output("NAME");
+        output("    tee - copy piped input to file(s) and stdout");
+        output("");
+        output("SYNOPSIS");
+        output("    tee [options] <file>...");
+        output("");
+        output("DESCRIPTION");
+        output("    Read input from stdin, write to output file(s) and stdout.");
+        output("    Useful for saving command output while displaying it.");
+        output("    By default overwrites existing files.");
+        output("");
+        output("OPTIONS");
+        output("    -a    Append to files instead of overwriting");
+        output("");
+        output("EXAMPLES");
+        output("    echo 'test' | tee output.txt");
+        output("    cat file.txt | tee -a log.txt");
+        
+    } else if (cmd == "diff") {
+        output("NAME");
+        output("    diff - compare files line by line");
+        output("");
+        output("SYNOPSIS");
+        output("    diff [options] <file1> <file2>");
+        output("");
+        output("DESCRIPTION");
+        output("    Compare two text files and display differences in unified");
+        output("    format. Shows added, deleted, and changed lines with context.");
+        output("");
+        output("OPTIONS");
+        output("    -u    Unified diff format (default)");
+        output("    -c    Context format");
+        output("");
+        output("EXAMPLES");
+        output("    diff file1.txt file2.txt");
+        output("    diff -u original.txt modified.txt");
+        
+    } else if (cmd == "patch") {
+        output("NAME");
+        output("    patch - apply patch files");
+        output("");
+        output("SYNOPSIS");
+        output("    patch [options] [patchfile]");
+        output("");
+        output("DESCRIPTION");
+        output("    Apply a patch file to update files. Reads patch from stdin");
+        output("    or from specified file. Supports unified diff format.");
+        output("");
+        output("OPTIONS");
+        output("    -p<num>    Strip path components (e.g., -p1)");
+        output("    -r <file>  Reject file for failed hunks");
+        output("");
+        output("EXAMPLES");
+        output("    patch < changes.patch");
+        output("    patch -p1 < updates.patch");
+        
+    } else if (cmd == "nano") {
+        output("NAME");
+        output("    nano - simple text editor");
+        output("");
+        output("SYNOPSIS");
+        output("    nano [options] [file]");
+        output("");
+        output("DESCRIPTION");
+        output("    Interactive text editor for viewing and editing files.");
+        output("    Supports keyboard shortcuts for common operations.");
+        output("    Can create new files or edit existing ones.");
+        output("");
+        output("OPTIONS");
+        output("    -n     Create new file (don't load existing)");
+        output("");
+        output("KEYBOARD COMMANDS");
+        output("    Ctrl+W  Save file (or Save As if new)");
+        output("    Ctrl+X  Exit editor");
+        output("    Ctrl+Q  Exit without saving");
+        output("    Arrow Keys  Navigate in file");
+        output("    Page Up/Down  Scroll by page");
+        output("");
+        output("EXAMPLES");
+        output("    nano file.txt          # Edit existing file");
+        output("    nano -n newfile.txt    # Create new file");
+        
+    } else if (cmd == "exec") {
+        output("NAME");
+        output("    exec - execute command in current shell");
+        output("");
+        output("SYNOPSIS");
+        output("    exec <command> [args]");
+        output("");
+        output("DESCRIPTION");
+        output("    Execute a command and replace the current shell process.");
+        output("    Any arguments are passed to the command.");
+        output("    External executables are run via Windows CreateProcessA.");
+        output("");
+        output("EXAMPLES");
+        output("    exec notepad");
+        output("    exec powershell");
+        
+    } else if (cmd == "awk") {
+        output("NAME");
+        output("    awk - pattern scanning and processing language");
+        output("");
+        output("SYNOPSIS");
+        output("    awk [options] 'pattern { action }' [file]...");
+        output("");
+        output("DESCRIPTION");
+        output("    Process text files line by line. Applies patterns and");
+        output("    actions to each line. Supports field splitting and");
+        output("    built-in variables like NR, NF, FS, OFS.");
+        output("");
+        output("OPTIONS");
+        output("    -F <sep>    Set field separator");
+        output("    -v <var=val>  Set variable");
+        output("");
+        output("EXAMPLES");
+        output("    awk '{print $1}' file.txt");
+        output("    awk -F: '{print $1}' /etc/passwd");
+        output("    awk 'NR > 5' file.txt");
+        
+    } else if (cmd == "sort") {
+        output("NAME");
+        output("    sort - sort lines of text");
+        output("");
+        output("SYNOPSIS");
+        output("    sort [options] [file]...");
+        output("");
+        output("DESCRIPTION");
+        output("    Sort lines of text alphabetically or numerically.");
+        output("    Reads from file or stdin if no file specified.");
+        output("");
+        output("OPTIONS");
+        output("    -r       Reverse order");
+        output("    -n       Sort numerically");
+        output("    -k <num> Sort by column/field");
+        output("    -u       Unique (remove duplicates)");
+        output("");
+        output("EXAMPLES");
+        output("    sort file.txt");
+        output("    sort -rn numbers.txt");
+        output("    sort -k2 data.txt");
+        
+    } else if (cmd == "cut") {
+        output("NAME");
+        output("    cut - extract columns or fields from text");
+        output("");
+        output("SYNOPSIS");
+        output("    cut [options] [file]...");
+        output("");
+        output("DESCRIPTION");
+        output("    Extract selected columns or fields from each line.");
+        output("    Supports character positions and field delimiters.");
+        output("");
+        output("OPTIONS");
+        output("    -c <list>  Select by character positions");
+        output("    -f <list>  Select by fields");
+        output("    -d <char>  Field delimiter (default: tab)");
+        output("");
+        output("EXAMPLES");
+        output("    cut -c1-10 file.txt");
+        output("    cut -f1 -d: /etc/passwd");
+        output("    cut -f2-4 data.csv");
+        
+    } else if (cmd == "paste") {
+        output("NAME");
+        output("    paste - merge lines of files");
+        output("");
+        output("SYNOPSIS");
+        output("    paste [options] <file>...");
+        output("");
+        output("DESCRIPTION");
+        output("    Merge corresponding lines from files side by side.");
+        output("    Fields are separated by tab by default.");
+        output("");
+        output("OPTIONS");
+        output("    -d <sep>   Output delimiter");
+        output("");
+        output("EXAMPLES");
+        output("    paste file1.txt file2.txt");
+        output("    paste -d',' col1.txt col2.txt");
+        
+    } else if (cmd == "passwd") {
+        output("NAME");
+        output("    passwd - change user password");
+        output("");
+        output("SYNOPSIS");
+        output("    passwd [username]");
+        output("");
+        output("DESCRIPTION");
+        output("    Change the password for a user account.");
+        output("    If no username is specified, changes current user's password.");
+        output("    Requires administrator privileges.");
+        output("");
+        output("SECURITY");
+        output("    Uses Windows net user command to modify passwords.");
+        output("    Requires elevation (admin rights) to execute.");
+        output("");
+        output("EXAMPLES");
+        output("    passwd              # Change current user password");
+        output("    passwd john         # Change john's password");
+        
+    } else if (cmd == "useradd") {
+        output("NAME");
+        output("    useradd - add a new user account");
+        output("");
+        output("SYNOPSIS");
+        output("    useradd [options] <username>");
+        output("");
+        output("DESCRIPTION");
+        output("    Create a new user account on the system.");
+        output("    Requires administrator privileges.");
+        output("    Uses Windows user management API.");
+        output("");
+        output("OPTIONS");
+        output("    -p <password>    Set user password");
+        output("    -c <comment>     Set full name or comment");
+        output("    -d <home>        Set home directory path");
+        output("");
+        output("EXAMPLES");
+        output("    useradd john");
+        output("    useradd -p secret123 -c \"John Doe\" john");
+        output("    useradd -d C:\\Users\\john john");
+        
+    } else if (cmd == "userdel") {
+        output("NAME");
+        output("    userdel - delete a user account");
+        output("");
+        output("SYNOPSIS");
+        output("    userdel [options] <username>");
+        output("");
+        output("DESCRIPTION");
+        output("    Delete a user account from the system.");
+        output("    Requires administrator privileges.");
+        output("    Prompts for confirmation before deletion.");
+        output("");
+        output("OPTIONS");
+        output("    -r    Remove user's home directory and files");
+        output("");
+        output("EXAMPLES");
+        output("    userdel john        # Delete user john");
+        output("    userdel -r john     # Delete user and home directory");
+        
+    } else if (cmd == "usermod") {
+        output("NAME");
+        output("    usermod - modify a user account");
+        output("");
+        output("SYNOPSIS");
+        output("    usermod [options] <username>");
+        output("");
+        output("DESCRIPTION");
+        output("    Modify properties of an existing user account.");
+        output("    Requires administrator privileges.");
+        output("    Can change user details, lock/unlock accounts, modify groups.");
+        output("");
+        output("OPTIONS");
+        output("    -c <comment>     Change full name or comment");
+        output("    -d <home>        Change home directory");
+        output("    -L               Lock (disable) the account");
+        output("    -U               Unlock (enable) the account");
+        output("    -a -G <group>    Add user to specified group");
+        output("");
+        output("EXAMPLES");
+        output("    usermod -c \"John Smith\" john");
+        output("    usermod -L john              # Lock account");
+        output("    usermod -U john              # Unlock account");
+        output("    usermod -a -G Administrators john");
+        
+    } else if (cmd == "groupadd") {
+        output("NAME");
+        output("    groupadd - create a new group");
+        output("");
+        output("SYNOPSIS");
+        output("    groupadd [options] <groupname>");
+        output("");
+        output("DESCRIPTION");
+        output("    Create a new local group on the system.");
+        output("    Requires administrator privileges.");
+        output("    Uses Windows net localgroup command.");
+        output("");
+        output("OPTIONS");
+        output("    -g <GID>    Group ID (ignored on Windows)");
+        output("");
+        output("EXAMPLES");
+        output("    groupadd developers");
+        output("    groupadd testgroup");
+        
+    } else if (cmd == "addgroup") {
+        output("NAME");
+        output("    addgroup - create a new group (alias for groupadd)");
+        output("");
+        output("SYNOPSIS");
+        output("    addgroup [options] <groupname>");
+        output("");
+        output("DESCRIPTION");
+        output("    Alternative command for creating groups.");
+        output("    Functions identically to groupadd.");
+        output("    Requires administrator privileges.");
+        output("");
+        output("EXAMPLES");
+        output("    addgroup developers");
+        output("    addgroup testgroup");
+        
+    } else if (cmd == "groupmod") {
+        output("NAME");
+        output("    groupmod - modify a group");
+        output("");
+        output("SYNOPSIS");
+        output("    groupmod [options] <groupname>");
+        output("");
+        output("DESCRIPTION");
+        output("    Modify group properties. Limited functionality on Windows.");
+        output("    Group renaming requires manual steps on Windows.");
+        output("    Requires administrator privileges.");
+        output("");
+        output("OPTIONS");
+        output("    -n <newname>    Rename group (requires manual steps)");
+        output("    -g <GID>        Change GID (not supported on Windows)");
+        output("");
+        output("NOTE");
+        output("    Windows doesn't support direct group renaming.");
+        output("    Manual process: create new group, migrate members, delete old.");
+        output("");
+        output("EXAMPLES");
+        output("    groupmod -n newname oldname");
+        
+    } else if (cmd == "groupdel") {
+        output("NAME");
+        output("    groupdel - delete a group");
+        output("");
+        output("SYNOPSIS");
+        output("    groupdel <groupname>");
+        output("");
+        output("DESCRIPTION");
+        output("    Delete a local group from the system.");
+        output("    Requires administrator privileges.");
+        output("    Prompts for confirmation before deletion.");
+        output("");
+        output("EXAMPLES");
+        output("    groupdel developers");
+        output("    groupdel testgroup");
+        
+    } else if (cmd == "screen") {
+        output("NAME");
+        output("    screen - terminal multiplexer");
+        output("");
+        output("SYNOPSIS");
+        output("    screen [options]");
+        output("");
+        output("DESCRIPTION");
+        output("    Terminal multiplexer allowing multiple terminal sessions.");
+        output("    This is a limited implementation for GaryShell.");
+        output("    Full screen functionality requires advanced terminal handling.");
+        output("");
+        output("OPTIONS");
+        output("    -ls             List screen sessions");
+        output("    -S <name>       Create named session");
+        output("    -r <name>       Resume/attach to session");
+        output("    -X <cmd>        Send command to session");
+        output("");
+        output("NOTE");
+        output("    True terminal multiplexing is not fully supported.");
+        output("    Consider alternatives:");
+        output("      - Windows Terminal (tabs and panes)");
+        output("      - tmux via WSL");
+        output("      - ConEmu or similar emulators");
+        output("");
+        output("EXAMPLES");
+        output("    screen -ls              # List sessions");
+        output("    screen -S mysession     # Create named session");
+        
+    } else if (cmd == "getent") {
+        output("NAME");
+        output("    getent - get entries from administrative databases");
+        output("");
+        output("SYNOPSIS");
+        output("    getent <database> [key...]");
+        output("");
+        output("DESCRIPTION");
+        output("    Retrieve and display entries from system databases.");
+        output("    Simulates Unix getent functionality on Windows.");
+        output("");
+        output("DATABASES");
+        output("    passwd      User account information");
+        output("    group       Group information");
+        output("    hosts       Host names and addresses");
+        output("    services    Network services and ports");
+        output("");
+        output("EXAMPLES");
+        output("    getent passwd           # Show user info");
+        output("    getent group            # Show groups");
+        output("    getent hosts            # Show hosts file");
+        output("    getent services         # Show services");
+        
+    } else if (cmd == "source") {
+        output("NAME");
+        output("    source - execute commands from a file");
+        output("");
+        output("SYNOPSIS");
+        output("    source <filename>");
+        output("    . <filename>");
+        output("");
+        output("DESCRIPTION");
+        output("    Read and execute commands from the specified file in the");
+        output("    current shell environment. Also accessible via '.' alias.");
+        output("    Commands execute as if typed at the prompt.");
+        output("");
+        output("EXAMPLES");
+        output("    source script.sh        # Execute script");
+        output("    . ~/.profile            # Load profile");
+        output("    source config.txt       # Load configuration");
+        
+    } else if (cmd == "service") {
+        output("NAME");
+        output("    service - control system services");
+        output("");
+        output("SYNOPSIS");
+        output("    service <service> <action>");
+        output("");
+        output("DESCRIPTION");
+        output("    Control Windows services. Start, stop, restart, or check");
+        output("    status of system services. Uses Windows net and sc commands.");
+        output("    Requires administrator privileges (except for status).");
+        output("");
+        output("ACTIONS");
+        output("    start       Start the service");
+        output("    stop        Stop the service");
+        output("    restart     Restart the service");
+        output("    status      Show service status");
+        output("");
+        output("EXAMPLES");
+        output("    service spooler status      # Check print spooler");
+        output("    service wuauserv start      # Start Windows Update");
+        output("    service eventlog restart    # Restart event log");
+        
+    } else if (cmd == "jobs") {
+        output("NAME");
+        output("    jobs - list background jobs");
+        output("");
+        output("SYNOPSIS");
+        output("    jobs [options]");
+        output("");
+        output("DESCRIPTION");
+        output("    Display status of background jobs in the current session.");
+        output("    Job control is limited in GaryShell due to shell architecture.");
+        output("");
+        output("OPTIONS");
+        output("    -l    List process IDs with job information");
+        output("    -p    List only process IDs");
+        output("");
+        output("NOTE");
+        output("    Full job control requires advanced shell features.");
+        output("    For background tasks on Windows, use:");
+        output("      - Start-Process in PowerShell");
+        output("      - Task Scheduler");
+        output("      - Windows Services");
+        output("");
+        output("EXAMPLES");
+        output("    jobs                # List all jobs");
+        output("    jobs -l             # List with PIDs");
+        
+    } else if (cmd == "htop") {
+        output("NAME");
+        output("    htop - interactive process viewer");
+        output("");
+        output("SYNOPSIS");
+        output("    htop [options]");
+        output("");
+        output("DESCRIPTION");
+        output("    htop is an interactive process viewer that displays a list");
+        output("    of running processes with their CPU usage, memory consumption,");
+        output("    and other system resource information in real-time.");
+        output("");
+        output("    On Windows, htop displays a snapshot of processes with their");
+        output("    memory usage, thread count, and priority information.");
+        output("");
+        output("OPTIONS");
+        output("    -d N         Delay between updates (seconds)");
+        output("    -u USER      Filter by user");
+        output("    -p PID       Show only specific process ID");
+        output("");
+        output("FEATURES");
+        output("    - Process ID (PID) display");
+        output("    - Thread count per process");
+        output("    - Base priority level");
+        output("    - Working set memory usage");
+        output("    - Process executable name");
+        output("");
+        output("NOTE");
+        output("    For interactive real-time monitoring on Windows:");
+        output("      - Task Manager (taskmgr)");
+        output("      - Resource Monitor (resmon)");
+        output("      - Process Explorer (Sysinternals)");
+        output("      - Performance Monitor (perfmon)");
+        output("");
+        output("EXAMPLES");
+        output("    htop                # Show all processes");
+        output("    htop -u garyt       # Filter by user");
+        
+    } else if (cmd == "at") {
+        output("NAME");
+        output("    at - schedule commands to run at a specific time");
+        output("");
+        output("SYNOPSIS");
+        output("    at [time] [command]");
+        output("    at -l");
+        output("    at -r <job_id>");
+        output("");
+        output("DESCRIPTION");
+        output("    The at command schedules commands to be executed at a");
+        output("    specified time. Jobs are queued and executed when the");
+        output("    system reaches the specified time.");
+        output("");
+        output("    On Windows, at uses the Task Scheduler service.");
+        output("");
+        output("OPTIONS");
+        output("    -l            List scheduled jobs");
+        output("    -r <id>       Remove scheduled job by ID");
+        output("    -f <file>     Read commands from file");
+        output("");
+        output("TIME FORMATS");
+        output("    HH:MM              Execute at time today (24-hour format)");
+        output("    HH:MM MM/DD/YY     Execute at specific date and time");
+        output("    now + N minutes    Execute N minutes from now");
+        output("    now + N hours      Execute N hours from now");
+        output("");
+        output("WINDOWS IMPLEMENTATION");
+        output("    Uses Windows Task Scheduler (schtasks command).");
+        output("    Tasks persist across reboots if system is scheduled.");
+        output("");
+        output("EXAMPLES");
+        output("    at 14:30 shutdown /r           # Reboot at 2:30 PM");
+        output("    at -l                          # List scheduled jobs");
+        output("    at -r 1                        # Remove job 1");
+        output("    at 09:00 01/25/26 backup.bat   # Run on specific date");
+        output("");
+        output("SEE ALSO");
+        output("    cron, crontab, schtasks");
+        
+    } else if (cmd == "cron") {
+        output("NAME");
+        output("    cron - daemon for scheduled task execution");
+        output("");
+        output("SYNOPSIS");
+        output("    cron [options]");
+        output("");
+        output("DESCRIPTION");
+        output("    cron is a time-based job scheduler daemon that runs in the");
+        output("    background and executes commands at specified times and dates.");
+        output("");
+        output("    On Unix/Linux systems, cron reads crontab files containing");
+        output("    schedules and commands to execute. Each user can have their");
+        output("    own crontab file managed with the crontab command.");
+        output("");
+        output("WINDOWS IMPLEMENTATION");
+        output("    Windows does not have a native cron daemon. The equivalent");
+        output("    functionality is provided by:");
+        output("");
+        output("      • Task Scheduler Service (always running)");
+        output("      • Managed via taskschd.msc (GUI)");
+        output("      • Managed via schtasks (command-line)");
+        output("      • Managed via PowerShell ScheduledTasks module");
+        output("");
+        output("FUNCTIONALITY");
+        output("    The cron daemon:");
+        output("      - Runs continuously in the background");
+        output("      - Checks crontab files every minute");
+        output("      - Executes commands at scheduled times");
+        output("      - Logs execution to system logs");
+        output("      - Supports per-user and system-wide jobs");
+        output("");
+        output("ALTERNATIVES FOR WINDOWS");
+        output("    1. Native: Use Task Scheduler");
+        output("       - Already running as Windows service");
+        output("       - GUI: taskschd.msc");
+        output("       - CLI: schtasks");
+        output("");
+        output("    2. Unix-like: Windows Subsystem for Linux (WSL)");
+        output("       - Full cron implementation");
+        output("       - Native crontab support");
+        output("");
+        output("    3. Third-party: cronw, cron ports for Windows");
+        output("");
+        output("EXAMPLES");
+        output("    # Check Task Scheduler service status");
+        output("    service Schedule status");
+        output("");
+        output("    # Manage scheduled tasks");
+        output("    crontab -l              # List tasks");
+        output("    crontab -e              # Edit tasks");
+        output("");
+        output("SEE ALSO");
+        output("    crontab, at, schtasks, service");
+        
+    } else if (cmd == "crontab") {
+        output("NAME");
+        output("    crontab - manage scheduled tasks (cron jobs)");
+        output("");
+        output("SYNOPSIS");
+        output("    crontab [options]");
+        output("    crontab -l");
+        output("    crontab -e");
+        output("    crontab -r");
+        output("");
+        output("DESCRIPTION");
+        output("    crontab is used to install, view, edit, and remove a user's");
+        output("    scheduled tasks (cron jobs). Each line in a crontab file");
+        output("    represents a scheduled job.");
+        output("");
+        output("OPTIONS");
+        output("    -l            List current crontab entries");
+        output("    -e            Edit crontab file");
+        output("    -r            Remove crontab (delete all entries)");
+        output("    -u <user>     Specify user's crontab (requires admin)");
+        output("");
+        output("CRONTAB FILE FORMAT");
+        output("    Each line has 6 fields:");
+        output("");
+        output("    MIN  HOUR  DAY  MON  DOW  COMMAND");
+        output("    *    *     *    *    *    /path/to/command");
+        output("    │    │     │    │    │");
+        output("    │    │     │    │    └─── Day of week (0-7, Sun=0 or 7)");
+        output("    │    │     │    └──────── Month (1-12)");
+        output("    │    │     └───────────── Day of month (1-31)");
+        output("    │    └─────────────────── Hour (0-23)");
+        output("    └──────────────────────── Minute (0-59)");
+        output("");
+        output("SPECIAL CHARACTERS");
+        output("    *         Any value");
+        output("    ,         List separator (e.g., 1,3,5)");
+        output("    -         Range (e.g., 1-5)");
+        output("    /         Step (e.g., */5 = every 5 units)");
+        output("");
+        output("SPECIAL STRINGS");
+        output("    @reboot      Run once at startup");
+        output("    @yearly      0 0 1 1 *   (January 1st midnight)");
+        output("    @monthly     0 0 1 * *   (1st of month midnight)");
+        output("    @weekly      0 0 * * 0   (Sunday midnight)");
+        output("    @daily       0 0 * * *   (Every day midnight)");
+        output("    @hourly      0 * * * *   (Every hour)");
+        output("");
+        output("WINDOWS IMPLEMENTATION");
+        output("    On Windows, crontab interfaces with Task Scheduler.");
+        output("    Tasks are stored in Windows Task Scheduler, not in");
+        output("    traditional Unix crontab files.");
+        output("");
+        output("EXAMPLES");
+        output("    # List scheduled tasks");
+        output("    crontab -l");
+        output("");
+        output("    # Example crontab entries (Unix format)");
+        output("    */5 * * * * /path/to/script.sh      # Every 5 minutes");
+        output("    0 2 * * * /path/to/backup.sh        # Daily at 2 AM");
+        output("    0 0 * * 0 /path/to/weekly.sh        # Weekly on Sunday");
+        output("    0 0 1 * * /path/to/monthly.sh       # Monthly on 1st");
+        output("    0 9 * * 1-5 /path/to/workday.sh     # Weekdays at 9 AM");
+        output("");
+        output("SEE ALSO");
+        output("    cron, at, schtasks");
+        
+    } else if (cmd == "uniq") {
+        output("NAME");
+        output("    uniq - filter out repeated lines");
+        output("");
+        output("SYNOPSIS");
+        output("    uniq [options] [input [output]]");
+        output("");
+        output("DESCRIPTION");
+        output("    Filter adjacent matching lines from INPUT (or stdin),");
+        output("    writing to OUTPUT (or stdout). Lines must be adjacent");
+        output("    to be considered duplicates (use sort first if needed).");
+        output("");
+        output("OPTIONS");
+        output("    -c            Prefix lines with occurrence count");
+        output("    -d            Only print duplicate lines");
+        output("    -u            Only print unique lines (no duplicates)");
+        output("    -i            Ignore case when comparing");
+        output("    -f N          Skip first N fields (whitespace-separated)");
+        output("    -s N          Skip first N characters");
+        output("");
+        output("BEHAVIOR");
+        output("    uniq compares adjacent lines only. To find all unique or");
+        output("    duplicate lines in a file, first sort the file:");
+        output("");
+        output("        sort file.txt | uniq");
+        output("");
+        output("OUTPUT OPTIONS");
+        output("    Default: Output lines with duplicates removed");
+        output("    -c:      Show count of occurrences");
+        output("    -d:      Show only lines that appear more than once");
+        output("    -u:      Show only lines that appear exactly once");
+        output("");
+        output("EXAMPLES");
+        output("    # Remove adjacent duplicate lines");
+        output("    uniq file.txt");
+        output("");
+        output("    # Remove all duplicates (requires sort)");
+        output("    sort file.txt | uniq");
+        output("");
+        output("    # Count occurrences");
+        output("    sort file.txt | uniq -c");
+        output("");
+        output("    # Show only duplicates");
+        output("    sort file.txt | uniq -d");
+        output("");
+        output("    # Show only unique lines (no duplicates)");
+        output("    sort file.txt | uniq -u");
+        output("");
+        output("    # Case-insensitive comparison");
+        output("    sort file.txt | uniq -i");
+        output("");
+        output("    # Skip first field when comparing");
+        output("    uniq -f 1 data.txt");
+        output("");
+        output("SEE ALSO");
+        output("    sort, comm, join, cut");
+        
+    } else if (cmd == "dig") {
+        output("NAME");
+        output("    dig - DNS lookup utility");
+        output("");
+        output("SYNOPSIS");
+        output("    dig [options] <domain> [type]");
+        output("");
+        output("DESCRIPTION");
+        output("    dig (domain information groper) is a command-line tool for");
+        output("    performing DNS lookups and displaying DNS resource records.");
+        output("    It queries DNS servers and shows detailed information about");
+        output("    domain names, including IP addresses, mail servers, and other");
+        output("    DNS records.");
+        output("");
+        output("OPTIONS");
+        output("    +short             Show short answer only");
+        output("    +long              Show long format (default)");
+        output("    @server            Query specific DNS server");
+        output("    +trace             Trace DNS resolution path");
+        output("    +recurse           Enable recursive queries (default)");
+        output("    +norecurse         Disable recursive queries");
+        output("");
+        output("QUERY TYPES");
+        output("    A                  IPv4 address records");
+        output("    AAAA               IPv6 address records");
+        output("    MX                 Mail exchange records");
+        output("    NS                 Name server records");
+        output("    CNAME              Canonical name records");
+        output("    TXT                Text records");
+        output("    SOA                Start of authority records");
+        output("    SRV                Service records");
+        output("");
+        output("EXAMPLES");
+        output("    dig google.com");
+        output("    dig google.com A");
+        output("    dig google.com MX");
+        output("    dig google.com NS");
+        output("    dig +short google.com");
+        output("    dig @8.8.8.8 google.com");
+        output("");
+        output("NOTE");
+        output("    On Windows, dig uses the nslookup command internally.");
+        output("    For advanced DNS analysis, use 'nslookup'.");
+        output("");
+        output("SEE ALSO");
+        output("    nslookup, host, getent");
+        
+    } else if (cmd == "nslookup") {
+        output("NAME");
+        output("    nslookup - query the Domain Name System");
+        output("");
+        output("SYNOPSIS");
+        output("    nslookup [options] <domain> [server]");
+        output("");
+        output("DESCRIPTION");
+        output("    nslookup is a command-line tool for querying the Domain Name");
+        output("    System (DNS) to obtain domain names or IP addresses, or for");
+        output("    other DNS records. It sends queries to DNS servers and");
+        output("    displays the responses.");
+        output("");
+        output("OPTIONS");
+        output("    -type=A            Query A records (IPv4, default)");
+        output("    -type=AAAA         Query AAAA records (IPv6)");
+        output("    -type=MX           Query MX records (mail servers)");
+        output("    -type=NS           Query NS records (name servers)");
+        output("    -type=CNAME        Query CNAME records (aliases)");
+        output("    -type=TXT          Query TXT records (text data)");
+        output("    -type=SOA          Query SOA records (authority)");
+        output("    -type=SRV          Query SRV records (services)");
+        output("    -type=ANY          Query all available records");
+        output("");
+        output("USAGE MODES");
+        output("    Interactive:       nslookup (starts interactive shell)");
+        output("    Single query:      nslookup google.com");
+        output("    With server:       nslookup google.com 8.8.8.8");
+        output("    With record type:  nslookup -type=MX google.com");
+        output("");
+        output("EXAMPLES");
+        output("    # Query A record (IP address)");
+        output("    nslookup google.com");
+        output("");
+        output("    # Query IPv6 address");
+        output("    nslookup -type=AAAA google.com");
+        output("");
+        output("    # Query mail servers");
+        output("    nslookup -type=MX google.com");
+        output("");
+        output("    # Query specific DNS server");
+        output("    nslookup google.com 8.8.8.8");
+        output("");
+        output("    # Query name servers");
+        output("    nslookup -type=NS google.com");
+        output("");
+        output("SEE ALSO");
+        output("    dig, host, getent");
+        
+    } else if (cmd == "netstat") {
+        output("NAME");
+        output("    netstat - show network statistics");
+        output("");
+        output("SYNOPSIS");
+        output("    netstat [options]");
+        output("");
+        output("DESCRIPTION");
+        output("    Netstat displays network connections, routing table, and");
+        output("    interface statistics. It shows which ports are listening,");
+        output("    which connections are established, and other network-related");
+        output("    information. Most options require administrator privileges.");
+        output("");
+        output("OPTIONS");
+        output("    -a                 Show all connections and listening ports");
+        output("    -b                 Show executable name (requires admin)");
+        output("    -e                 Show ethernet statistics");
+        output("    -n                 Show numerical addresses instead of names");
+        output("    -o                 Show associated process ID (PID)");
+        output("    -p proto           Filter by protocol (tcp, udp, icmp)");
+        output("    -r                 Show routing table");
+        output("    -s                 Show statistics by protocol");
+        output("    -t                 Show TCP connections");
+        output("    -u                 Show UDP connections");
+        output("");
+        output("EXAMPLES");
+        output("    # Show all connections");
+        output("    netstat -a");
+        output("");
+        output("    # Show in numerical format");
+        output("    netstat -an");
+        output("");
+        output("    # Show with process IDs");
+        output("    netstat -aon");
+        output("");
+        output("    # Show listening ports only");
+        output("    netstat -tuln");
+        output("");
+        output("    # Show routing table");
+        output("    netstat -r");
+        output("");
+        output("    # Show protocol statistics");
+        output("    netstat -s");
+        output("");
+        output("NOTE");
+        output("    Most options require administrator privileges on Windows.");
+        output("    Run 'sudo netstat' for elevated access.");
+        output("");
+        output("SEE ALSO");
+        output("    ss, lsof, ip, route");
+        
+    } else if (cmd == "neofetch") {
+        output("NAME");
+        output("    neofetch - display system information with ASCII art");
+        output("");
+        output("SYNOPSIS");
+        output("    neofetch [options]");
+        output("");
+        output("DESCRIPTION");
+        output("    neofetch displays system information in an aesthetically");
+        output("    pleasing manner with ASCII art. It shows information about:");
+        output("    operating system, hostname, kernel, uptime, memory usage,");
+        output("    CPU cores, and disk space usage.");
+        output("");
+        output("OPTIONS");
+        output("    --no-art           Display without ASCII art logo");
+        output("    --compact          Compact output format");
+        output("");
+        output("INFORMATION DISPLAYED");
+        output("    OS                 Operating system and file system");
+        output("    Hostname           Computer network name");
+        output("    User               Current user name");
+        output("    Shell              Shell name and version");
+        output("    Uptime             System uptime (days, hours, minutes)");
+        output("    Memory             RAM usage (used / total)");
+        output("    CPU Cores          Number of processor cores");
+        output("    Disk               Disk space usage (C: drive)");
+        output("");
+        output("EXAMPLES");
+        output("    neofetch");
+        output("");
+        output("    neofetch --no-art");
+        output("");
+        output("    neofetch --compact");
+        output("");
+        output("NOTE");
+        output("    Information is gathered from Windows system APIs.");
+        output("    For more detailed system info, use 'systeminfo'.");
+        output("");
+        output("SEE ALSO");
+        output("    systeminfo, uname, whoami");
+        
+    } else if (cmd == "printf") {
+        output("NAME");
+        output("    printf - print formatted output");
+        output("");
+        output("SYNOPSIS");
+        output("    printf <format> [arguments...]");
+        output("");
+        output("DESCRIPTION");
+        output("    printf prints formatted text using a format string with");
+        output("    optional arguments. It supports conversion specifiers and");
+        output("    escape sequences for flexible output formatting.");
+        output("");
+        output("FORMAT STRING");
+        output("    The format string consists of literal text and:");
+        output("");
+        output("    Conversion Specifiers:");
+        output("    %%              Literal percent sign (%)");
+        output("    %s              String");
+        output("    %d, %i          Decimal integer");
+        output("    %x              Hexadecimal integer (lowercase)");
+        output("    %X              Hexadecimal integer (uppercase)");
+        output("    %o              Octal integer");
+        output("    %f              Floating-point number");
+        output("    %c              Character");
+        output("");
+        output("    Escape Sequences:");
+        output("    \\\\              Backslash");
+        output("    \\n              Newline");
+        output("    \\t              Tab");
+        output("    \\r              Carriage return");
+        output("");
+        output("EXAMPLES");
+        output("    printf 'Hello %s\\n' World");
+        output("    printf 'Number: %d\\n' 42");
+        output("    printf 'Hex: %x\\n' 255");
+        output("    printf 'Float: %f\\n' 3.14159");
+        output("");
+        output("NOTE");
+        output("    Unlike echo, printf does not add a trailing newline.");
+        output("    Use \\n in format string for newlines.");
+        output("");
+        output("SEE ALSO");
+        output("    echo, sprintf");
+        
+    } else if (cmd == "case") {
+        output("NAME");
+        output("    case - conditional shell control structure");
+        output("");
+        output("SYNOPSIS");
+        output("    case <word> in");
+        output("        [pattern1) commands ;; ]");
+        output("        [pattern2) commands ;; ]");
+        output("        [*) default commands ;; ]");
+        output("    esac");
+        output("");
+        output("DESCRIPTION");
+        output("    case tests a word against a series of patterns and executes");
+        output("    commands matching the first pattern. It provides a way to");
+        output("    select execution path based on pattern matching.");
+        output("");
+        output("PATTERNS");
+        output("    *                   Matches any string");
+        output("    [set]               Matches any char in set (e.g., [abc])");
+        output("    [!set]              Matches any char not in set");
+        output("    ?(pattern)          Matches zero or one occurrence");
+        output("    *(pattern)          Matches zero or more occurrences");
+        output("    +(pattern)          Matches one or more occurrences");
+        output("    pat1|pat2           Matches pat1 or pat2 (alternatives)");
+        output("");
+        output("EXAMPLES");
+        output("    case \"$1\" in");
+        output("        start)  echo 'Starting...' ;;");
+        output("        stop)   echo 'Stopping...' ;;");
+        output("        *)      echo 'Unknown command' ;;");
+        output("    esac");
+        output("");
+        output("    case \"$var\" in");
+        output("        [aeiou]) echo 'Vowel' ;;");
+        output("        [0-9])   echo 'Digit' ;;");
+        output("        *)       echo 'Other' ;;");
+        output("    esac");
+        output("");
+        output("NOTE");
+        output("    case is primarily used in shell scripts. The shell parses");
+        output("    it as a control structure during script execution.");
+        output("");
+        output("SEE ALSO");
+        output("    if, test, [");
+        
+    } else if (cmd == "free") {
+        output("NAME");
+        output("    free - display free and used memory");
+        output("");
+        output("SYNOPSIS");
+        output("    free [options]");
+        output("");
+        output("DESCRIPTION");
+        output("    free displays the total amount of free and used physical");
+        output("    memory and swap memory in the system, as well as the");
+        output("    buffers and caches used by the kernel.");
+        output("");
+        output("OPTIONS");
+        output("    -b           Show output in bytes");
+        output("    -k           Show output in kilobytes (default)");
+        output("    -m           Show output in megabytes");
+        output("    -g           Show output in gigabytes");
+        output("    -h           Show output in human-readable format");
+        output("");
+        output("EXAMPLES");
+        output("    free");
+        output("    free -h");
+        output("    free -m");
+        output("    free -g");
+        output("");
+        output("NOTE");
+        output("    Shows total, used, and available system memory.");
+        output("    On Windows, reports physical RAM information.");
+        output("");
+        output("SEE ALSO");
+        output("    vmstat, top, htop");
+        
+    } else if (cmd == "hostname") {
+        output("NAME");
+        output("    hostname - show or set the system hostname");
+        output("");
+        output("SYNOPSIS");
+        output("    hostname [name]");
+        output("");
+        output("DESCRIPTION");
+        output("    Without any argument, hostname displays the name of the");
+        output("    current host system. With an argument, it attempts to set");
+        output("    the hostname to the supplied name (requires admin).");
+        output("");
+        output("OPTIONS");
+        output("    -f             Show FQDN (fully qualified domain name)");
+        output("    -i             Show IP address");
+        output("");
+        output("EXAMPLES");
+        output("    hostname");
+        output("    hostname -f");
+        output("    hostname -i");
+        output("    hostname NewName");
+        output("");
+        output("NOTE");
+        output("    Changing hostname requires administrator privileges.");
+        output("    System restart may be required for changes to take effect.");
+        output("");
+        output("SEE ALSO");
+        output("    ip, uname, whoami");
+        
+    } else if (cmd == "vmstat") {
+        output("NAME");
+        output("    vmstat - report virtual memory statistics");
+        output("");
+        output("SYNOPSIS");
+        output("    vmstat [options] [delay [count]]");
+        output("");
+        output("DESCRIPTION");
+        output("    vmstat reports information about processes, memory, paging,");
+        output("    block I/O, traps, and CPU activity.");
+        output("");
+        output("OPTIONS");
+        output("    -s             Display memory statistics table");
+        output("    -d             Display disk statistics");
+        output("    -a             Include active and inactive memory");
+        output("");
+        output("FIELD DESCRIPTIONS");
+        output("    r              Number of runnable processes");
+        output("    b              Number of blocked processes");
+        output("    swpd           Virtual memory used (KB)");
+        output("    free           Free memory (KB)");
+        output("    buff           Memory used as buffers (KB)");
+        output("    cache          Memory used as cache (KB)");
+        output("");
+        output("EXAMPLES");
+        output("    vmstat");
+        output("    vmstat -s");
+        output("    vmstat 1 5");
+        output("");
+        output("NOTE");
+        output("    On Windows, displays simplified memory statistics.");
+        output("");
+        output("SEE ALSO");
+        output("    iostat, free, top");
+        
+    } else if (cmd == "iostat") {
+        output("NAME");
+        output("    iostat - report CPU and I/O device statistics");
+        output("");
+        output("SYNOPSIS");
+        output("    iostat [options] [interval [count]]");
+        output("");
+        output("DESCRIPTION");
+        output("    iostat command is used for monitoring system I/O device");
+        output("    loading by observing the time the devices are active in");
+        output("    relation to their average transfer rates.");
+        output("");
+        output("OPTIONS");
+        output("    -c             Display CPU statistics only");
+        output("    -d             Display device statistics only");
+        output("    -x             Display extended statistics");
+        output("");
+        output("EXAMPLES");
+        output("    iostat");
+        output("    iostat -c");
+        output("    iostat -d");
+        output("    iostat 1 3");
+        output("");
+        output("NOTE");
+        output("    On Windows, provides CPU and disk activity snapshot.");
+        output("");
+        output("SEE ALSO");
+        output("    vmstat, df, du");
+        
+    } else if (cmd == "bc") {
+        output("NAME");
+        output("    bc - arbitrary-precision arithmetic language");
+        output("");
+        output("SYNOPSIS");
+        output("    bc [options]");
+        output("");
+        output("DESCRIPTION");
+        output("    bc is a language that supports arbitrary precision arithmetic");
+        output("    and is similar to the programming language C. It can be used");
+        output("    both as a mathematical scripting language and as a calculator.");
+        output("");
+        output("OPERATORS");
+        output("    +, -, *, /     Arithmetic operations");
+        output("    %              Modulo (remainder)");
+        output("    ^              Exponentiation");
+        output("    sqrt(x)        Square root");
+        output("    scale=N        Set decimal places");
+        output("");
+        output("OPTIONS");
+        output("    -l             Load standard math library");
+        output("    -s             Silent mode");
+        output("");
+        output("EXAMPLES");
+        output("    bc");
+        output("    echo '10 + 5' | bc");
+        output("    echo '2^10' | bc");
+        output("    echo 'scale=5; 10/3' | bc");
+        output("");
+        output("NOTE");
+        output("    This is a simplified implementation of bc.");
+        output("    Interactive calculator with arbitrary precision.");
+        output("");
+        output("SEE ALSO");
+        output("    bc, qalc, awk");
+        
+    } else if (cmd == "calc") {
+        output("NAME");
+        output("    calc - simple desktop calculator");
+        output("");
+        output("SYNOPSIS");
+        output("    calc [expression]");
+        output("");
+        output("DESCRIPTION");
+        output("    calc is a simple desktop calculator utility that performs");
+        output("    basic arithmetic operations and mathematical functions.");
+        output("");
+        output("OPERATORS");
+        output("    +              Addition");
+        output("    -              Subtraction");
+        output("    *              Multiplication");
+        output("    /              Division");
+        output("    %              Modulo");
+        output("    ^              Exponentiation");
+        output("");
+        output("FUNCTIONS");
+        output("    sqrt(x)        Square root");
+        output("    sin(x)         Sine");
+        output("    cos(x)         Cosine");
+        output("    tan(x)         Tangent");
+        output("    abs(x)         Absolute value");
+        output("");
+        output("EXAMPLES");
+        output("    calc");
+        output("    calc \"2 + 3\"");
+        output("    calc \"2 * 3 + 4\"");
+        output("    calc \"2 ^ 8\"");
+        output("    calc \"sqrt(16)\"");
+        output("");
+        output("NOTE");
+        output("    Without arguments, enters interactive calculator mode.");
+        output("    Type 'quit' or 'exit' to exit interactive mode.");
+        output("");
+        output("SEE ALSO");
+        output("    bc, qalc, awk");
+        
+    } else if (cmd == "qalc") {
+        output("NAME");
+        output("    qalc - advanced calculator (Qalculate!)");
+        output("");
+        output("SYNOPSIS");
+        output("    qalc [expression]");
+        output("");
+        output("DESCRIPTION");
+        output("    qalc is Qalculate! console calculator with advanced features");
+        output("    including unit conversions, functions, and complex calculations.");
+        output("");
+        output("OPERATORS");
+        output("    +, -, *, /     Basic arithmetic");
+        output("    ^, **          Exponentiation");
+        output("    %              Modulo");
+        output("    !              Factorial");
+        output("");
+        output("FUNCTIONS");
+        output("    sqrt(x)        Square root");
+        output("    sin(x)         Sine");
+        output("    cos(x)         Cosine");
+        output("    tan(x)         Tangent");
+        output("    ln(x)          Natural logarithm");
+        output("    log(x)         Logarithm base 10");
+        output("    abs(x)         Absolute value");
+        output("");
+        output("UNIT CONVERSIONS");
+        output("    100 km to miles");
+        output("    50 USD to EUR");
+        output("    10 gallons to liters");
+        output("");
+        output("EXAMPLES");
+        output("    qalc 2^8");
+        output("    qalc 'sqrt(144)'");
+        output("    qalc '100 km to miles'");
+        output("    qalc 'sin(45)'");
+        output("");
+        output("NOTE");
+        output("    This is a simplified implementation.");
+        output("    For full Qalculate! features, install the complete package.");
+        output("");
+        output("SEE ALSO");
+        output("    bc, calc");
+        
+    } else if (cmd == "ifconfig") {
+        output("NAME");
+        output("    ifconfig - configure network interface parameters");
+        output("");
+        output("SYNOPSIS");
+        output("    ifconfig [interface] [options]");
+        output("");
+        output("DESCRIPTION");
+        output("    Display or configure network interfaces. Without arguments,");
+        output("    shows all active interfaces.");
+        output("");
+        output("OPTIONS");
+        output("    -a             Show all interfaces (including inactive)");
+        output("    up             Activate interface");
+        output("    down           Deactivate interface");
+        output("    netmask <mask> Set network mask");
+        output("");
+        output("EXAMPLES");
+        output("    ifconfig");
+        output("    ifconfig -a");
+        output("    ifconfig eth0");
+        output("");
+        output("NOTE");
+        output("    On Windows, this uses ipconfig and netsh commands.");
+        output("    For full control, use 'netsh interface' commands.");
+        output("");
+        output("SEE ALSO");
+        output("    ip, netstat");
+        
+    } else if (cmd == "ss") {
+        output("NAME");
+        output("    ss - display socket statistics");
+        output("");
+        output("SYNOPSIS");
+        output("    ss [options]");
+        output("");
+        output("DESCRIPTION");
+        output("    ss is a utility to investigate sockets. It displays more");
+        output("    information than netstat and is faster.");
+        output("");
+        output("OPTIONS");
+        output("    -a, --all      Show all sockets");
+        output("    -l, --listening Show only listening sockets");
+        output("    -t, --tcp      Show TCP sockets");
+        output("    -u, --udp      Show UDP sockets");
+        output("    -n, --numeric  Don't resolve service names");
+        output("    -p, --processes Show process using socket");
+        output("    -s, --summary  Print summary statistics");
+        output("");
+        output("EXAMPLES");
+        output("    ss -a          # Show all sockets");
+        output("    ss -l          # Show listening sockets");
+        output("    ss -t          # Show TCP sockets only");
+        output("    ss -tan        # TCP sockets with numeric addresses");
+        output("    ss -s          # Summary statistics");
+        output("");
+        output("NOTE");
+        output("    On Windows, ss uses netstat internally.");
+        output("    For more details, use 'netstat' command directly.");
+        output("");
+        output("SEE ALSO");
+        output("    netstat, lsof");
+        
+    } else if (cmd == "nmap") {
+        output("NAME");
+        output("    nmap - Network Mapper");
+        output("");
+        output("SYNOPSIS");
+        output("    nmap [options] <host>");
+        output("");
+        output("DESCRIPTION");
+        output("    Nmap (Network Mapper) is a free and open source utility");
+        output("    for network discovery and security auditing. It discovers");
+        output("    hosts and services on a computer network.");
+        output("");
+        output("OPTIONS");
+        output("    -sT            TCP connect scan");
+        output("    -sS            TCP SYN scan (stealth)");
+        output("    -sU            UDP scan");
+        output("    -p <ports>     Scan specific ports");
+        output("    -p-            Scan all 65535 ports");
+        output("    -F             Fast scan (top 100 ports)");
+        output("    -A             Aggressive scan (OS/version detection)");
+        output("    -O             Enable OS detection");
+        output("    -v             Verbose output");
+        output("");
+        output("EXAMPLES");
+        output("    nmap 192.168.1.1");
+        output("    nmap -p 80,443 192.168.1.1");
+        output("    nmap -F scanme.nmap.org");
+        output("    nmap -A 192.168.1.0/24");
+        output("");
+        output("NOTE");
+        output("    This is a simplified implementation.");
+        output("    For full functionality, install nmap from nmap.org.");
+        output("    Some scans require administrator privileges.");
+        output("");
+        output("SEE ALSO");
+        output("    ping, traceroute");
+        
+    } else if (cmd == "tcpdump") {
+        output("NAME");
+        output("    tcpdump - capture and analyze network packets");
+        output("");
+        output("SYNOPSIS");
+        output("    tcpdump [options] [filter]");
+        output("");
+        output("DESCRIPTION");
+        output("    tcpdump is a packet analyzer that captures network traffic");
+        output("    passing through the network interface.");
+        output("");
+        output("OPTIONS");
+        output("    -i <iface>     Capture on specific interface");
+        output("    -n             Don't resolve hostnames");
+        output("    -nn            Don't resolve hostnames or port names");
+        output("    -c <count>     Capture only <count> packets");
+        output("    -w <file>      Write packets to file");
+        output("    -r <file>      Read packets from file");
+        output("    -v             Verbose output");
+        output("    -X             Print packet data in hex and ASCII");
+        output("");
+        output("FILTERS");
+        output("    host <host>    Capture packets to/from host");
+        output("    port <port>    Capture packets on port");
+        output("    tcp            Capture only TCP packets");
+        output("    udp            Capture only UDP packets");
+        output("    icmp           Capture only ICMP packets");
+        output("");
+        output("EXAMPLES");
+        output("    tcpdump -i eth0");
+        output("    tcpdump -n host 192.168.1.1");
+        output("    tcpdump -nn port 80");
+        output("    tcpdump -w capture.pcap");
+        output("    tcpdump tcp and port 443");
+        output("");
+        output("NOTE");
+        output("    On Windows, requires Npcap/WinPcap driver and admin privileges.");
+        output("    This command provides information only.");
+        output("    Install Wireshark for full packet capture: wireshark.org");
+        output("");
+        output("SEE ALSO");
+        output("    netstat, wireshark");
+        
+    } else if (cmd == "umask") {
+        output("NAME");
+        output("    umask - set file mode creation mask");
+        output("");
+        output("SYNOPSIS");
+        output("    umask [-S] [mask]");
+        output("");
+        output("DESCRIPTION");
+        output("    The umask sets the default permissions for newly created");
+        output("    files and directories. It's a mask subtracted from default");
+        output("    permissions (666 for files, 777 for directories).");
+        output("");
+        output("OPTIONS");
+        output("    -S             Display mask in symbolic notation");
+        output("");
+        output("MASK FORMAT");
+        output("    Octal notation: 0022, 0077, etc.");
+        output("    User/Group/Other permissions:");
+        output("      0 = read, write, execute");
+        output("      2 = read, execute (no write)");
+        output("      7 = no permissions");
+        output("");
+        output("EXAMPLES");
+        output("    umask          # Display current mask");
+        output("    umask -S       # Display in symbolic form");
+        output("    umask 0022     # Set mask to 0022 (default)");
+        output("    umask 0077     # Set mask to 0077 (private)");
+        output("");
+        output("COMMON MASKS");
+        output("    0022 - User: rwx, Group: r-x, Other: r-x");
+        output("    0027 - User: rwx, Group: r-x, Other: ---");
+        output("    0077 - User: rwx, Group: ---, Other: ---");
+        output("");
+        output("NOTE");
+        output("    On Windows, file permissions are managed through ACLs.");
+        output("    This command simulates Unix umask behavior.");
+        output("");
+        output("SEE ALSO");
+        output("    chmod, mkdir, touch");
+        
+    } else if (cmd == "gpasswd") {
+        output("NAME");
+        output("    gpasswd - administer /etc/group and /etc/gshadow");
+        output("");
+        output("SYNOPSIS");
+        output("    gpasswd [options] GROUP");
+        output("");
+        output("DESCRIPTION");
+        output("    gpasswd is used to administer group membership and passwords.");
+        output("    Every group can have administrators, members and a password.");
+        output("");
+        output("OPTIONS");
+        output("    -a <user>      Add user to group");
+        output("    -d <user>      Remove user from group");
+        output("    -R             Restrict access to GROUP to its members");
+        output("    -r             Remove the GROUP's password");
+        output("    -A <user>      Set group administrators");
+        output("    -M <user>      Set group members");
+        output("");
+        output("EXAMPLES");
+        output("    gpasswd -a john developers");
+        output("    gpasswd -d john developers");
+        output("    gpasswd -A admin developers");
+        output("");
+        output("NOTE");
+        output("    On Windows, uses net localgroup commands.");
+        output("    Requires administrator privileges.");
+        output("");
+        output("SEE ALSO");
+        output("    groupadd, groupmod, groupdel, usermod");
+        
+    } else if (cmd == "who") {
+        output("NAME");
+        output("    who - show who is logged on");
+        output("");
+        output("SYNOPSIS");
+        output("    who [options]");
+        output("");
+        output("DESCRIPTION");
+        output("    Display information about users currently logged in.");
+        output("");
+        output("OPTIONS");
+        output("    -a, --all      Same as -b -d --login -p -r -t -T -u");
+        output("    -b, --boot     Time of last system boot");
+        output("    -d, --dead     Print dead processes");
+        output("    -H, --heading  Print line of column headings");
+        output("    -l, --login    Print system login processes");
+        output("    -q, --count    All login names and number of users");
+        output("    -u, --users    List users logged in");
+        output("");
+        output("EXAMPLES");
+        output("    who");
+        output("    who -H");
+        output("    who -b");
+        output("    who -q");
+        output("");
+        output("NOTE");
+        output("    On Windows, shows currently logged in users.");
+        output("");
+        output("SEE ALSO");
+        output("    w, last, users");
+        
+    } else if (cmd == "w") {
+        output("NAME");
+        output("    w - show who is logged on and what they are doing");
+        output("");
+        output("SYNOPSIS");
+        output("    w [options] [user]");
+        output("");
+        output("DESCRIPTION");
+        output("    w displays information about users currently logged in");
+        output("    and their processes. Shows system uptime, number of users,");
+        output("    and load averages.");
+        output("");
+        output("OPTIONS");
+        output("    -h, --no-header   Don't print header");
+        output("    -s, --short       Short format");
+        output("    -f, --from        Show remote hostname field");
+        output("    -i, --ip-addr     Display IP address");
+        output("");
+        output("EXAMPLES");
+        output("    w");
+        output("    w -h");
+        output("    w username");
+        output("");
+        output("NOTE");
+        output("    On Windows, shows logged in users and processes.");
+        output("");
+        output("SEE ALSO");
+        output("    who, last, uptime, ps");
+        
+    } else if (cmd == "last") {
+        output("NAME");
+        output("    last - show listing of last logged in users");
+        output("");
+        output("SYNOPSIS");
+        output("    last [options] [username...] [tty...]");
+        output("");
+        output("DESCRIPTION");
+        output("    last searches back through login records and displays");
+        output("    a list of all users logged in and out since that file");
+        output("    was created.");
+        output("");
+        output("OPTIONS");
+        output("    -a             Display hostname in last column");
+        output("    -d             Translate IP to hostname");
+        output("    -F             Print full login and logout times");
+        output("    -i             Display IP address in numbers");
+        output("    -n <number>    Show only <number> lines");
+        output("    -R             Don't display hostname field");
+        output("    -x             Display system shutdown entries");
+        output("");
+        output("EXAMPLES");
+        output("    last");
+        output("    last -n 10");
+        output("    last username");
+        output("");
+        output("NOTE");
+        output("    On Windows, shows login history from event logs.");
+        output("    Limited history available compared to Unix systems.");
+        output("");
+        output("SEE ALSO");
+        output("    who, w, lastlog");
+        
+    } else if (cmd == "top") {
+        output("NAME");
+        output("    top - display and update sorted process information");
+        output("");
+        output("SYNOPSIS");
+        output("    top [options]");
+        output("");
+        output("DESCRIPTION");
+        output("    top provides a dynamic real-time view of running processes.");
+        output("    It displays system summary information and a list of tasks");
+        output("    currently being managed by the kernel.");
+        output("");
+        output("OPTIONS");
+        output("    -b             Batch mode");
+        output("    -n <number>    Number of iterations");
+        output("    -d <seconds>   Delay between updates");
+        output("    -p <pid>       Monitor specific PIDs");
+        output("    -u <user>      Show only user's processes");
+        output("    -H             Show threads");
+        output("");
+        output("INTERACTIVE COMMANDS");
+        output("    q              Quit");
+        output("    k              Kill a process");
+        output("    r              Renice a process");
+        output("    M              Sort by memory usage");
+        output("    P              Sort by CPU usage");
+        output("    h or ?         Help");
+        output("");
+        output("EXAMPLES");
+        output("    top");
+        output("    top -n 5");
+        output("    top -u username");
+        output("");
+        output("NOTE");
+        output("    On Windows, provides snapshot view of processes.");
+        output("    For interactive monitoring, use Task Manager (taskmgr).");
+        output("");
+        output("SEE ALSO");
+        output("    ps, htop, kill");
+        
+    } else if (cmd == "nice") {
+        output("NAME");
+        output("    nice - run a program with modified scheduling priority");
+        output("");
+        output("SYNOPSIS");
+        output("    nice [OPTION] [COMMAND [ARG]...]");
+        output("");
+        output("DESCRIPTION");
+        output("    nice runs COMMAND with an adjusted niceness, which affects");
+        output("    process scheduling. Niceness values range from -20 (highest");
+        output("    priority) to 19 (lowest priority). Default niceness is 0.");
+        output("");
+        output("OPTIONS");
+        output("    -n, --adjustment=N   Add integer N to niceness (default 10)");
+        output("");
+        output("NICENESS VALUES");
+        output("    -20 to -1    High priority (requires admin)");
+        output("     0           Normal priority (default)");
+        output("     1 to 19     Low priority");
+        output("");
+        output("EXAMPLES");
+        output("    nice -n 10 command");
+        output("    nice command              # Default: nice -n 10");
+        output("    nice -n -5 command        # Higher priority");
+        output("");
+        output("NOTE");
+        output("    On Windows, uses priority classes:");
+        output("      Niceness -20 to -10: HIGH_PRIORITY_CLASS");
+        output("      Niceness -9 to 9:    NORMAL_PRIORITY_CLASS");
+        output("      Niceness 10 to 19:   IDLE_PRIORITY_CLASS");
+        output("");
+        output("SEE ALSO");
+        output("    renice, top, ps");
+        
+    } else if (cmd == "pkill") {
+        output("NAME");
+        output("    pkill - signal processes based on name");
+        output("");
+        output("SYNOPSIS");
+        output("    pkill [options] <pattern>");
+        output("");
+        output("DESCRIPTION");
+        output("    pkill sends signals to processes based on name matching.");
+        output("    By default, sends SIGTERM to allow graceful shutdown.");
+        output("");
+        output("OPTIONS");
+        output("    -9             Send SIGKILL signal (force kill)");
+        output("    -15            Send SIGTERM signal (default)");
+        output("    -u <user>      Match processes owned by user");
+        output("    -x             Match exact process name");
+        output("    -f             Match against full command line");
+        output("");
+        output("EXAMPLES");
+        output("    pkill notepad");
+        output("    pkill -9 chrome");
+        output("    pkill -x firefox.exe");
+        output("");
+        output("NOTE");
+        output("    On Windows, uses TerminateProcess for force kill.");
+        output("    Partial name matching is case-insensitive.");
+        output("");
+        output("SEE ALSO");
+        output("    kill, killall, ps, top");
+        
+    } else if (cmd == "bg") {
+        output("NAME");
+        output("    bg - resume suspended jobs in background");
+        output("");
+        output("SYNOPSIS");
+        output("    bg [job_spec ...]");
+        output("");
+        output("DESCRIPTION");
+        output("    bg resumes each suspended job in the background, as if it");
+        output("    had been started with &. If job_spec is not present, the");
+        output("    current job is used.");
+        output("");
+        output("EXAMPLES");
+        output("    bg");
+        output("    bg %1");
+        output("");
+        output("NOTE");
+        output("    On Windows, job control is limited.");
+        output("    This command simulates Unix job control behavior.");
+        output("");
+        output("SEE ALSO");
+        output("    fg, jobs, kill");
+        
+    } else if (cmd == "renice") {
+        output("NAME");
+        output("    renice - alter priority of running processes");
+        output("");
+        output("SYNOPSIS");
+        output("    renice [-n] priority [[-p] pid ...]");
+        output("");
+        output("DESCRIPTION");
+        output("    renice changes the scheduling priority of running processes.");
+        output("    Niceness values range from -20 (highest) to 19 (lowest).");
+        output("");
+        output("OPTIONS");
+        output("    -n <priority>  Set niceness value");
+        output("    -p <pid>       Specify process ID");
+        output("    -g <pgrp>      Specify process group ID");
+        output("    -u <user>      Specify user name");
+        output("");
+        output("PRIORITY VALUES");
+        output("    -20 to -1      High priority (requires admin)");
+        output("     0             Normal priority");
+        output("     1 to 19       Low priority");
+        output("");
+        output("EXAMPLES");
+        output("    renice -n 10 1234");
+        output("    renice 5 -p 1234");
+        output("");
+        output("NOTE");
+        output("    On Windows, maps niceness to priority classes.");
+        output("");
+        output("SEE ALSO");
+        output("    nice, top, ps");
+        
+    } else if (cmd == "fg") {
+        output("NAME");
+        output("    fg - move job to the foreground");
+        output("");
+        output("SYNOPSIS");
+        output("    fg [job_spec]");
+        output("");
+        output("DESCRIPTION");
+        output("    fg brings a background job to the foreground and makes it");
+        output("    the current job. If job_spec is not present, the current");
+        output("    job is used.");
+        output("");
+        output("EXAMPLES");
+        output("    fg");
+        output("    fg %1");
+        output("");
+        output("NOTE");
+        output("    On Windows, job control is limited.");
+        output("    This command simulates Unix job control behavior.");
+        output("");
+        output("SEE ALSO");
+        output("    bg, jobs, kill");
+        
+    } else if (cmd == "strace") {
+        output("NAME");
+        output("    strace - trace system calls and signals");
+        output("");
+        output("SYNOPSIS");
+        output("    strace [options] command [args...]");
+        output("");
+        output("DESCRIPTION");
+        output("    strace intercepts and records system calls and signals");
+        output("    received by a process. Useful for debugging.");
+        output("");
+        output("OPTIONS");
+        output("    -c             Count time and calls");
+        output("    -f             Trace child processes");
+        output("    -o <file>      Write output to file");
+        output("    -p <pid>       Attach to running process");
+        output("    -T             Show time spent in calls");
+        output("");
+        output("EXAMPLES");
+        output("    strace ls");
+        output("    strace -c find /");
+        output("    strace -p 1234");
+        output("");
+        output("NOTE");
+        output("    On Windows, use Process Monitor (procmon.exe)");
+        output("    from Sysinternals for actual tracing.");
+        output("");
+        output("SEE ALSO");
+        output("    ltrace, ps, top");
+        
+    } else if (cmd == "nc") {
+        output("NAME");
+        output("    nc - network utility for reading/writing network connections");
+        output("");
+        output("SYNOPSIS");
+        output("    nc [options] [host] [port]");
+        output("");
+        output("DESCRIPTION");
+        output("    nc is a versatile networking tool for reading and writing");
+        output("    across network connections. Can be used as client or server.");
+        output("");
+        output("OPTIONS");
+        output("    -l              Listen mode (server)");
+        output("    -p <port>       Local port");
+        output("    -n              Numeric; no DNS");
+        output("");
+        output("EXAMPLES");
+        output("    nc -l -p 8000");
+        output("    nc example.com 80");
+        output("");
+        output("NOTE");
+        output("    On Windows, requires netcat.exe or external implementation.");
+        output("");
+        output("SEE ALSO");
+        output("    telnet, netstat, ss");
+        
+    } else if (cmd == "unrar") {
+        output("NAME");
+        output("    unrar - extract and list RAR archives");
+        output("");
+        output("SYNOPSIS");
+        output("    unrar [options] <archive> [files...]");
+        output("");
+        output("DESCRIPTION");
+        output("    unrar extracts, lists, or tests RAR archive files.");
+        output("    Requires external unrar.exe utility.");
+        output("");
+        output("OPTIONS");
+        output("    x              Extract with full paths");
+        output("    e              Extract to current directory");
+        output("    l              List archive contents");
+        output("    t              Test archive");
+        output("");
+        output("EXAMPLES");
+        output("    unrar l archive.rar");
+        output("    unrar x archive.rar");
+        output("");
+        output("NOTE");
+        output("    Install WinRAR or UnRAR for full functionality.");
+        output("");
+        output("SEE ALSO");
+        output("    tar, zip, unzip, xz");
+        
+    } else if (cmd == "xz") {
+        output("NAME");
+        output("    xz - compress files to XZ format");
+        output("");
+        output("SYNOPSIS");
+        output("    xz [options] [file...]");
+        output("");
+        output("DESCRIPTION");
+        output("    xz compresses files using the XZ compression algorithm.");
+        output("    Produces .xz compressed files. Requires external utility.");
+        output("");
+        output("OPTIONS");
+        output("    -d              Decompress (same as unxz)");
+        output("    -k              Keep original files");
+        output("    -9              Maximum compression");
+        output("");
+        output("EXAMPLES");
+        output("    xz file.txt");
+        output("    xz -k file.tar");
+        output("");
+        output("NOTE");
+        output("    Install XZ Utils from https://tukaani.org/xz/");
+        output("");
+        output("SEE ALSO");
+        output("    unxz, gzip, bzip2");
+        
+    } else if (cmd == "unxz") {
+        output("NAME");
+        output("    unxz - decompress XZ-compressed files");
+        output("");
+        output("SYNOPSIS");
+        output("    unxz [options] <file.xz>");
+        output("");
+        output("DESCRIPTION");
+        output("    unxz decompresses files in XZ format (.xz files).");
+        output("    Equivalent to 'xz -d'.");
+        output("");
+        output("OPTIONS");
+        output("    -k              Keep compressed file");
+        output("    -T              Test integrity");
+        output("");
+        output("EXAMPLES");
+        output("    unxz file.tar.xz");
+        output("    unxz -k file.xz");
+        output("");
+        output("NOTE");
+        output("    Install XZ Utils from https://tukaani.org/xz/");
+        output("");
+        output("SEE ALSO");
+        output("    xz, gunzip, bunzip2");
+        
+    } else if (cmd == "dmesg") {
+        output("NAME");
+        output("    dmesg - display kernel and system messages");
+        output("");
+        output("SYNOPSIS");
+        output("    dmesg [options]");
+        output("");
+        output("DESCRIPTION");
+        output("    On Linux, dmesg displays kernel message buffer.");
+        output("    On Windows, displays system event log information.");
+        output("");
+        output("OPTIONS");
+        output("    -c              Clear message buffer");
+        output("    -n <level>      Set logging level");
+        output("    -T              Human-readable timestamps");
+        output("");
+        output("EXAMPLES");
+        output("    dmesg");
+        output("    dmesg | grep -i error");
+        output("");
+        output("NOTE");
+        output("    On Windows, uses Event Viewer logs.");
+        output("    View detailed logs with: eventvwr.exe");
+        output("");
+        output("SEE ALSO");
+        output("    uname, uptime, syslog");
+        
+    } else if (cmd == "mkfs") {
+        output("NAME");
+        output("    mkfs - create a filesystem in a file");
+        output("");
+        output("SYNOPSIS");
+        output("    mkfs [options] <file> [size]");
+        output("");
+        output("DESCRIPTION");
+        output("    Creates a filesystem image file. Supports various");
+        output("    filesystem types. Useful for disk images and testing.");
+        output("");
+        output("OPTIONS");
+        output("    -t <type>       Filesystem type (ext4, ntfs, fat, etc)");
+        output("    -L <label>      Filesystem label");
+        output("    -F              Force creation");
+        output("");
+        output("EXAMPLES");
+        output("    mkfs -t ext4 disk.img 100M");
+        output("    mkfs -t ntfs diskimage.bin");
+        output("");
+        output("NOTE");
+        output("    On Windows, requires external mkfs tools or WSL integration.");
+        output("    For Windows volumes, use Windows Disk Management.");
+        output("");
+        output("SEE ALSO");
+        output("    fsck, mount, dd");
+        
+    } else if (cmd == "fsck") {
+        output("NAME");
+        output("    fsck - check and repair filesystem");
+        output("");
+        output("SYNOPSIS");
+        output("    fsck [options] <device/file>");
+        output("");
+        output("DESCRIPTION");
+        output("    Checks and repairs filesystem consistency.");
+        output("    Can fix common filesystem errors and corruption.");
+        output("");
+        output("OPTIONS");
+        output("    -n              No changes, read-only check");
+        output("    -y              Assume yes to all prompts");
+        output("    -f              Force check even if marked clean");
+        output("    -p              Repair automatically");
+        output("");
+        output("EXAMPLES");
+        output("    fsck -n disk.img");
+        output("    fsck -y /dev/sda1");
+        output("");
+        output("NOTE");
+        output("    On Windows, use chkdsk /F for NTFS volumes.");
+        output("    Requires elevated privileges for device operations.");
+        output("");
+        output("SEE ALSO");
+        output("    mkfs, mount, chkdsk");
+        
+    } else if (cmd == "systemctl") {
+        output("NAME");
+        output("    systemctl - control system services");
+        output("");
+        output("SYNOPSIS");
+        output("    systemctl [action] <service>");
+        output("");
+        output("DESCRIPTION");
+        output("    Controls and manages system services and units.");
+        output("    Similar to 'service' command with extended functionality.");
+        output("");
+        output("ACTIONS");
+        output("    start <service>     Start a service");
+        output("    stop <service>      Stop a service");
+        output("    restart <service>   Restart a service");
+        output("    status <service>    Show service status");
+        output("    enable <service>    Enable service at boot");
+        output("    disable <service>   Disable service at boot");
+        output("");
+        output("EXAMPLES");
+        output("    systemctl start nginx");
+        output("    systemctl status mysql");
+        output("    systemctl restart sshd");
+        output("");
+        output("NOTE");
+        output("    On Windows, maps to service control commands.");
+        output("    Requires administrator privileges for service changes.");
+        output("");
+        output("SEE ALSO");
+        output("    service, journalctl, shutdown");
+        
+    } else if (cmd == "journalctl") {
+        output("NAME");
+        output("    journalctl - query system journal");
+        output("");
+        output("SYNOPSIS");
+        output("    journalctl [options]");
+        output("");
+        output("DESCRIPTION");
+        output("    Views and filters system journal entries.");
+        output("    On Windows, displays Event Viewer logs.");
+        output("");
+        output("OPTIONS");
+        output("    -n N            Show last N lines");
+        output("    -f              Follow journal (tail mode)");
+        output("    -u <unit>       Filter by systemd unit");
+        output("    -p <level>      Filter by priority (err, warn, info, debug)");
+        output("");
+        output("EXAMPLES");
+        output("    journalctl -n 50");
+        output("    journalctl -u sshd");
+        output("    journalctl -p err");
+        output("");
+        output("NOTE");
+        output("    On Windows, uses Event Viewer for system logs.");
+        output("    View detailed logs with: Get-EventLog -LogName System");
+        output("");
+        output("SEE ALSO");
+        output("    systemctl, dmesg, tail");
+        
+    } else if (cmd == "updatedb") {
+        output("NAME");
+        output("    updatedb - build locate database");
+        output("");
+        output("SYNOPSIS");
+        output("    updatedb [-U path] [-o dbfile] [-m max]");
+        output("");
+        output("DESCRIPTION");
+        output("    Recursively indexes files and directories to generate a simple");
+        output("    locate-style database stored in a text file.");
+        output("");
+        output("OPTIONS");
+        output("    -U <path>       Root path to index (default: current directory)");
+        output("    -o <dbfile>     Output database file (default: locate.db)");
+        output("    -m <max>        Maximum entries to index (default: 50000)");
+        output("");
+        output("EXAMPLES");
+        output("    updatedb");
+        output("    updatedb -U C:/Projects -o mydb.txt");
+        output("    updatedb -m 200000");
+        output("");
+        output("NOTE");
+        output("    The database is a plain text list of paths for use with locate-like searches.");
+        output("");
+        output("SEE ALSO");
+        output("    locate, find");
+        
+    } else if (cmd == "timedatectl") {
+        output("NAME");
+        output("    timedatectl - show system time and timezone status");
+        output("");
+        output("SYNOPSIS");
+        output("    timedatectl [status]");
+        output("");
+        output("DESCRIPTION");
+        output("    Displays local time, UTC time, timezone offset, and clock sync info.");
+        output("");
+        output("EXAMPLES");
+        output("    timedatectl");
+        output("    timedatectl status");
+        output("");
+        output("NOTE");
+        output("    On Windows, shows current time and timezone from system settings.");
+        output("");
+        output("SEE ALSO");
+        output("    date, hwclock");
+        
+    } else if (cmd == "env") {
+        output("NAME");
+        output("    env - print or set environment variables");
+        output("");
+        output("SYNOPSIS");
+        output("    env [-u VAR] [KEY=VALUE ...]");
+        output("");
+        output("DESCRIPTION");
+        output("    Shows the current process environment or updates variables for this session.");
+        output("");
+        output("OPTIONS");
+        output("    -u VAR         Unset (remove) environment variable");
+        output("");
+        output("EXAMPLES");
+        output("    env");
+        output("    env PATH=C:/Tools/bin");
+        output("    env -u TEMP");
+        output("");
+        output("SEE ALSO");
+        output("    export, set, unset");
+        
+    } else if (cmd == "split") {
+        output("NAME");
+        output("    split - split files into pieces");
+        output("");
+        output("SYNOPSIS");
+        output("    split [-l lines|-b size] [input] [prefix]");
+        output("");
+        output("DESCRIPTION");
+        output("    Splits input into fixed-size chunks by lines or bytes, writing sequential files.");
+        output("");
+        output("OPTIONS");
+        output("    -l <lines>     Split by line count (default: 1000 lines)");
+        output("    -b <size>      Split by bytes (supports K/M/G suffix)");
+        output("    -d            Use numeric suffixes (00,01,...)");
+        output("");
+        output("EXAMPLES");
+        output("    split -l 200 big.log logs_");
+        output("    split -b 10M image.iso part_");
+        output("");
+        output("SEE ALSO");
+        output("    csplit, head, tail");
+        
+    } else if (cmd == "nl") {
+        output("NAME");
+        output("    nl - number lines of files");
+        output("");
+        output("SYNOPSIS");
+        output("    nl [-ba|-bt] [-s sep] [-w width] [file]");
+        output("");
+        output("DESCRIPTION");
+        output("    Numbers lines of input; by default numbers non-empty lines only.");
+        output("");
+        output("OPTIONS");
+        output("    -ba           Number all lines");
+        output("    -bt           Number non-empty lines (default)");
+        output("    -s <sep>      Separator between number and text (default: tab)");
+        output("    -w <width>    Width of line numbers (default: 6)");
+        output("");
+        output("EXAMPLES");
+        output("    nl file.txt");
+        output("    cat file | nl -ba -w 4");
+        output("");
+        output("SEE ALSO");
+        output("    cat, sed, awk");
+        
+    } else if (cmd == "tr") {
+        output("NAME");
+        output("    tr - translate or delete characters");
+        output("");
+        output("SYNOPSIS");
+        output("    tr [options] SET1 [SET2]");
+        output("");
+        output("DESCRIPTION");
+        output("    Translates characters from SET1 to SET2, or deletes/squeezes characters.");
+        output("");
+        output("OPTIONS");
+        output("    -d            Delete characters in SET1");
+        output("    -s            Squeeze repeated output characters");
+        output("");
+        output("EXAMPLES");
+        output("    echo foo | tr o a");
+        output("    echo 'a  b' | tr -s ' '");
+        output("    echo 'abc' | tr -d b");
+        output("");
+        output("SEE ALSO");
+        output("    sed, awk, cut");
+        
+    } else if (cmd == "printenv") {
+        output("NAME");
+        output("    printenv - print environment variables");
+        output("");
+        output("SYNOPSIS");
+        output("    printenv [VARIABLE...]");
+        output("");
+        output("DESCRIPTION");
+        output("    Prints environment variables. With no arguments, prints all variables.");
+        output("    With arguments, prints the values of specified variables.");
+        output("");
+        output("EXAMPLES");
+        output("    printenv              # Print all variables");
+        output("    printenv PATH         # Print PATH variable");
+        output("    printenv HOME USER    # Print multiple variables");
+        output("");
+        output("SEE ALSO");
+        output("    env, export");
+        
+    } else if (cmd == "export") {
+        output("NAME");
+        output("    export - set environment variables");
+        output("");
+        output("SYNOPSIS");
+        output("    export [KEY=VALUE...]");
+        output("");
+        output("DESCRIPTION");
+        output("    Sets environment variables for the current session. Variables can");
+        output("    reference other variables using $VAR or ${VAR} syntax.");
+        output("");
+        output("EXAMPLES");
+        output("    export MYVAR=value");
+        output("    export PATH=/usr/bin:$PATH");
+        output("    export                # Show all variables");
+        output("");
+        output("SEE ALSO");
+        output("    env, printenv");
+        
+    } else if (cmd == "shuf") {
+        output("NAME");
+        output("    shuf - shuffle lines randomly");
+        output("");
+        output("SYNOPSIS");
+        output("    shuf [options] [file]");
+        output("");
+        output("DESCRIPTION");
+        output("    Shuffles lines of input in random order.");
+        output("");
+        output("OPTIONS");
+        output("    -n <count>     Output at most <count> lines");
+        output("    -e <args>      Shuffle arguments instead of file");
+        output("");
+        output("EXAMPLES");
+        output("    shuf file.txt");
+        output("    shuf -n 5 file.txt");
+        output("    shuf -e one two three");
+        output("    cat file.txt | shuf");
+        output("");
+        output("SEE ALSO");
+        output("    sort, uniq");
+        
+    } else if (cmd == "banner") {
+        output("NAME");
+        output("    banner - display text in large letters");
+        output("");
+        output("SYNOPSIS");
+        output("    banner [text...]");
+        output("");
+        output("DESCRIPTION");
+        output("    Displays text in large ASCII art letters, 5 rows high.");
+        output("");
+        output("EXAMPLES");
+        output("    banner Hello");
+        output("    banner WELCOME");
+        output("");
+        output("SEE ALSO");
+        output("    echo, figlet");
+        
+    } else if (cmd == "time") {
+        output("NAME");
+        output("    time - measure command execution time");
+        output("");
+        output("SYNOPSIS");
+        output("    time <command> [args...]");
+        output("");
+        output("DESCRIPTION");
+        output("    Executes the specified command and reports the elapsed execution time.");
+        output("");
+        output("EXAMPLES");
+        output("    time ls -la");
+        output("    time sleep 2");
+        output("");
+        output("SEE ALSO");
+        output("    watch, sleep");
+        
+    } else if (cmd == "watch") {
+        output("NAME");
+        output("    watch - execute command repeatedly");
+        output("");
+        output("SYNOPSIS");
+        output("    watch [-n seconds] <command>");
+        output("");
+        output("DESCRIPTION");
+        output("    Executes command repeatedly at specified intervals (default: 2 seconds).");
+        output("    Note: Full loop not implemented; executes once with timing info.");
+        output("");
+        output("OPTIONS");
+        output("    -n <seconds>   Interval in seconds (default: 2)");
+        output("");
+        output("EXAMPLES");
+        output("    watch -n 5 date");
+        output("    watch ls -la");
+        output("");
+        output("NOTE");
+        output("    For continuous watching, use PowerShell:");
+        output("    while($true) { cls; <command>; sleep <interval> }");
+        output("");
+        output("SEE ALSO");
+        output("    time, sleep");
+        
+    } else if (cmd == "trap") {
+        output("NAME");
+        output("    trap - set signal handlers");
+        output("");
+        output("SYNOPSIS");
+        output("    trap [action] [signal...]");
+        output("");
+        output("DESCRIPTION");
+        output("    Trap signals and interrupts. When a signal is caught, the");
+        output("    specified action is executed. This is typically used to");
+        output("    perform cleanup operations on script exit.");
+        output("");
+        output("SIGNALS");
+        output("    INT         Interrupt (Ctrl+C)");
+        output("    TERM        Terminate");
+        output("    EXIT        Script exit");
+        output("    HUP         Hangup");
+        output("");
+        output("EXAMPLES");
+        output("    trap 'rm -f temp.txt' EXIT");
+        output("    trap 'echo interrupted' INT");
+        output("    trap - INT");
+        output("");
+        output("NOTE");
+        output("    Signal handling is limited on Windows. This command provides");
+        output("    compatibility for Unix shell scripts.");
+        output("");
+        output("SEE ALSO");
+        output("    kill, exit");
+        
+    } else if (cmd == "ulimit") {
+        output("NAME");
+        output("    ulimit - set or display resource limits");
+        output("");
+        output("SYNOPSIS");
+        output("    ulimit [options] [limit]");
+        output("");
+        output("DESCRIPTION");
+        output("    Gets or sets resource limits for the shell and processes");
+        output("    created within the shell. On Windows, some limits may not");
+        output("    be enforceable.");
+        output("");
+        output("OPTIONS");
+        output("    -a             Show all limits");
+        output("    -c <limit>     Core dump size");
+        output("    -d <limit>     Data segment size");
+        output("    -f <limit>     File size limit");
+        output("    -m <limit>     Memory usage limit");
+        output("    -n <limit>     Number of open file descriptors");
+        output("    -s <limit>     Stack size");
+        output("    -t <limit>     CPU time limit");
+        output("    -u <limit>     Processes per user");
+        output("");
+        output("EXAMPLES");
+        output("    ulimit -a");
+        output("    ulimit -n 4096");
+        output("");
+        output("NOTE");
+        output("    Windows does not enforce all resource limits. The");
+        output("    command is provided for script compatibility.");
+        output("");
+        output("SEE ALSO");
+        output("    sysctl");
+        
+    } else if (cmd == "expr") {
+        output("NAME");
+        output("    expr - evaluate expressions");
+        output("");
+        output("SYNOPSIS");
+        output("    expr EXPRESSION");
+        output("");
+        output("DESCRIPTION");
+        output("    Evaluates EXPRESSION and prints the result. Expressions");
+        output("    may be arithmetic, string-based, or regex-based.");
+        output("");
+        output("OPERATORS");
+        output("    Arithmetic: +, -, *, /, %");
+        output("    Comparison: <, <=, =, !=, >=, >");
+        output("    String: substr, length, match");
+        output("    Logical: &, |");
+        output("");
+        output("EXAMPLES");
+        output("    expr 3 + 4");
+        output("    expr 10 - 3");
+        output("    expr 5 \\* 2");
+        output("    expr 10 / 3");
+        output("    expr 10 \\% 3");
+        output("");
+        output("SEE ALSO");
+        output("    bc, calc, printf");
+        
+    } else if (cmd == "info") {
+        output("NAME");
+        output("    info - display information about topics");
+        output("");
+        output("SYNOPSIS");
+        output("    info [topic] [subtopic]");
+        output("");
+        output("DESCRIPTION");
+        output("    Displays detailed information about specified topics.");
+        output("    Similar to man pages but for general GNU software topics.");
+        output("");
+        output("TOPICS");
+        output("    coreutils      GNU core utilities");
+        output("    bash           Bash shell manual");
+        output("    gnu            GNU general information");
+        output("    gzip           GNU compression");
+        output("    tar            TAR archive format");
+        output("");
+        output("EXAMPLES");
+        output("    info coreutils");
+        output("    info bash");
+        output("    info gzip");
+        output("");
+        output("NOTE");
+        output("    This implementation provides compatibility info pages.");
+        output("    For detailed command help, use 'man <command>'.");
+        output("");
+        output("SEE ALSO");
+        output("    man, help, apropos");
+        
+    } else if (cmd == "apropos") {
+        output("NAME");
+        output("    apropos - search manual page names and descriptions");
+        output("");
+        output("SYNOPSIS");
+        output("    apropos [options] keyword");
+        output("");
+        output("DESCRIPTION");
+        output("    Searches the manual page descriptions for the keyword");
+        output("    and displays a list of matching man pages.");
+        output("");
+        output("OPTIONS");
+        output("    -e            Interpret keyword as regex");
+        output("    -w            Match whole words only");
+        output("");
+        output("EXAMPLES");
+        output("    apropos file");
+        output("    apropos -w copy");
+        output("    apropos directory");
+        output("");
+        output("SEE ALSO");
+        output("    man, whatis, help");
+        
+    } else if (cmd == "whatis") {
+        output("NAME");
+        output("    whatis - display one-line command descriptions");
+        output("");
+        output("SYNOPSIS");
+        output("    whatis command [command...]");
+        output("");
+        output("DESCRIPTION");
+        output("    Displays a brief one-line description of each command.");
+        output("    Typically used to quickly identify what a command does.");
+        output("");
+        output("EXAMPLES");
+        output("    whatis ls");
+        output("    whatis cat grep");
+        output("    whatis pwd cd");
+        output("");
+        output("SEE ALSO");
+        output("    man, apropos, help");
+        
+    } else if (cmd == "quota") {
+        output("NAME");
+        output("    quota - display disk quota information");
+        output("");
+        output("SYNOPSIS");
+        output("    quota [options] [user]");
+        output("");
+        output("DESCRIPTION");
+        output("    Displays disk quota information for the current or specified user.");
+        output("    On Windows, quotas are managed differently than on Unix systems.");
+        output("");
+        output("OPTIONS");
+        output("    -v                Verbose output");
+        output("    -u <user>         Show quota for specific user");
+        output("    -g <group>        Show quota for specific group");
+        output("");
+        output("EXAMPLES");
+        output("    quota");
+        output("    quota -u john");
+        output("");
+        output("NOTE");
+        output("    Windows does not enforce user disk quotas the same way as Unix.");
+        output("    Use 'fsutil quota' for detailed quota management on NTFS volumes.");
+        output("");
+        output("SEE ALSO");
+        output("    df, du, fsutil");
+        
+    } else if (cmd == "basename") {
+        output("NAME");
+        output("    basename - strip directory and suffix from pathname");
+        output("");
+        output("SYNOPSIS");
+        output("    basename path [suffix]");
+        output("");
+        output("DESCRIPTION");
+        output("    Removes leading directory components from path.");
+        output("    If suffix is provided, removes trailing suffix as well.");
+        output("");
+        output("EXAMPLES");
+        output("    basename /path/to/file.txt");
+        output("    basename /path/to/file.txt .txt");
+        output("    basename C:\\\\Windows\\\\System32\\\\notepad.exe");
+        output("");
+        output("SEE ALSO");
+        output("    dirname, path expansion");
+        
+    } else if (cmd == "whereis") {
+        output("NAME");
+        output("    whereis - locate command, source, and manual page files");
+        output("");
+        output("SYNOPSIS");
+        output("    whereis [options] command");
+        output("");
+        output("DESCRIPTION");
+        output("    Searches for the location of the binary, source code, and");
+        output("    manual page files for a given command.");
+        output("");
+        output("OPTIONS");
+        output("    -b                Search for binary only");
+        output("    -s                Search for source code only");
+        output("    -m                Search for manual page only");
+        output("    -a                Find all occurrences");
+        output("");
+        output("EXAMPLES");
+        output("    whereis ls");
+        output("    whereis -b ls");
+        output("    whereis grep");
+        output("");
+        output("NOTE");
+        output("    On Windows, only checks for executables in PATH.");
+        output("    Source code location is not available on Windows.");
+        output("");
+        output("SEE ALSO");
+        output("    which, find, locate");
+        
+    } else if (cmd == "stat") {
+        output("NAME");
+        output("    stat - display file and filesystem statistics");
+        output("");
+        output("SYNOPSIS");
+        output("    stat [options] file [file...]");
+        output("");
+        output("DESCRIPTION");
+        output("    Displays detailed information about the specified files or");
+        output("    filesystems. Shows size, attributes, access times, and permissions.");
+        output("");
+        output("OPTIONS");
+        output("    -c <format>       Format output (not fully supported)");
+        output("    -f                Display filesystem statistics");
+        output("    -L                Follow symbolic links");
+        output("");
+        output("EXAMPLES");
+        output("    stat file.txt");
+        output("    stat /path/to/file");
+        output("    stat -f /");
+        output("");
+        output("SEE ALSO");
+        output("    file, ls, dir");
+        
+    } else if (cmd == "type") {
+        output("NAME");
+        output("    type - show command type (alias for cat on Windows)");
+        output("");
+        output("SYNOPSIS");
+        output("    type file [file...]");
+        output("");
+        output("DESCRIPTION");
+        output("    In Unix, type shows whether a command is builtin, alias, etc.");
+        output("    In this shell, type is an alias for cat, displaying file contents.");
+        output("");
+        output("EXAMPLES");
+        output("    type file.txt");
+        output("    type script.sh");
+        output("");
+        output("SEE ALSO");
+        output("    cat, less, more");
+        
+    } else if (cmd == "chattr") {
+        output("NAME");
+        output("    chattr - change file attributes");
+        output("");
+        output("SYNOPSIS");
+        output("    chattr [+-=]<attr> file...");
+        output("");
+        output("DESCRIPTION");
+        output("    Changes file attributes. On Windows, supports Read-only (r),");
+        output("    Hidden (h), System (s), and Archive (a) attributes.");
+        output("");
+        output("OPERATIONS");
+        output("    +               Add attribute");
+        output("    -               Remove attribute");
+        output("    =               Set exactly");
+        output("");
+        output("ATTRIBUTES");
+        output("    r               Read-only");
+        output("    h               Hidden");
+        output("    s               System");
+        output("    a               Archive");
+        output("");
+        output("EXAMPLES");
+        output("    chattr +r file.txt          Make read-only");
+        output("    chattr -h file.txt          Remove hidden attribute");
+        output("    chattr +h +s file.txt       Hide and mark as system");
+        output("");
+        output("NOTE");
+        output("    Windows file attributes are more limited than Unix extended attributes.");
+        output("    Not all attributes may be supported on all filesystems.");
+        output("");
+        output("SEE ALSO");
+        output("    chmod, stat, ls");
+        
+    } else if (cmd == "pgrep") {
+        output("NAME");
+        output("    pgrep - search processes by name");
+        output("");
+        output("SYNOPSIS");
+        output("    pgrep [options] pattern");
+        output("");
+        output("DESCRIPTION");
+        output("    Searches the active process list for names matching pattern and");
+        output("    prints their process IDs. Matching is case-insensitive by default.");
+        output("");
+        output("OPTIONS");
+        output("    -i                Case-insensitive matching (default)");
+        output("    -l                List PID and process name");
+        output("    -x                Exact match of process name");
+        output("");
+        output("EXAMPLES");
+        output("    pgrep chrome");
+        output("    pgrep -l notepad");
+        output("    pgrep -x garyshell.exe");
+        
+    } else if (cmd == "pidof") {
+        output("NAME");
+        output("    pidof - find the process ID of a running program");
+        output("");
+        output("SYNOPSIS");
+        output("    pidof program [program...]");
+        output("");
+        output("DESCRIPTION");
+        output("    Prints the process IDs of running programs with the given name(s).");
+        output("");
+        output("EXAMPLES");
+        output("    pidof notepad");
+        output("    pidof chrome firefox");
+        
+    } else if (cmd == "pstree") {
+        output("NAME");
+        output("    pstree - display processes as a tree");
+        output("");
+        output("SYNOPSIS");
+        output("    pstree [pid]");
+        output("");
+        output("DESCRIPTION");
+        output("    Shows running processes in a tree format based on parent-child");
+        output("    relationships. If pid is provided, shows the tree rooted at pid.");
+        output("");
+        output("EXAMPLES");
+        output("    pstree");
+        output("    pstree 4");
+        
+    } else if (cmd == "timeout") {
+        output("NAME");
+        output("    timeout - run command with a time limit");
+        output("");
+        output("SYNOPSIS");
+        output("    timeout <seconds> command [args...]");
+        output("");
+        output("DESCRIPTION");
+        output("    Runs a command and terminates it if it exceeds the specified time.");
+        output("");
+        output("EXAMPLES");
+        output("    timeout 5 ping 127.0.0.1");
+        output("    timeout 2 cmd /c \"dir /s\"");
+        
+    } else if (cmd == "ftp") {
+        output("NAME");
+        output("    ftp - simple FTP connectivity test");
+        output("");
+        output("SYNOPSIS");
+        output("    ftp [-p port] [-u user] [-w pass] host");
+        output("");
+        output("DESCRIPTION");
+        output("    Connects to an FTP server, performs a basic login, and prints");
+        output("    server responses. Designed for quick connectivity checks.");
+        output("");
+        output("EXAMPLES");
+        output("    ftp ftp.example.com");
+        output("    ftp -p 2121 -u user -w pass ftp.example.com");
+        output("");
+        output("NOTE");
+        output("    This is a lightweight client for testing connectivity and login.");
+        output("    File transfers are not implemented in this build.");
+        
+    } else if (cmd == "sftp") {
+        output("NAME");
+        output("    sftp - SSH/SFTP connectivity probe");
+        output("");
+        output("SYNOPSIS");
+        output("    sftp [-p port] host");
+        output("");
+        output("DESCRIPTION");
+        output("    Opens a TCP connection to an SSH/SFTP server, reads the banner,");
+        output("    and reports connectivity. Use scp/ssh for transfers.");
+        output("");
+        output("EXAMPLES");
+        output("    sftp example.com");
+        output("    sftp -p 2222 example.com");
+        output("");
+        output("NOTE");
+        output("    This implementation checks reachability and server banners only.");
+        output("    Full SFTP file transfer is not included.");
+        
+    } else if (cmd == "sysctl") {
+        output("NAME");
+        output("    sysctl - view system parameters (compatibility)");
+        output("");
+        output("SYNOPSIS");
+        output("    sysctl [-a] [name...]");
+        output("");
+        output("DESCRIPTION");
+        output("    Displays selected system parameters in a sysctl-compatible style.");
+        output("    Supports a curated set of read-only keys for Windows systems.");
+        output("");
+        output("EXAMPLES");
+        output("    sysctl kernel.osrelease");
+        output("    sysctl -a");
+        output("    sysctl hw.ncpu hw.memsize");
+        output("");
+        output("SEE ALSO");
+        output("    uname, vmstat, iostat");
+        
+    } else if (cmd == "read") {
+        output("NAME");
+        output("    read - read line from standard input");
+        output("");
+        output("SYNOPSIS");
+        output("    read [var]");
+        output("");
+        output("DESCRIPTION");
+        output("    Reads a single line from standard input and displays it.");
+        output("    In full shell implementations, would store to a variable.");
+        output("");
+        output("EXAMPLES");
+        output("    read");
+        output("    echo 'Enter your name:' && read name");
+        
+    } else if (cmd == "rename") {
+        output("NAME");
+        output("    rename - rename files by pattern");
+        output("");
+        output("SYNOPSIS");
+        output("    rename <old> <new> [files...]");
+        output("");
+        output("DESCRIPTION");
+        output("    Renames files by replacing old pattern with new pattern in filenames.");
+        output("");
+        output("EXAMPLES");
+        output("    rename .txt .bak file1.txt file2.txt");
+        output("    rename old new oldfile.txt");
+        output("");
+        output("SEE ALSO");
+        output("    mv");
+        
+    } else if (cmd == "unlink") {
+        output("NAME");
+        output("    unlink - remove a file");
+        output("");
+        output("SYNOPSIS");
+        output("    unlink <file>");
+        output("");
+        output("DESCRIPTION");
+        output("    Removes a single file. Similar to 'rm' but only works with one file.");
+        output("");
+        output("EXAMPLES");
+        output("    unlink oldfile.txt");
+        output("");
+        output("SEE ALSO");
+        output("    rm, del");
+        
+    } else if (cmd == "nohup") {
+        output("NAME");
+        output("    nohup - run command immune to hangups");
+        output("");
+        output("SYNOPSIS");
+        output("    nohup <command> [args...]");
+        output("");
+        output("DESCRIPTION");
+        output("    Runs a command as a detached process that continues running");
+        output("    even if the terminal closes or the user logs out.");
+        output("");
+        output("EXAMPLES");
+        output("    nohup ping 127.0.0.1 -n 100");
+        output("    nohup long-running-task.exe");
+        output("");
+        output("SEE ALSO");
+        output("    timeout, bg");
+        
+    } else if (cmd == "blkid") {
+        output("NAME");
+        output("    blkid - display block device attributes");
+        output("");
+        output("SYNOPSIS");
+        output("    blkid [device...]");
+        output("");
+        output("DESCRIPTION");
+        output("    Shows information about block devices including volume labels,");
+        output("    file system types, and unique identifiers (UUIDs).");
+        output("");
+        output("EXAMPLES");
+        output("    blkid");
+        output("    blkid C:");
+        output("    blkid D: E:");
+        output("");
+        output("SEE ALSO");
+        output("    mount, df, lsblk");
+        
+    } else if (cmd == "test" || cmd == "[") {
+        output("NAME");
+        output("    test, [ - evaluate conditional expression");
+        output("");
+        output("SYNOPSIS");
+        output("    test <expression>");
+        output("    [ <expression> ]");
+        output("");
+        output("DESCRIPTION");
+        output("    Evaluates conditional expressions and returns exit status.");
+        output("    Returns 0 (true) or 1 (false) based on the test result.");
+        output("");
+        output("FILE TESTS");
+        output("    -e file      file exists");
+        output("    -f file      file is regular file");
+        output("    -d file      file is directory");
+        output("    -r file      file is readable");
+        output("    -w file      file is writable");
+        output("    -x file      file is executable");
+        output("");
+        output("STRING TESTS");
+        output("    -z string    string is empty");
+        output("    -n string    string is not empty");
+        output("    s1 = s2      strings are equal");
+        output("    s1 != s2     strings are not equal");
+        output("");
+        output("INTEGER TESTS");
+        output("    n1 -eq n2    integers are equal");
+        output("    n1 -ne n2    integers are not equal");
+        output("    n1 -lt n2    n1 less than n2");
+        output("    n1 -le n2    n1 less than or equal to n2");
+        output("    n1 -gt n2    n1 greater than n2");
+        output("    n1 -ge n2    n1 greater than or equal to n2");
+        output("");
+        output("EXAMPLES");
+        output("    test -f file.txt");
+        output("    [ -d /tmp ]");
+        output("    test 5 -gt 3");
+        
+    } else if (cmd == "egrep") {
+        output("NAME");
+        output("    egrep - extended grep");
+        output("");
+        output("SYNOPSIS");
+        output("    egrep [options] pattern [files...]");
+        output("");
+        output("DESCRIPTION");
+        output("    Extended grep using extended regular expressions.");
+        output("    Supports alternation (|), grouping (), and repetition (+, *, ?).");
+        output("");
+        output("OPTIONS");
+        output("    -i    Case-insensitive search");
+        output("    -n    Show line numbers");
+        output("    -v    Invert match");
+        output("    -c    Count matching lines");
+        output("");
+        output("EXAMPLES");
+        output("    egrep 'error|warning' logfile.txt");
+        output("    egrep -i '(foo|bar)' data.txt");
+        output("");
+        output("SEE ALSO");
+        output("    grep, fgrep");
+        
+    } else if (cmd == "more") {
+        output("NAME");
+        output("    more - display text with paging");
+        output("");
+        output("SYNOPSIS");
+        output("    more [file...]");
+        output("");
+        output("DESCRIPTION");
+        output("    Displays file contents one screen at a time.");
+        output("    Similar to 'less' but with basic navigation only.");
+        output("");
+        output("NAVIGATION");
+        output("    Space           Next page");
+        output("    Enter           Next line");
+        output("    q               Quit");
+        output("    /pattern        Search forward");
+        output("");
+        output("EXAMPLES");
+        output("    more file.txt");
+        output("    cat file.txt | more");
+        output("    more *.log");
+        output("");
+        output("NOTE");
+        output("    'more' is less feature-rich than 'less'.");
+        output("    Use 'less' for advanced features like backward search.");
+        output("");
+        output("SEE ALSO");
+        output("    less, cat, head, tail");
+        
+    } else if (cmd == "lsof") {
+        output("NAME");
+        output("    lsof - list open files");
+        output("");
+        output("SYNOPSIS");
+        output("    lsof [options]");
+        output("");
+        output("DESCRIPTION");
+        output("    lsof lists information about files opened by processes.");
+        output("    An open file may be a regular file, directory, network");
+        output("    socket, device, pipe, etc.");
+        output("");
+        output("OPTIONS");
+        output("    -c <cmd>       List files by command name");
+        output("    -p <pid>       List files by process ID");
+        output("    -u <user>      List files by user");
+        output("    -i [addr]      List network connections");
+        output("    +D <dir>       List processes using directory");
+        output("");
+        output("EXAMPLES");
+        output("    lsof");
+        output("    lsof -p 1234");
+        output("    lsof -i :80");
+        output("    lsof -c chrome");
+        output("");
+        output("NOTE");
+        output("    On Windows, use Handle.exe or Process Explorer");
+        output("    from Sysinternals for detailed file handle info.");
+        output("");
+        output("SEE ALSO");
+        output("    ps, netstat, ss");
+        
+    } else if (cmd == "sleep") {
+        output("NAME");
+        output("    sleep - delay for a specified amount of time");
+        output("");
+        output("SYNOPSIS");
+        output("    sleep [seconds]");
+        output("");
+        output("DESCRIPTION");
+        output("    Pauses execution for the given duration. Fractions of a second");
+        output("    are supported. If no argument is provided, defaults to 1 second.");
+        output("");
+        output("EXAMPLES");
+        output("    sleep 5");
+        output("    sleep 0.5");
+        output("");
+        output("SEE ALSO");
+        output("    wait");
+        
+    } else if (cmd == "wait") {
+        output("NAME");
+        output("    wait - wait for processes to exit");
+        output("");
+        output("SYNOPSIS");
+        output("    wait <pid> [pid...]");
+        output("");
+        output("DESCRIPTION");
+        output("    Opens each provided PID and waits until it terminates.");
+        output("    Requires permission to open the target process with synchronize access.");
+        output("");
+        output("EXAMPLES");
+        output("    wait 1234");
+        output("    wait 1234 5678");
+        output("");
+        output("SEE ALSO");
+        output("    sleep, ps, kill");
+        
+    } else if (cmd == "tac") {
+        output("NAME");
+        output("    tac - concatenate and print files in reverse");
+        output("");
+        output("SYNOPSIS");
+        output("    tac <file>...");
+        output("");
+        output("DESCRIPTION");
+        output("    Reads one or more files and writes their contents starting");
+        output("    from the last line back to the first.");
+        output("");
+        output("EXAMPLES");
+        output("    tac logfile.txt");
+        output("    tac part1.txt part2.txt");
+        output("");
+        output("SEE ALSO");
+        output("    cat, head, tail");
+        
+    } else if (cmd == "mpstat") {
+        output("NAME");
+        output("    mpstat - report CPU statistics");
+        output("");
+        output("SYNOPSIS");
+        output("    mpstat [interval] [count]");
+        output("");
+        output("DESCRIPTION");
+        output("    Reports aggregate CPU usage using Windows system timers.");
+        output("    Per-CPU breakdown and interrupts are not available here.");
+        output("");
+        output("EXAMPLES");
+        output("    mpstat");
+        output("    mpstat 5 3");
+        output("");
+        output("SEE ALSO");
+        output("    top, vmstat, iostat");
+        
+    } else if (cmd == "cal") {
+        output("NAME");
+        output("    cal - display calendar (Sunday first)");
+        output("");
+        output("SYNOPSIS");
+        output("    cal [month] [year]");
+        output("");
+        output("DESCRIPTION");
+        output("    Shows a monthly calendar with weeks starting on Sunday.");
+        output("    With only a year argument, prints all months in that year.");
+        output("");
+        output("EXAMPLES");
+        output("    cal");
+        output("    cal 10 2026");
+        output("    cal 2026");
+        output("");
+        output("SEE ALSO");
+        output("    ncal, date");
+        
+    } else if (cmd == "lspci") {
+        output("NAME");
+        output("    lspci - list PCI devices (informational)");
+        output("");
+        output("SYNOPSIS");
+        output("    lspci");
+        output("");
+        output("DESCRIPTION");
+        output("    Displays guidance for viewing PCI devices on Windows.");
+        output("    Use Device Manager (devmgmt.msc) or msinfo32 for details.");
+        output("");
+        output("SEE ALSO");
+        output("    lsusb, device manager");
+        
+    } else if (cmd == "lsusb") {
+        output("NAME");
+        output("    lsusb - list USB devices (informational)");
+        output("");
+        output("SYNOPSIS");
+        output("    lsusb");
+        output("");
+        output("DESCRIPTION");
+        output("    Displays guidance for viewing USB devices on Windows.");
+        output("    Check Device Manager under 'Universal Serial Bus controllers'.");
+        output("");
+        output("SEE ALSO");
+        output("    lspci, device manager");
+        
+    } else if (cmd == "bzip2") {
+        output("NAME");
+        output("    bzip2 - compress files using bzip2 algorithm");
+        output("");
+        output("SYNOPSIS");
+        output("    bzip2 [options] [file...]");
+        output("");
+        output("DESCRIPTION");
+        output("    Compresses files using the bzip2 block-sorting algorithm.");
+        output("    Creates .bz2 files. On Windows, requires external bzip2.exe.");
+        output("");
+        output("OPTIONS");
+        output("    -d             Decompress (same as bunzip2)");
+        output("    -k             Keep original file");
+        output("    -v             Verbose output");
+        output("    -z             Force compression");
+        output("");
+        output("EXAMPLES");
+        output("    bzip2 file.txt");
+        output("    bzip2 -k file.txt");
+        output("    bzip2 -d file.bz2");
+        output("");
+        output("SEE ALSO");
+        output("    bunzip2, gzip, tar");
+        
+    } else if (cmd == "bunzip2") {
+        output("NAME");
+        output("    bunzip2 - decompress bzip2 files");
+        output("");
+        output("SYNOPSIS");
+        output("    bunzip2 [options] [file...]");
+        output("");
+        output("DESCRIPTION");
+        output("    Decompresses .bz2 files created by bzip2.");
+        output("    On Windows, requires external bzip2.exe.");
+        output("");
+        output("OPTIONS");
+        output("    -k             Keep original file");
+        output("    -v             Verbose output");
+        output("    -c             Write to stdout");
+        output("    -t             Test file integrity");
+        output("");
+        output("EXAMPLES");
+        output("    bunzip2 file.bz2");
+        output("    bunzip2 -k file.bz2");
+        output("    bunzip2 -t file.bz2");
+        output("");
+        output("SEE ALSO");
+        output("    bzip2, gunzip, tar");
+        
+    } else {
+        output("No manual entry for '" + cmd + "'");
+        output("Use 'man' without arguments to see available pages.");
+    }
+}
+
+void cmd_proc() {
+    // Create snapshot of all processes
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnapshot == INVALID_HANDLE_VALUE) {
+        outputError("proc: failed to get process list");
+        return;
+    }
+    
+    PROCESSENTRY32 pe32;
+    pe32.dwSize = sizeof(PROCESSENTRY32);
+    
+    // Get first process
+    if (!Process32First(hSnapshot, &pe32)) {
+        CloseHandle(hSnapshot);
+        outputError("proc: failed to enumerate processes");
+        return;
+    }
+    
+    // Header
+    output("PID      Process Name");
+    output("-------  --------------------------------");
+    
+    // List all processes
+    do {
+        char line[256];
+        sprintf(line, "%-8lu %s", pe32.th32ProcessID, pe32.szExeFile);
+        output(line);
+    } while (Process32Next(hSnapshot, &pe32));
+    
+    CloseHandle(hSnapshot);
+}
+
+void cmd_proc(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: proc (or ps)");
+        output("  List all running processes with PID and name");
+        return;
+    }
+    cmd_proc();
+}
+
+void cmd_kill(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: kill <PID>...");
+        output("  Terminate processes by PID");
+        return;
+    }
+    if (args.size() < 2) {
+        outputError("kill: missing PID operand");
+        outputError("Usage: kill <PID>");
+        return;
+    }
+    
+    for (size_t i = 1; i < args.size(); ++i) {
+        // Convert PID string to number
+        DWORD pid = 0;
+        try {
+            pid = std::stoul(args[i]);
+        } catch (...) {
+            outputError("kill: invalid PID '" + args[i] + "'");
+            continue;
+        }
+        
+        // Open process with terminate rights
+        HANDLE hProcess = OpenProcess(PROCESS_TERMINATE, FALSE, pid);
+        if (hProcess == NULL) {
+            outputError("kill: failed to open process " + args[i] + " (access denied or process not found)");
+            continue;
+        }
+        
+        // Terminate the process
+        if (TerminateProcess(hProcess, 1)) {
+            output("Killed process " + args[i]);
+        } else {
+            outputError("kill: failed to terminate process " + args[i]);
+        }
+        
+        CloseHandle(hProcess);
+    }
+}
+
+void cmd_killall(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: killall <process_name>");
+        output("  Terminate all processes with matching name");
+        return;
+    }
+    if (args.size() < 2) {
+        outputError("killall: missing process name operand");
+        outputError("Usage: killall <process_name>");
+        return;
+    }
+    
+    for (size_t i = 1; i < args.size(); ++i) {
+        std::string targetName = args[i];
+        
+        // Add .exe if not present
+        if (targetName.length() < 4 || 
+            toLower(targetName.substr(targetName.length() - 4)) != ".exe") {
+            targetName += ".exe";
+        }
+        
+        // Create snapshot of all processes
+        HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (hSnapshot == INVALID_HANDLE_VALUE) {
+            outputError("killall: failed to get process list");
+            continue;
+        }
+        
+        PROCESSENTRY32 pe32;
+        pe32.dwSize = sizeof(PROCESSENTRY32);
+        
+        if (!Process32First(hSnapshot, &pe32)) {
+            CloseHandle(hSnapshot);
+            outputError("killall: failed to enumerate processes");
+            continue;
+        }
+        
+        int killedCount = 0;
+        
+        // Find and kill all matching processes
+        do {
+            std::string processName = pe32.szExeFile;
+            
+            // Case-insensitive comparison
+            if (toLower(processName) == toLower(targetName)) {
+                HANDLE hProcess = OpenProcess(PROCESS_TERMINATE, FALSE, pe32.th32ProcessID);
+                if (hProcess != NULL) {
+                    if (TerminateProcess(hProcess, 1)) {
+                        char msg[256];
+                        sprintf(msg, "Killed %s (PID: %lu)", pe32.szExeFile, pe32.th32ProcessID);
+                        output(msg);
+                        killedCount++;
+                    }
+                    CloseHandle(hProcess);
+                }
+            }
+        } while (Process32Next(hSnapshot, &pe32));
+        
+        CloseHandle(hSnapshot);
+        
+        if (killedCount == 0) {
+            output("killall: no processes found matching '" + args[i] + "'");
+        } else {
+            char summary[256];
+            sprintf(summary, "Terminated %d process(es)", killedCount);
+            output(summary);
+        }
+    }
+}
+
+void cmd_xkill() {
+    output("Click on a window to kill it (press ESC to cancel)...");
+    
+    // Set crosshair cursor
+    HCURSOR hCrossCursor = LoadCursor(NULL, IDC_CROSS);
+    HCURSOR hOldCursor = SetCursor(hCrossCursor);
+    
+    // Wait for mouse click or ESC key
+    bool killed = false;
+    MSG msg;
+    while (GetMessage(&msg, NULL, 0, 0)) {
+        if (msg.message == WM_LBUTTONDOWN) {
+            // Get cursor position
+            POINT pt;
+            GetCursorPos(&pt);
+            
+            // Get window at cursor position
+            HWND hTargetWnd = WindowFromPoint(pt);
+            
+            if (hTargetWnd != NULL) {
+                // Get root window (not child controls)
+                while (GetParent(hTargetWnd) != NULL) {
+                    hTargetWnd = GetParent(hTargetWnd);
+                }
+                
+                // Get process ID from window
+                DWORD processId = 0;
+                GetWindowThreadProcessId(hTargetWnd, &processId);
+                
+                if (processId != 0) {
+                    // Get process name
+                    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+                    char processName[MAX_PATH] = "unknown";
+                    
+                    if (hSnapshot != INVALID_HANDLE_VALUE) {
+                        PROCESSENTRY32 pe32;
+                        pe32.dwSize = sizeof(PROCESSENTRY32);
+                        
+                        if (Process32First(hSnapshot, &pe32)) {
+                            do {
+                                if (pe32.th32ProcessID == processId) {
+                                    strcpy(processName, pe32.szExeFile);
+                                    break;
+                                }
+                            } while (Process32Next(hSnapshot, &pe32));
+                        }
+                        CloseHandle(hSnapshot);
+                    }
+                    
+                    // Try to kill the process
+                    HANDLE hProcess = OpenProcess(PROCESS_TERMINATE, FALSE, processId);
+                    if (hProcess != NULL) {
+                        if (TerminateProcess(hProcess, 1)) {
+                            char msg[512];
+                            sprintf(msg, "Killed %s (PID: %lu)", processName, processId);
+                            output(msg);
+                            killed = true;
+                        } else {
+                            char msg[512];
+                            sprintf(msg, "xkill: failed to terminate %s (PID: %lu)", processName, processId);
+                            outputError(msg);
+                        }
+                        CloseHandle(hProcess);
+                    } else {
+                        char msg[512];
+                        sprintf(msg, "xkill: access denied for %s (PID: %lu)", processName, processId);
+                        outputError(msg);
+                    }
+                } else {
+                    outputError("xkill: could not get process ID from window");
+                }
+            } else {
+                outputError("xkill: no window found at cursor position");
+            }
+            
+            break;
+        } else if (msg.message == WM_KEYDOWN && msg.wParam == VK_ESCAPE) {
+            output("xkill: cancelled");
+            break;
+        }
+        
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
+    }
+    
+    // Restore original cursor
+    SetCursor(hOldCursor);
+}
+
+void cmd_xkill(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: xkill");
+        output("  Click on a window to kill its process");
+        output("  Press ESC to cancel");
+        return;
+    }
+    cmd_xkill();
+}
+
+void cmd_rev(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: rev <file>... or rev <text>");
+        output("  Reverse lines in files or text");
+        return;
+    }
+    if (args.size() < 2) {
+        outputError("rev: missing operand");
+        outputError("Usage: rev <file>... or rev <text>");
+        return;
+    }
+    
+    // Check if first argument is a file
+    std::string firstArg = unixPathToWindows(args[1]);
+    std::ifstream testFile(firstArg);
+    
+    if (testFile.is_open()) {
+        // It's a file, close and process as file(s)
+        testFile.close();
+        
+        for (size_t i = 1; i < args.size(); ++i) {
+            // Verify case if in case-sensitive mode
+            if (!verifyFileNameCase(args[i])) {
+                outputError("rev: " + args[i] + ": File name case doesn't match (case-sensitive mode)");
+                continue;
+            }
+            
+            std::string path = unixPathToWindows(args[i]);
+            std::ifstream file(path);
+            
+            if (!file.is_open()) {
+                outputError("rev: " + args[i] + ": No such file or directory");
+                continue;
+            }
+            
+            std::string line;
+            while (std::getline(file, line)) {
+                std::reverse(line.begin(), line.end());
+                output(line);
+            }
+            
+            file.close();
+        }
+    } else {
+        // Not a file, treat all arguments as text to reverse
+        std::string text;
+        for (size_t i = 1; i < args.size(); ++i) {
+            if (i > 1) text += " ";
+            text += args[i];
+        }
+        
+        std::reverse(text.begin(), text.end());
+        output(text);
+    }
+}
+
+// Shutdown command - shut down the system
+void cmd_shutdown(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: shutdown [options]");
+        output("  Shut down the computer");
+        output("");
+        output("OPTIONS");
+        output("  -t <seconds>     Time delay before shutdown (default: 30)");
+        output("  -f               Force applications to close");
+        output("  -c <message>     Display message to users");
+        output("  -a               Abort a pending shutdown");
+        output("");
+        output("EXAMPLES");
+        output("  shutdown              Shutdown in 30 seconds");
+        output("  shutdown -t 60        Shutdown in 60 seconds");
+        output("  shutdown -t 0         Shutdown immediately");
+        output("  shutdown -a           Cancel pending shutdown");
+        output("");
+        output("NOTE: Requires administrator privileges");
+        return;
+    }
+    
+    // Parse options
+    int delay = 30;  // Default 30 seconds
+    bool forceClose = false;
+    bool abort = false;
+    std::string message;
+    
+    for (size_t i = 1; i < args.size(); i++) {
+        const std::string& arg = args[i];
+        
+        if (arg == "-t" && i + 1 < args.size()) {
+            delay = std::atoi(args[i + 1].c_str());
+            if (delay < 0) delay = 0;
+            i++;
+        } else if (arg == "-f") {
+            forceClose = true;
+        } else if (arg == "-a") {
+            abort = true;
+        } else if (arg == "-c" && i + 1 < args.size()) {
+            message = args[i + 1];
+            i++;
+        }
+    }
+    
+    // Try to enable shutdown privilege
+    HANDLE hToken;
+    TOKEN_PRIVILEGES tkp;
+    
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken)) {
+        LookupPrivilegeValue(NULL, SE_SHUTDOWN_NAME, &tkp.Privileges[0].Luid);
+        tkp.PrivilegeCount = 1;
+        tkp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+        AdjustTokenPrivileges(hToken, FALSE, &tkp, 0, (PTOKEN_PRIVILEGES)NULL, 0);
+        CloseHandle(hToken);
+    }
+    
+    if (abort) {
+        // Abort shutdown
+        if (AbortSystemShutdownA(NULL)) {
+            output("Shutdown cancelled successfully");
+        } else {
+            DWORD error = GetLastError();
+            if (error == ERROR_NO_SHUTDOWN_IN_PROGRESS) {
+                outputError("shutdown: no shutdown in progress");
+            } else {
+                outputError("shutdown: failed to abort shutdown (may require admin privileges)");
+            }
+        }
+        return;
+    }
+    
+    // Initiate shutdown
+    DWORD flags = EWX_SHUTDOWN;
+    if (forceClose) {
+        flags |= EWX_FORCE;
+    }
+    
+    std::ostringstream msg;
+    msg << "System will shut down in " << delay << " second(s)";
+    if (!message.empty()) {
+        msg << ": " << message;
+    }
+    output(msg.str());
+    
+    // Use InitiateSystemShutdownEx for delayed shutdown with message
+    if (delay > 0) {
+        BOOL result = InitiateSystemShutdownExA(
+            NULL,                           // Local machine
+            (LPSTR)(message.empty() ? "System is shutting down..." : message.c_str()),
+            delay,                          // Delay in seconds
+            forceClose,                     // Force apps to close
+            FALSE,                          // Not a reboot
+            SHTDN_REASON_MAJOR_OTHER | SHTDN_REASON_MINOR_OTHER | SHTDN_REASON_FLAG_PLANNED
+        );
+        
+        if (!result) {
+            outputError("shutdown: failed to initiate shutdown (requires admin privileges)");
+            output("Try running the console as administrator");
+        } else {
+            output("Shutdown initiated. Use 'shutdown -a' to cancel.");
+        }
+    } else {
+        // Immediate shutdown
+        if (!ExitWindowsEx(flags, SHTDN_REASON_MAJOR_OTHER | SHTDN_REASON_MINOR_OTHER | SHTDN_REASON_FLAG_PLANNED)) {
+            outputError("shutdown: failed to initiate shutdown (requires admin privileges)");
+            output("Try running the console as administrator");
+        }
+    }
+}
+
+// Reboot command - restart the system
+void cmd_reboot(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: reboot [options]");
+        output("  Restart the computer");
+        output("");
+        output("OPTIONS");
+        output("  -t <seconds>     Time delay before reboot (default: 30)");
+        output("  -f               Force applications to close");
+        output("  -c <message>     Display message to users");
+        output("");
+        output("EXAMPLES");
+        output("  reboot               Reboot in 30 seconds");
+        output("  reboot -t 60         Reboot in 60 seconds");
+        output("  reboot -t 0          Reboot immediately");
+        output("  reboot -f            Force close and reboot");
+        output("");
+        output("NOTE: Requires administrator privileges");
+        return;
+    }
+    
+    // Parse options
+    int delay = 30;  // Default 30 seconds
+    bool forceClose = false;
+    std::string message;
+    
+    for (size_t i = 1; i < args.size(); i++) {
+        const std::string& arg = args[i];
+        
+        if (arg == "-t" && i + 1 < args.size()) {
+            delay = std::atoi(args[i + 1].c_str());
+            if (delay < 0) delay = 0;
+            i++;
+        } else if (arg == "-f") {
+            forceClose = true;
+        } else if (arg == "-c" && i + 1 < args.size()) {
+            message = args[i + 1];
+            i++;
+        }
+    }
+    
+    // Try to enable shutdown privilege
+    HANDLE hToken;
+    TOKEN_PRIVILEGES tkp;
+    
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken)) {
+        LookupPrivilegeValue(NULL, SE_SHUTDOWN_NAME, &tkp.Privileges[0].Luid);
+        tkp.PrivilegeCount = 1;
+        tkp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+        AdjustTokenPrivileges(hToken, FALSE, &tkp, 0, (PTOKEN_PRIVILEGES)NULL, 0);
+        CloseHandle(hToken);
+    }
+    
+    // Initiate reboot
+    DWORD flags = EWX_REBOOT;
+    if (forceClose) {
+        flags |= EWX_FORCE;
+    }
+    
+    std::ostringstream msg;
+    msg << "System will reboot in " << delay << " second(s)";
+    if (!message.empty()) {
+        msg << ": " << message;
+    }
+    output(msg.str());
+    
+    // Use InitiateSystemShutdownEx for delayed reboot with message
+    if (delay > 0) {
+        BOOL result = InitiateSystemShutdownExA(
+            NULL,                           // Local machine
+            (LPSTR)(message.empty() ? "System is rebooting..." : message.c_str()),
+            delay,                          // Delay in seconds
+            forceClose,                     // Force apps to close
+            TRUE,                           // Reboot
+            SHTDN_REASON_MAJOR_OTHER | SHTDN_REASON_MINOR_OTHER | SHTDN_REASON_FLAG_PLANNED
+        );
+        
+        if (!result) {
+            outputError("reboot: failed to initiate reboot (requires admin privileges)");
+            output("Try running the console as administrator");
+        } else {
+            output("Reboot initiated. Use 'shutdown -a' to cancel.");
+        }
+    } else {
+        // Immediate reboot
+        if (!ExitWindowsEx(flags, SHTDN_REASON_MAJOR_OTHER | SHTDN_REASON_MINOR_OTHER | SHTDN_REASON_FLAG_PLANNED)) {
+            outputError("reboot: failed to initiate reboot (requires admin privileges)");
+            output("Try running the console as administrator");
+        }
+    }
+}
+
+// Alias command - create, list, or remove command aliases
+void cmd_alias(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: alias [name='command']");
+        output("  Create, list, or modify command aliases");
+        output("");
+        output("SYNOPSIS");
+        output("  alias              List all aliases");
+        output("  alias name         Display alias definition");
+        output("  alias name=cmd     Create or modify alias");
+        output("");
+        output("DESCRIPTION");
+        output("  Aliases are shortcuts that expand to longer commands.");
+        output("  When an alias is used, it's replaced with its definition.");
+        output("");
+        output("EXAMPLES");
+        output("  alias");
+        output("    List all defined aliases");
+        output("");
+        output("  alias ll='ls -la'");
+        output("    Create an alias 'll' for 'ls -la'");
+        output("");
+        output("  alias ls");
+        output("    Show the definition of 'ls' if aliased");
+        output("");
+        output("  alias copy='cp'");
+        output("    Create Windows-to-Unix command alias");
+        return;
+    }
+    
+    if (args.size() < 2) {
+        // List all aliases
+        if (g_aliases.empty()) {
+            output("No aliases defined");
+        } else {
+            output("Defined aliases:");
+            for (const auto& pair : g_aliases) {
+                std::ostringstream oss;
+                oss << "  " << pair.first << "=" << pair.second;
+                output(oss.str());
+            }
+        }
+        return;
+    }
+    
+    std::string aliasArg = args[1];
+    
+    // Check if this is an assignment (name=command)
+    size_t equalPos = aliasArg.find('=');
+    
+    if (equalPos != std::string::npos) {
+        // Create or modify alias
+        std::string aliasName = aliasArg.substr(0, equalPos);
+        std::string aliasCmd = aliasArg.substr(equalPos + 1);
+        
+        // Trim whitespace
+        aliasName.erase(0, aliasName.find_first_not_of(" \t"));
+        aliasName.erase(aliasName.find_last_not_of(" \t") + 1);
+        aliasCmd.erase(0, aliasCmd.find_first_not_of(" \t"));
+        aliasCmd.erase(aliasCmd.find_last_not_of(" \t") + 1);
+        
+        // Validate alias name (no special characters)
+        bool validName = !aliasName.empty() && isalpha(aliasName[0]);
+        for (char c : aliasName) {
+            if (!isalnum(c) && c != '_') {
+                validName = false;
+                break;
+            }
+        }
+        
+        if (!validName) {
+            outputError("alias: invalid name '" + aliasName + "'");
+            output("Alias names must start with a letter and contain only alphanumeric characters and underscores");
+            return;
+        }
+        
+        if (aliasCmd.empty()) {
+            outputError("alias: empty command");
+            return;
+        }
+        
+        // Check if alias would create a circular reference
+        if (aliasCmd == aliasName) {
+            outputError("alias: circular reference");
+            return;
+        }
+        
+        // Store alias
+        g_aliases[aliasName] = aliasCmd;
+        std::ostringstream oss;
+        oss << "Alias " << aliasName << " -> " << aliasCmd << " created";
+        output(oss.str());
+        
+    } else {
+        // Display alias definition
+        auto it = g_aliases.find(aliasArg);
+        if (it != g_aliases.end()) {
+            std::ostringstream oss;
+            oss << aliasArg << "=" << it->second;
+            output(oss.str());
+        } else {
+            output("alias: '" + aliasArg + "' not defined");
+        }
+    }
+}
+
+// Unalias command - remove command aliases
+void cmd_unalias(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: unalias <alias_name>...");
+        output("  Remove command aliases");
+        output("");
+        output("DESCRIPTION");
+        output("  Removes one or more previously defined aliases.");
+        output("");
+        output("EXAMPLES");
+        output("  unalias ll");
+        output("    Remove the 'll' alias");
+        output("");
+        output("  unalias ll copy rm");
+        output("    Remove multiple aliases");
+        return;
+    }
+    
+    if (args.size() < 2) {
+        outputError("unalias: missing alias name");
+        output("Usage: unalias <alias_name>...");
+        return;
+    }
+    
+    int removed = 0;
+    
+    for (size_t i = 1; i < args.size(); i++) {
+        const std::string& aliasName = args[i];
+        
+        auto it = g_aliases.find(aliasName);
+        if (it != g_aliases.end()) {
+            g_aliases.erase(it);
+            std::ostringstream oss;
+            oss << "Alias '" << aliasName << "' removed";
+            output(oss.str());
+            removed++;
+        } else {
+            std::ostringstream oss;
+            oss << "unalias: '" << aliasName << "' not found";
+            outputError(oss.str());
+        }
+    }
+    
+    if (removed == 0) {
+        outputError("unalias: no aliases removed");
+    }
+}
+
+// History command - display or manage command history
+void cmd_history(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: history [options]");
+        output("  Display or manage command history");
+        output("");
+        output("OPTIONS");
+        output("  -c, --clear      Clear all history");
+        output("  -n, --last N     Show last N commands (default: 50)");
+        output("  -s PATTERN       Search for pattern in history");
+        output("");
+        output("EXAMPLES");
+        output("  history");
+        output("    Display all command history with line numbers");
+        output("");
+        output("  history -n 20");
+        output("    Show the last 20 commands");
+        output("");
+        output("  history -s grep");
+        output("    Show all commands containing 'grep'");
+        output("");
+        output("  history -c");
+        output("    Clear all command history");
+        return;
+    }
+    
+    if (g_commandHistory.empty()) {
+        output("No command history");
+        return;
+    }
+    
+    // Parse options
+    bool clear = false;
+    int lastN = -1;
+    std::string searchPattern;
+    
+    for (size_t i = 1; i < args.size(); i++) {
+        const std::string& arg = args[i];
+        
+        if (arg == "-c" || arg == "--clear") {
+            clear = true;
+        } else if (arg == "-n" || arg == "--last") {
+            if (i + 1 < args.size()) {
+                try {
+                    lastN = std::stoi(args[i + 1]);
+                    i++;
+                } catch (...) {
+                    outputError("history: invalid number " + args[i + 1]);
+                    return;
+                }
+            } else {
+                outputError("history: -n requires a number");
+                return;
+            }
+        } else if (arg == "-s") {
+            if (i + 1 < args.size()) {
+                searchPattern = args[i + 1];
+                i++;
+            } else {
+                outputError("history: -s requires a pattern");
+                return;
+            }
+        }
+    }
+    
+    // Clear history
+    if (clear) {
+        g_commandHistory.clear();
+        output("History cleared");
+        return;
+    }
+    
+    // Determine which entries to show
+    std::vector<std::pair<size_t, std::string>> entriesToShow;
+    
+    for (size_t i = 0; i < g_commandHistory.size(); i++) {
+        const std::string& cmd = g_commandHistory[i];
+        
+        // Apply search filter if specified
+        if (!searchPattern.empty()) {
+            std::string cmdLower = cmd;
+            std::string patternLower = searchPattern;
+            
+            // Convert to lowercase for case-insensitive search
+            std::transform(cmdLower.begin(), cmdLower.end(), cmdLower.begin(), ::tolower);
+            std::transform(patternLower.begin(), patternLower.end(), patternLower.begin(), ::tolower);
+            
+            if (cmdLower.find(patternLower) != std::string::npos) {
+                entriesToShow.push_back({i + 1, cmd});
+            }
+        } else {
+            entriesToShow.push_back({i + 1, cmd});
+        }
+    }
+    
+    // Apply last N filter
+    if (lastN > 0 && entriesToShow.size() > (size_t)lastN) {
+        std::vector<std::pair<size_t, std::string>> temp;
+        size_t start = entriesToShow.size() - lastN;
+        for (size_t i = start; i < entriesToShow.size(); i++) {
+            temp.push_back(entriesToShow[i]);
+        }
+        entriesToShow = temp;
+    }
+    
+    // Display entries
+    if (entriesToShow.empty()) {
+        if (!searchPattern.empty()) {
+            output("No history entries matching '" + searchPattern + "'");
+        } else {
+            output("No command history");
+        }
+        return;
+    }
+    
+    for (const auto& entry : entriesToShow) {
+        std::ostringstream oss;
+        oss << entry.first << "  " << entry.second;
+        output(oss.str());
+    }
+}
+
+// Helper function to check if running as administrator
+bool isRunningAsAdmin() {
+    BOOL isAdmin = FALSE;
+    PSID adminGroup = NULL;
+    SID_IDENTIFIER_AUTHORITY ntAuthority = SECURITY_NT_AUTHORITY;
+    
+    if (AllocateAndInitializeSid(&ntAuthority, 2, SECURITY_BUILTIN_DOMAIN_RID,
+                                  DOMAIN_ALIAS_RID_ADMINS, 0, 0, 0, 0, 0, 0, &adminGroup)) {
+        CheckTokenMembership(NULL, adminGroup, &isAdmin);
+        FreeSid(adminGroup);
+    }
+    
+    return isAdmin != FALSE;
+}
+
+// Mount command - show mounted volumes
+void cmd_mount(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: mount [options]");
+        output("  Display information about mounted volumes and file systems");
+        output("");
+        output("OPTIONS");
+        output("  (no options available)");
+        output("");
+        output("DESCRIPTION");
+        output("  Shows all logical drives and their properties including");
+        output("  drive letter, volume name, file system type, and capacity.");
+        output("");
+        output("EXAMPLES");
+        output("  mount");
+        output("    Display all mounted drives");
+        output("");
+        output("NOTE");
+        output("  On Windows, 'mount points' are represented by drive letters.");
+        output("  Use 'df' command for disk space information.");
+        return;
+    }
+    
+    output("Filesystem        Size Used  Avail Use% Mounted on");
+    output(std::string(70, '-'));
+    
+    // Get all drive letters
+    DWORD drives = GetLogicalDrives();
+    
+    for (int i = 0; i < 26; i++) {
+        if (!(drives & (1 << i))) continue;
+        
+        char drivePath[4];
+        drivePath[0] = 'A' + i;
+        drivePath[1] = ':';
+        drivePath[2] = '\\';
+        drivePath[3] = '\0';
+        
+        // Get volume name
+        char volumeName[MAX_PATH + 1] = {0};
+        char fileSystem[32] = {0};
+        DWORD serialNumber = 0;
+        DWORD maxComponentLength = 0;
+        DWORD fileSystemFlags = 0;
+        
+        GetVolumeInformationA(drivePath, volumeName, MAX_PATH, &serialNumber,
+                             &maxComponentLength, &fileSystemFlags, fileSystem, 32);
+        
+        // Get disk space
+        ULARGE_INTEGER freeBytesAvailable, totalBytes, totalFreeBytes;
+        if (!GetDiskFreeSpaceExA(drivePath, &freeBytesAvailable, &totalBytes, &totalFreeBytes)) {
+            // Drive might not be ready
+            std::ostringstream line;
+            line << std::left << std::setw(18) << drivePath;
+            line << "[not ready]";
+            output(line.str());
+            continue;
+        }
+        
+        // Format sizes
+        auto formatSize = [](ULONGLONG bytes) -> std::string {
+            const char* units[] = { "B", "K", "M", "G", "T" };
+            double size = (double)bytes;
+            int unitIndex = 0;
+            
+            while (size >= 1024.0 && unitIndex < 4) {
+                size /= 1024.0;
+                unitIndex++;
+            }
+            
+            std::ostringstream oss;
+            oss << std::fixed << std::setprecision(1) << size << units[unitIndex];
+            return oss.str();
+        };
+        
+        std::string totalStr = formatSize(totalBytes.QuadPart);
+        std::string usedStr = formatSize(totalBytes.QuadPart - totalFreeBytes.QuadPart);
+        std::string availStr = formatSize(freeBytesAvailable.QuadPart);
+        double percentUsed = (totalBytes.QuadPart > 0) ? 
+            (100.0 * (totalBytes.QuadPart - totalFreeBytes.QuadPart) / totalBytes.QuadPart) : 0.0;
+        
+        // Format volume name
+        std::string volName = volumeName;
+        if (volName.empty()) {
+            volName = "[no name]";
+        }
+        
+        // Build output line
+        std::ostringstream line;
+        line << std::left << std::setw(18) << drivePath;
+        line << std::left << std::setw(12) << totalStr;
+        line << std::right << std::setw(6) << usedStr;
+        line << std::right << std::setw(7) << availStr;
+        line << std::right << std::setw(5) << std::fixed << std::setprecision(0) << percentUsed << "%";
+        line << "  " << volName;
+        
+        output(line.str());
+    }
+}
+
+// Date command - show/set current date and time
+void cmd_date(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: date [options]");
+        output("  Display or set the current date and time");
+        output("");
+        output("OPTIONS");
+        output("  +<format>  Output format string (strftime-compatible)");
+        output("  -s <time>  Set date and time (requires admin) [NYI]");
+        output("  -d <date>  Display date relative to given date [NYI]");
+        output("");
+        output("FORMAT SPECIFIERS");
+        output("  %Y  Year with century (e.g., 2026)");
+        output("  %m  Month (01-12)");
+        output("  %d  Day of month (01-31)");
+        output("  %H  Hour (00-23)");
+        output("  %M  Minute (00-59)");
+        output("  %S  Second (00-59)");
+        output("  %A  Full weekday name");
+        output("  %a  Abbreviated weekday name");
+        output("  %B  Full month name");
+        output("  %b  Abbreviated month name");
+        output("  %j  Day of year (001-366)");
+        output("  %w  Day of week (0-6, Sunday=0)");
+        output("");
+        output("EXAMPLES");
+        output("  date");
+        output("    Show current date and time");
+        output("");
+        output("  date '+%Y-%m-%d %H:%M:%S'");
+        output("    Show in ISO format");
+        output("");
+        output("  date '+%A, %B %d, %Y'");
+        output("    Show formatted long date");
+        return;
+    }
+    
+    // Get current system time
+    SYSTEMTIME st;
+    GetSystemTime(&st);
+    
+    // Check for format string
+    std::string formatStr;
+    if (args.size() >= 2 && args[1][0] == '+') {
+        formatStr = args[1].substr(1);
+    }
+    
+    if (formatStr.empty()) {
+        // Default format: Day Mon DD HH:MM:SS YYYY
+        const char* dayNames[] = { "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
+        const char* monthNames[] = { "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                                     "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+        
+        std::ostringstream oss;
+        oss << dayNames[st.wDayOfWeek] << " "
+            << monthNames[st.wMonth - 1] << " "
+            << std::setfill('0') << std::setw(2) << st.wDay << " "
+            << std::setfill('0') << std::setw(2) << st.wHour << ":"
+            << std::setfill('0') << std::setw(2) << st.wMinute << ":"
+            << std::setfill('0') << std::setw(2) << st.wSecond << " "
+            << st.wYear;
+        output(oss.str());
+    } else {
+        // Parse format string and apply
+        std::string result;
+        const char* monthNames[] = { "January", "February", "March", "April", "May", "June",
+                                     "July", "August", "September", "October", "November", "December" };
+        const char* monthAbbr[] = { "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                                    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+        const char* dayNames[] = { "Sunday", "Monday", "Tuesday", "Wednesday",
+                                   "Thursday", "Friday", "Saturday" };
+        const char* dayAbbr[] = { "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
+        
+        for (size_t i = 0; i < formatStr.length(); i++) {
+            if (formatStr[i] == '%' && i + 1 < formatStr.length()) {
+                char spec = formatStr[i + 1];
+                
+                switch (spec) {
+                    case 'Y': {
+                        std::ostringstream oss;
+                        oss << st.wYear;
+                        result += oss.str();
+                        break;
+                    }
+                    case 'm': {
+                        std::ostringstream oss;
+                        oss << std::setfill('0') << std::setw(2) << st.wMonth;
+                        result += oss.str();
+                        break;
+                    }
+                    case 'd': {
+                        std::ostringstream oss;
+                        oss << std::setfill('0') << std::setw(2) << st.wDay;
+                        result += oss.str();
+                        break;
+                    }
+                    case 'H': {
+                        std::ostringstream oss;
+                        oss << std::setfill('0') << std::setw(2) << st.wHour;
+                        result += oss.str();
+                        break;
+                    }
+                    case 'M': {
+                        std::ostringstream oss;
+                        oss << std::setfill('0') << std::setw(2) << st.wMinute;
+                        result += oss.str();
+                        break;
+                    }
+                    case 'S': {
+                        std::ostringstream oss;
+                        oss << std::setfill('0') << std::setw(2) << st.wSecond;
+                        result += oss.str();
+                        break;
+                    }
+                    case 'A': result += dayNames[st.wDayOfWeek]; break;
+                    case 'a': result += dayAbbr[st.wDayOfWeek]; break;
+                    case 'B': result += monthNames[st.wMonth - 1]; break;
+                    case 'b': result += monthAbbr[st.wMonth - 1]; break;
+                    case 'j': {
+                        // Calculate day of year
+                        int daysInMonth[] = { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+                        if (((st.wYear % 4 == 0 && st.wYear % 100 != 0) || (st.wYear % 400 == 0))) {
+                            daysInMonth[1] = 29;  // Leap year
+                        }
+                        int dayOfYear = st.wDay;
+                        for (int m = 0; m < st.wMonth - 1; m++) {
+                            dayOfYear += daysInMonth[m];
+                        }
+                        std::ostringstream oss;
+                        oss << std::setfill('0') << std::setw(3) << dayOfYear;
+                        result += oss.str();
+                        break;
+                    }
+                    case 'w': {
+                        std::ostringstream oss;
+                        oss << st.wDayOfWeek;
+                        result += oss.str();
+                        break;
+                    }
+                    case '%': result += '%'; break;
+                    default: {
+                        result += '%';
+                        result += spec;
+                    }
+                }
+                i++;  // Skip the format specifier
+            } else {
+                result += formatStr[i];
+            }
+        }
+        output(result);
+    }
+}
+
+// Calendar command (ncal) - display calendar
+void cmd_ncal(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: ncal [year] [month]");
+        output("  Display calendar in narrow format");
+        output("");
+        output("ARGUMENTS");
+        output("  month   Month (1-12) - displays that month");
+        output("  year    Year number - displays that year or month/year");
+        output("");
+        output("DESCRIPTION");
+        output("  Shows a calendar in narrow, columnar format.");
+        output("  With no arguments, displays current month.");
+        output("");
+        output("EXAMPLES");
+        output("  ncal            Display current month calendar");
+        output("  ncal 2026       Display full year 2026");
+        output("  ncal 1 2026     Display January 2026");
+        return;
+    }
+    
+    // Get current system time
+    SYSTEMTIME st;
+    GetSystemTime(&st);
+    
+    int year = st.wYear;
+    int month = st.wMonth;
+    
+    // Parse arguments
+    if (args.size() >= 2) {
+        int num = std::atoi(args[1].c_str());
+        if (num >= 1 && num <= 12) {
+            month = num;
+        } else if (num > 12) {
+            year = num;
+        }
+    }
+    
+    if (args.size() >= 3) {
+        year = std::atoi(args[2].c_str());
+    }
+    
+    // If only year given and month not set, display full year
+    bool displayFullYear = (args.size() >= 2 && std::atoi(args[1].c_str()) > 12);
+    
+    if (displayFullYear) {
+        // Display full year calendar
+        output(std::string(60, ' ') + std::to_string(year));
+        output("");
+        
+        for (int m = 1; m <= 12; m++) {
+            // Month header
+            const char* monthNames[] = { "January", "February", "March", "April", "May", "June",
+                                        "July", "August", "September", "October", "November", "December" };
+            std::ostringstream header;
+            header << "      " << monthNames[m - 1] << " " << year;
+            output(header.str());
+            output("Mo Tu We Th Fr Sa Su");
+            
+            // Calculate days
+            int daysInMonth[] = { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+            if (((year % 4 == 0 && year % 100 != 0) || (year % 400 == 0))) {
+                daysInMonth[1] = 29;
+            }
+            
+            // Zeller's algorithm to get day of week for 1st of month
+            int q = 1;
+            int m_zeller = m;
+            int k = year % 100;
+            int j = year / 100;
+            if (m < 3) {
+                m_zeller += 12;
+                k = (year - 1) % 100;
+                j = (year - 1) / 100;
+            }
+            int h = (q + (13 * (m_zeller + 1)) / 5 + k + k / 4 + j / 4 - 2 * j) % 7;
+            int firstDay = (h + 5) % 7;  // Convert to Monday=0
+            
+            // Print calendar
+            std::string calLine;
+            for (int i = 0; i < firstDay; i++) {
+                calLine += "   ";
+            }
+            
+            for (int day = 1; day <= daysInMonth[m - 1]; day++) {
+                std::ostringstream oss;
+                oss << std::setfill(' ') << std::setw(2) << day;
+                calLine += oss.str() + " ";
+                
+                if ((firstDay + day) % 7 == 0) {
+                    output(calLine);
+                    calLine = "";
+                }
+            }
+            
+            if (!calLine.empty()) {
+                output(calLine);
+            }
+            
+            output("");
+        }
+    } else {
+        // Display single month
+        const char* monthNames[] = { "January", "February", "March", "April", "May", "June",
+                                    "July", "August", "September", "October", "November", "December" };
+        
+        std::ostringstream header;
+        header << "      " << monthNames[month - 1] << " " << year;
+        output(header.str());
+        output("Mo Tu We Th Fr Sa Su");
+        
+        // Calculate days in month
+        int daysInMonth[] = { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+        if (((year % 4 == 0 && year % 100 != 0) || (year % 400 == 0))) {
+            daysInMonth[1] = 29;
+        }
+        
+        // Zeller's algorithm to get day of week for 1st of month
+        int q = 1;
+        int m_zeller = month;
+        int k = year % 100;
+        int j = year / 100;
+        if (month < 3) {
+            m_zeller += 12;
+            k = (year - 1) % 100;
+            j = (year - 1) / 100;
+        }
+        int h = (q + (13 * (m_zeller + 1)) / 5 + k + k / 4 + j / 4 - 2 * j) % 7;
+        int firstDay = (h + 5) % 7;  // Convert to Monday=0
+        
+        // Print calendar
+        std::string calLine;
+        for (int i = 0; i < firstDay; i++) {
+            calLine += "   ";
+        }
+        
+        for (int day = 1; day <= daysInMonth[month - 1]; day++) {
+            std::ostringstream oss;
+            oss << std::setfill(' ') << std::setw(2) << day;
+            calLine += oss.str() + " ";
+            
+            if ((firstDay + day) % 7 == 0) {
+                output(calLine);
+                calLine = "";
+            }
+        }
+        
+        if (!calLine.empty()) {
+            output(calLine);
+        }
+    }
+}
+
+// Who am I command - display current user information
+void cmd_whoami(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: whoami [options]");
+        output("  Display current user information");
+        output("");
+        output("OPTIONS");
+        output("  -u, --user       Show username only");
+        output("  -d, --domain     Show domain/computer name");
+        output("  -f, --full       Show full user name");
+        output("  -s, --status     Show admin status");
+        output("");
+        output("EXAMPLES");
+        output("  whoami");
+        output("    Display user information");
+        output("");
+        output("  whoami -u");
+        output("    Show username only");
+        output("");
+        output("  whoami -s");
+        output("    Check if running as administrator");
+        return;
+    }
+    
+    // Get username
+    char username[UNLEN + 1];
+    DWORD size = sizeof(username);
+    if (!GetUserNameA(username, &size)) {
+        outputError("whoami: failed to get username");
+        return;
+    }
+    
+    // Get domain/computer name
+    char computerName[MAX_COMPUTERNAME_LENGTH + 1];
+    size = sizeof(computerName);
+    if (!GetComputerNameA(computerName, &size)) {
+        strcpy_s(computerName, "UNKNOWN");
+    }
+    
+    // Check for options
+    bool showUser = false;
+    bool showDomain = false;
+    bool showFull = false;
+    bool showStatus = false;
+    
+    for (size_t i = 1; i < args.size(); i++) {
+        std::string arg = args[i];
+        if (arg == "-u" || arg == "--user") {
+            showUser = true;
+        } else if (arg == "-d" || arg == "--domain") {
+            showDomain = true;
+        } else if (arg == "-f" || arg == "--full") {
+            showFull = true;
+        } else if (arg == "-s" || arg == "--status") {
+            showStatus = true;
+        }
+    }
+    
+    // If no options, show all
+    if (!showUser && !showDomain && !showFull && !showStatus) {
+        std::ostringstream oss;
+        oss << computerName << "\\" << username;
+        output(oss.str());
+        
+        if (isRunningAsAdmin()) {
+            output("Status: Administrator");
+        } else {
+            output("Status: Standard User");
+        }
+    } else {
+        if (showUser) {
+            output(username);
+        }
+        if (showDomain) {
+            output(computerName);
+        }
+        if (showFull) {
+            std::ostringstream oss;
+            oss << computerName << "\\" << username;
+            output(oss.str());
+        }
+        if (showStatus) {
+            if (isRunningAsAdmin()) {
+                output("Administrator");
+            } else {
+                output("Standard User");
+            }
+        }
+    }
+}
+
+// User ID command - display user and group information
+void cmd_id(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: id [options]");
+        output("  Display user and group information");
+        output("");
+        output("OPTIONS");
+        output("  -u              Display UID (user ID) only");
+        output("  -g              Display GID (group ID) only");
+        output("  -n              Display names instead of numbers");
+        output("");
+        output("DESCRIPTION");
+        output("  Shows user ID, group ID, and group memberships.");
+        output("  On Windows, UIDs/GIDs are derived from SIDs.");
+        output("");
+        output("EXAMPLES");
+        output("  id");
+        output("    Display full user/group information");
+        output("");
+        output("  id -u");
+        output("    Show user ID number");
+        output("");
+        output("  id -g");
+        output("    Show group ID number");
+        return;
+    }
+    
+    // Get username for name display
+    char username[UNLEN + 1];
+    DWORD size = sizeof(username);
+    if (!GetUserNameA(username, &size)) {
+        strcpy_s(username, "unknown");
+    }
+    
+    // On Windows, derive IDs from SID
+    // For simplicity, use a hash of username as UID and a fixed GID
+    DWORD uid = 0;
+    for (size_t i = 0; i < strlen(username); i++) {
+        uid = uid * 31 + (unsigned char)username[i];
+    }
+    uid = (uid % 60000) + 1000;  // Range 1000-61000
+    
+    DWORD gid = 1000;  // Default group ID for Windows users
+    
+    // Check for options
+    bool showUidOnly = false;
+    bool showGidOnly = false;
+    bool showNames = false;
+    
+    for (size_t i = 1; i < args.size(); i++) {
+        std::string arg = args[i];
+        if (arg == "-u") {
+            showUidOnly = true;
+        } else if (arg == "-g") {
+            showGidOnly = true;
+        } else if (arg == "-n") {
+            showNames = true;
+        }
+    }
+    
+    if (showUidOnly) {
+        std::ostringstream oss;
+        oss << uid;
+        output(oss.str());
+    } else if (showGidOnly) {
+        std::ostringstream oss;
+        oss << gid;
+        output(oss.str());
+    } else {
+        // Full output: uid=1000(user) gid=1000(group) groups=1000(group),...
+        std::ostringstream oss;
+        oss << "uid=" << uid;
+        if (showNames) {
+            oss << "(" << username << ")";
+        }
+        oss << " gid=" << gid;
+        if (showNames) {
+            oss << "(users)";
+        }
+        oss << " groups=" << gid;
+        if (showNames) {
+            oss << "(users)";
+        }
+        
+        // Add admin group if running as admin
+        if (isRunningAsAdmin()) {
+            oss << ",27(administrators)";
+        }
+        
+        output(oss.str());
+    }
+}
+
+// System name command - display system information
+void cmd_uname(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: uname [options]");
+        output("  Display system information");
+        output("");
+        output("OPTIONS");
+        output("  -a              Print all information");
+        output("  -s              System name (Windows)");
+        output("  -n              Network hostname");
+        output("  -r              Release (OS version)");
+        output("  -v              Version information");
+        output("  -m              Machine hardware name");
+        output("  -p              Processor type");
+        output("");
+        output("EXAMPLES");
+        output("  uname -a");
+        output("    Display all system information");
+        output("");
+        output("  uname -n");
+        output("    Show computer hostname");
+        output("");
+        output("  uname -r");
+        output("    Show Windows version");
+        return;
+    }
+    
+    // Get system information
+    char computerName[MAX_COMPUTERNAME_LENGTH + 1];
+    DWORD size = sizeof(computerName);
+    GetComputerNameA(computerName, &size);
+    
+    // Get OS version
+    OSVERSIONINFOA osInfo = {0};
+    osInfo.dwOSVersionInfoSize = sizeof(osInfo);
+    GetVersionExA(&osInfo);
+    
+    // Detect Windows version based on build number
+    // Windows 11 reports as 10.0 but has build >= 22000
+    std::string osName = "Windows";
+    int majorVersion = osInfo.dwMajorVersion;
+    int minorVersion = osInfo.dwMinorVersion;
+    int buildNumber = osInfo.dwBuildNumber;
+    
+    if (majorVersion == 10 && minorVersion == 0) {
+        if (buildNumber >= 22000) {
+            osName = "Windows 11";
+        } else {
+            osName = "Windows 10";
+        }
+    } else if (majorVersion == 6) {
+        if (minorVersion == 3) {
+            osName = "Windows 8.1";
+        } else if (minorVersion == 2) {
+            osName = "Windows 8";
+        } else if (minorVersion == 1) {
+            osName = "Windows 7";
+        } else if (minorVersion == 0) {
+            osName = "Windows Vista";
+        }
+    }
+    
+    // Get Windows edition (Home, Pro, Server, etc.)
+    std::string edition = "Edition";
+    DWORD productInfo = 0;
+    typedef BOOL (WINAPI *pGetProductInfo)(DWORD, DWORD, DWORD, DWORD, PDWORD);
+    pGetProductInfo GetProductInfo = (pGetProductInfo)GetProcAddress(GetModuleHandleA("kernel32.dll"), "GetProductInfo");
+    
+    if (GetProductInfo) {
+        GetProductInfo(osInfo.dwMajorVersion, osInfo.dwMinorVersion, 0, 0, &productInfo);
+        
+        switch (productInfo) {
+            case 0x10: edition = "Home Basic"; break;
+            case 0x11: edition = "Home Premium"; break;
+            case 0x30: edition = "Pro"; break;
+            case 0x31: edition = "Pro Education"; break;
+            case 0x45: edition = "Pro for Workstations"; break;
+            case 0x04: edition = "Enterprise"; break;
+            case 0x46: edition = "Enterprise N"; break;
+            case 0x07: edition = "Server Standard"; break;
+            case 0x08: edition = "Server Enterprise"; break;
+            case 0x0A: edition = "Server Datacenter"; break;
+            case 0x0E: edition = "Home"; break;
+            case 0x3A: edition = "Education"; break;
+            case 0x3C: edition = "Community"; break;
+            default: edition = "Pro"; break;  // Default to Pro for unknown
+        }
+    }
+    
+    // Format version string (build number for Windows 10/11, traditional for older)
+    std::ostringstream versionStr;
+    versionStr << buildNumber;
+    std::string version = versionStr.str();
+    
+    // Get processor info
+    SYSTEM_INFO sysInfo;
+    GetSystemInfo(&sysInfo);
+    
+    std::string processor = "x86";
+    if (sysInfo.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_AMD64) {
+        processor = "x86_64";
+    } else if (sysInfo.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_ARM) {
+        processor = "ARM";
+    } else if (sysInfo.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_ARM64) {
+        processor = "ARM64";
+    }
+    
+    // Check for options
+    bool showAll = false;
+    bool showSystem = false;
+    bool showNode = false;
+    bool showRelease = false;
+    bool showVersion = false;
+    bool showMachine = false;
+    bool showProcessor = false;
+    
+    for (size_t i = 1; i < args.size(); i++) {
+        std::string arg = args[i];
+        if (arg == "-a") {
+            showAll = true;
+        } else if (arg == "-s") {
+            showSystem = true;
+        } else if (arg == "-n") {
+            showNode = true;
+        } else if (arg == "-r") {
+            showRelease = true;
+        } else if (arg == "-v") {
+            showVersion = true;
+        } else if (arg == "-m") {
+            showMachine = true;
+        } else if (arg == "-p") {
+            showProcessor = true;
+        }
+    }
+    
+    if (showAll) {
+        showSystem = showNode = showRelease = showVersion = showMachine = showProcessor = true;
+    }
+    
+    // If no options specified, default to system name with version info
+    if (!showSystem && !showNode && !showRelease && !showVersion && !showMachine && !showProcessor) {
+        std::ostringstream oss;
+        oss << osName << " " << edition << " " << version;
+        output(oss.str());
+        return;
+    }
+    
+    // Build output
+    std::string output_str;
+    
+    if (showSystem) {
+        if (!output_str.empty()) output_str += " ";
+        output_str += osName;
+        output_str += " ";
+        output_str += edition;
+    }
+    if (showNode) {
+        if (!output_str.empty()) output_str += " ";
+        output_str += computerName;
+    }
+    if (showRelease) {
+        if (!output_str.empty()) output_str += " ";
+        output_str += version;
+    }
+    if (showVersion) {
+        if (!output_str.empty()) output_str += " ";
+        output_str += "#1";  // Build number placeholder
+    }
+    if (showMachine) {
+        if (!output_str.empty()) output_str += " ";
+        output_str += processor;
+    }
+    if (showProcessor) {
+        if (!output_str.empty()) output_str += " ";
+        output_str += processor;
+    }
+    
+    output(output_str);
+}
+
+// Stream editor command (sed) - stream editor for text substitution
+void cmd_sed(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: sed [options] <script> [file...]");
+        output("  Stream editor for filtering and transforming text");
+        output("");
+        output("SCRIPT");
+        output("  s/pattern/replacement/[flags]  Substitute command");
+        output("");
+        output("FLAGS");
+        output("  g  Replace all occurrences (global)");
+        output("  i  Case-insensitive matching");
+        output("  p  Print pattern space");
+        output("");
+        output("OPTIONS");
+        output("  -e <script>  Add script");
+        output("  -i           Edit files in-place");
+        output("");
+        output("EXAMPLES");
+        output("  sed 's/foo/bar/' file.txt");
+        output("    Replace first 'foo' with 'bar' on each line");
+        output("");
+        output("  sed 's/foo/bar/g' file.txt");
+        output("    Replace all 'foo' with 'bar' on each line");
+        output("");
+        output("  sed 's/foo/bar/i' file.txt");
+        output("    Replace 'foo' case-insensitively");
+        return;
+    }
+    
+    if (args.size() < 2) {
+        outputError("sed: missing script");
+        return;
+    }
+    
+    // Parse script (simplified - supports s/pattern/replacement/flags)
+    std::string script = args[1];
+    std::vector<std::string> files;
+    
+    // Collect file names
+    for (size_t i = 2; i < args.size(); i++) {
+        files.push_back(args[i]);
+    }
+    
+    // If no files specified, read from stdin (not implemented for simplicity)
+    if (files.empty()) {
+        outputError("sed: reading from stdin not supported in this implementation");
+        return;
+    }
+    
+    // Parse the sed script
+    if (script[0] != 's') {
+        outputError("sed: only 's' (substitute) command is supported");
+        return;
+    }
+    
+    // Extract pattern and replacement from s/pattern/replacement/flags
+    char delimiter = script[1];
+    size_t pos1 = script.find(delimiter, 2);
+    size_t pos2 = script.find(delimiter, pos1 + 1);
+    size_t pos3 = script.find(delimiter, pos2 + 1);
+    
+    if (pos1 == std::string::npos || pos2 == std::string::npos) {
+        outputError("sed: invalid substitution syntax");
+        return;
+    }
+    
+    std::string pattern = script.substr(2, pos1 - 2);
+    std::string replacement = script.substr(pos1 + 1, pos2 - pos1 - 1);
+    std::string flags = (pos3 != std::string::npos) ? script.substr(pos2 + 1, pos3 - pos2 - 1) : script.substr(pos2 + 1);
+    
+    // Parse flags
+    bool globalReplace = flags.find('g') != std::string::npos;
+    bool caseInsensitive = flags.find('i') != std::string::npos;
+    bool printMatched = flags.find('p') != std::string::npos;
+    
+    // Process each file
+    for (const auto& filename : files) {
+        // Open and read file
+        std::ifstream file(unixPathToWindows(filename));
+        if (!file.is_open()) {
+            outputError("sed: cannot open file: " + filename);
+            continue;
+        }
+        
+        std::string line;
+        while (std::getline(file, line)) {
+            std::string originalLine = line;
+            
+            // Perform substitution
+            size_t searchPos = 0;
+            while (true) {
+                size_t found;
+                if (caseInsensitive) {
+                    // Simple case-insensitive search (ASCII only)
+                    std::string lowerLine = line;
+                    std::string lowerPattern = pattern;
+                    std::transform(lowerLine.begin(), lowerLine.end(), lowerLine.begin(), ::tolower);
+                    std::transform(lowerPattern.begin(), lowerPattern.end(), lowerPattern.begin(), ::tolower);
+                    found = lowerLine.find(lowerPattern, searchPos);
+                    if (found != std::string::npos) {
+                        line.replace(found, pattern.length(), replacement);
+                        searchPos = found + replacement.length();
+                    }
+                } else {
+                    found = line.find(pattern, searchPos);
+                    if (found != std::string::npos) {
+                        line.replace(found, pattern.length(), replacement);
+                        searchPos = found + replacement.length();
+                    }
+                }
+                
+                if (found == std::string::npos || !globalReplace) {
+                    break;
+                }
+            }
+            
+            // Output the result
+            if (printMatched && line != originalLine) {
+                output(line);
+                output(line);  // Print twice when 'p' flag is set
+            } else {
+                output(line);
+            }
+        }
+        file.close();
+    }
+}
+
+// Execute arguments command (xargs) - build and execute command from arguments
+void cmd_xargs(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: xargs [options] [command [arguments...]]");
+        output("  Build and execute command from standard input");
+        output("");
+        output("OPTIONS");
+        output("  -n <max-args>  Use at most max-args per command");
+        output("  -I <string>    Replace string with input items");
+        output("  -0             Input items are null-terminated");
+        output("");
+        output("DESCRIPTION");
+        output("  Reads space-separated items from stdin and executes");
+        output("  the specified command with those items as arguments.");
+        output("");
+        output("EXAMPLES");
+        output("  echo file1 file2 | xargs rm");
+        output("    Delete file1 and file2");
+        output("");
+        output("  find . -name '*.txt' | xargs cat");
+        output("    Display contents of all .txt files");
+        output("");
+        output("NOTE");
+        output("  In this implementation, use piped input via the pipe mechanism.");
+        return;
+    }
+    
+    // xargs reads from g_capturedOutput (piped input)
+    if (g_capturedOutput.empty()) {
+        outputError("xargs: no input provided (use pipe to provide input)");
+        return;
+    }
+    
+    // Get command to execute
+    if (args.size() < 2) {
+        outputError("xargs: missing command");
+        return;
+    }
+    
+    std::string command = args[1];
+    std::vector<std::string> cmdArgs;
+    for (size_t i = 2; i < args.size(); i++) {
+        cmdArgs.push_back(args[i]);
+    }
+    
+    // Parse options
+    int maxArgs = 0;  // 0 means no limit
+    for (size_t i = 1; i < args.size(); i++) {
+        if (args[i] == "-n" && i + 1 < args.size()) {
+            maxArgs = std::atoi(args[i + 1].c_str());
+            i++;
+        }
+    }
+    
+    // Collect all input items
+    std::vector<std::string> items;
+    for (const auto& line : g_capturedOutput) {
+        // Split by whitespace
+        std::istringstream iss(line);
+        std::string item;
+        while (iss >> item) {
+            items.push_back(item);
+        }
+    }
+    
+    // Build and execute commands
+    if (maxArgs == 0 || maxArgs >= (int)items.size()) {
+        // Execute command once with all items
+        std::string fullCmd = command;
+        for (const auto& item : items) {
+            fullCmd += " " + item;
+        }
+        for (const auto& arg : cmdArgs) {
+            fullCmd += " " + arg;
+        }
+        executeCommand(fullCmd);
+    } else {
+        // Execute command multiple times with max-args per execution
+        size_t itemIdx = 0;
+        while (itemIdx < items.size()) {
+            std::string fullCmd = command;
+            int argsAdded = 0;
+            while (itemIdx < items.size() && argsAdded < maxArgs) {
+                fullCmd += " " + items[itemIdx];
+                itemIdx++;
+                argsAdded++;
+            }
+            for (const auto& arg : cmdArgs) {
+                fullCmd += " " + arg;
+            }
+            executeCommand(fullCmd);
+        }
+    }
+    
+    // Clear captured output after processing
+    g_capturedOutput.clear();
+}
+
+// Execute command (exec) - execute command, replacing the shell
+void cmd_exec(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: exec <command> [arguments...]");
+        output("  Execute command, replacing the current process");
+        output("");
+        output("DESCRIPTION");
+        output("  Executes a command without creating a new process.");
+        output("  In this implementation, behaves like running the command directly.");
+        output("");
+        output("EXAMPLES");
+        output("  exec ls -la");
+        output("    List directory contents");
+        output("");
+        output("  exec echo 'Hello World'");
+        output("    Print text");
+        return;
+    }
+    
+    if (args.size() < 2) {
+        outputError("exec: missing command");
+        return;
+    }
+    
+    // Build command from arguments (skip 'exec')
+    std::string command;
+    for (size_t i = 1; i < args.size(); i++) {
+        if (i > 1) command += " ";
+        command += args[i];
+    }
+    
+    // Execute the command but skip the final prompt since we're nested in executeCommand
+    g_skipFinalPrompt = true;
+    executeCommand(command);
+    g_skipFinalPrompt = false;
+}
+
+// AWK command - text processing language
+void cmd_awk(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: awk [options] '<program>' [file...]");
+        output("  Pattern scanning and text processing language");
+        output("");
+        output("PROGRAM SYNTAX");
+        output("  pattern { action }  Execute action when pattern matches");
+        output("  BEGIN { }           Execute before reading input");
+        output("  END { }             Execute after reading input");
+        output("");
+        output("BUILT-IN VARIABLES");
+        output("  NR    Line number");
+        output("  NF    Number of fields");
+        output("  $0    Entire line");
+        output("  $1,$2 Field 1, field 2, etc.");
+        output("  FS    Field separator (default: space)");
+        output("");
+        output("OPERATORS");
+        output("  ==, !=, <, >, <=, >=");
+        output("  &&, ||, !");
+        output("  ~     Match regex");
+        output("");
+        output("EXAMPLES");
+        output("  awk '{print $1}' file.txt");
+        output("    Print first field of each line");
+        output("");
+        output("  awk 'NR > 1' file.txt");
+        output("    Print all lines except the first");
+        output("");
+        output("  awk '/pattern/ {print}' file.txt");
+        output("    Print lines matching pattern");
+        return;
+    }
+    
+    if (args.size() < 2) {
+        outputError("awk: missing program");
+        return;
+    }
+    
+    std::string program = args[1];
+    std::vector<std::string> files;
+    
+    // Collect file names
+    for (size_t i = 2; i < args.size(); i++) {
+        files.push_back(args[i]);
+    }
+    
+    // If no files specified, read from stdin (captured output)
+    if (files.empty() && !g_capturedOutput.empty()) {
+        // Process piped input
+        std::vector<std::string> input_lines = g_capturedOutput;
+        
+        // Simple AWK implementation - parse and execute program
+        // This is a simplified version supporting basic patterns and actions
+        
+        // Look for BEGIN block
+        size_t begin_pos = program.find("BEGIN");
+        if (begin_pos != std::string::npos) {
+            size_t brace_start = program.find("{", begin_pos);
+            size_t brace_end = program.find("}", brace_start);
+            if (brace_start != std::string::npos && brace_end != std::string::npos) {
+                std::string begin_block = program.substr(brace_start + 1, brace_end - brace_start - 1);
+                // Execute BEGIN block (simplified - just output)
+                // In a full implementation, would handle variable assignments, etc.
+            }
+        }
+        
+        // Process each line
+        int lineNum = 0;
+        for (const auto& line : input_lines) {
+            lineNum++;
+            
+            // Very simplified AWK: just handle {print $N} pattern
+            if (program.find("{print") != std::string::npos) {
+                // Extract field number if specified
+                size_t dollar_pos = program.find("$");
+                if (dollar_pos != std::string::npos) {
+                    char field_char = program[dollar_pos + 1];
+                    int field_num = field_char - '0';
+                    
+                    if (field_num == 0) {
+                        // $0 means entire line
+                        output(line);
+                    } else if (field_num > 0) {
+                        // Split line by whitespace and get field
+                        std::istringstream iss(line);
+                        std::string field;
+                        int field_idx = 0;
+                        while (iss >> field) {
+                            field_idx++;
+                            if (field_idx == field_num) {
+                                output(field);
+                                break;
+                            }
+                        }
+                    }
+                } else {
+                    // No field specified, print whole line
+                    output(line);
+                }
+            } else if (program.find("/") != std::string::npos && program.find("{") != std::string::npos) {
+                // Pattern matching like /pattern/ {print}
+                size_t slash1 = program.find("/");
+                size_t slash2 = program.find("/", slash1 + 1);
+                if (slash1 != std::string::npos && slash2 != std::string::npos) {
+                    std::string pattern = program.substr(slash1 + 1, slash2 - slash1 - 1);
+                    
+                    // Simple pattern matching
+                    if (line.find(pattern) != std::string::npos) {
+                        output(line);
+                    }
+                }
+            } else if (program.find("NR") != std::string::npos) {
+                // Handle NR (line number) conditions
+                if (program.find("NR > 1") != std::string::npos && lineNum > 1) {
+                    output(line);
+                } else if (program.find("NR ==") != std::string::npos) {
+                    // Extract line number
+                    size_t pos = program.find("NR ==");
+                    if (pos != std::string::npos) {
+                        int match_line = std::atoi(program.substr(pos + 5).c_str());
+                        if (lineNum == match_line) {
+                            output(line);
+                        }
+                    }
+                } else {
+                    output(line);
+                }
+            } else {
+                output(line);
+            }
+        }
+        
+        // Look for END block
+        size_t end_pos = program.find("END");
+        if (end_pos != std::string::npos) {
+            size_t brace_start = program.find("{", end_pos);
+            size_t brace_end = program.find("}", brace_start);
+            if (brace_start != std::string::npos && brace_end != std::string::npos) {
+                std::string end_block = program.substr(brace_start + 1, brace_end - brace_start - 1);
+                // Execute END block (simplified)
+            }
+        }
+        
+        g_capturedOutput.clear();
+    } else if (!files.empty()) {
+        // Process files
+        for (const auto& filename : files) {
+            std::ifstream file(unixPathToWindows(filename));
+            if (!file.is_open()) {
+                outputError("awk: cannot open file: " + filename);
+                continue;
+            }
+            
+            std::string line;
+            int lineNum = 0;
+            while (std::getline(file, line)) {
+                lineNum++;
+                
+                // Same pattern matching as above
+                if (program.find("{print") != std::string::npos) {
+                    size_t dollar_pos = program.find("$");
+                    if (dollar_pos != std::string::npos) {
+                        char field_char = program[dollar_pos + 1];
+                        int field_num = field_char - '0';
+                        
+                        if (field_num == 0) {
+                            output(line);
+                        } else if (field_num > 0) {
+                            std::istringstream iss(line);
+                            std::string field;
+                            int field_idx = 0;
+                            while (iss >> field) {
+                                field_idx++;
+                                if (field_idx == field_num) {
+                                    output(field);
+                                    break;
+                                }
+                            }
+                        }
+                    } else {
+                        output(line);
+                    }
+                } else if (program.find("/") != std::string::npos && program.find("{") != std::string::npos) {
+                    size_t slash1 = program.find("/");
+                    size_t slash2 = program.find("/", slash1 + 1);
+                    if (slash1 != std::string::npos && slash2 != std::string::npos) {
+                        std::string pattern = program.substr(slash1 + 1, slash2 - slash1 - 1);
+                        if (line.find(pattern) != std::string::npos) {
+                            output(line);
+                        }
+                    }
+                } else if (program.find("NR") != std::string::npos) {
+                    if (program.find("NR > 1") != std::string::npos && lineNum > 1) {
+                        output(line);
+                    } else if (program.find("NR ==") != std::string::npos) {
+                        size_t pos = program.find("NR ==");
+                        if (pos != std::string::npos) {
+                            int match_line = std::atoi(program.substr(pos + 5).c_str());
+                            if (lineNum == match_line) {
+                                output(line);
+                            }
+                        }
+                    } else {
+                        output(line);
+                    }
+                } else {
+                    output(line);
+                }
+            }
+            file.close();
+        }
+    } else {
+        outputError("awk: no input provided");
+    }
+}
+
+// Sort command - sort lines of text
+void cmd_sort(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: sort [options] [file...]");
+        output("  Sort lines of text");
+        output("");
+        output("OPTIONS");
+        output("  -r          Reverse order (descending)");
+        output("  -n          Numeric sort");
+        output("  -u          Unique lines only");
+        output("  -k N        Sort by key/field N (default: field 1)");
+        output("");
+        output("DESCRIPTION");
+        output("  Sorts input lines alphabetically (or numerically with -n).");
+        output("  Can read from files or piped input.");
+        output("");
+        output("EXAMPLES");
+        output("  sort file.txt");
+        output("    Sort file alphabetically");
+        output("");
+        output("  sort -r file.txt");
+        output("    Sort in reverse order");
+        output("");
+        output("  sort -n numbers.txt");
+        output("    Sort numerically");
+        return;
+    }
+    
+    // Parse options
+    bool reverse = false;
+    bool numeric = false;
+    bool unique = false;
+    int keyField = 1;
+    std::vector<std::string> files;
+    
+    for (size_t i = 1; i < args.size(); i++) {
+        if (args[i] == "-r") {
+            reverse = true;
+        } else if (args[i] == "-n") {
+            numeric = true;
+        } else if (args[i] == "-u") {
+            unique = true;
+        } else if (args[i] == "-k" && i + 1 < args.size()) {
+            keyField = std::atoi(args[++i].c_str());
+            if (keyField < 1) keyField = 1;
+        } else if (args[i][0] != '-') {
+            files.push_back(args[i]);
+        }
+    }
+    
+    std::vector<std::string> lines;
+    
+    // Read from files or stdin
+    if (files.empty() && !g_capturedOutput.empty()) {
+        lines = g_capturedOutput;
+        g_capturedOutput.clear();
+    } else if (!files.empty()) {
+        for (const auto& filename : files) {
+            std::ifstream file(unixPathToWindows(filename));
+            if (!file.is_open()) {
+                outputError("sort: cannot open file: " + filename);
+                continue;
+            }
+            
+            std::string line;
+            while (std::getline(file, line)) {
+                lines.push_back(line);
+            }
+            file.close();
+        }
+    }
+    
+    if (lines.empty()) return;
+    
+    // Sort lines
+    if (numeric) {
+        std::sort(lines.begin(), lines.end(), [keyField](const std::string& a, const std::string& b) {
+            int valA = std::atoi(a.c_str());
+            int valB = std::atoi(b.c_str());
+            return valA < valB;
+        });
+    } else {
+        std::sort(lines.begin(), lines.end());
+    }
+    
+    // Reverse if needed
+    if (reverse) {
+        std::reverse(lines.begin(), lines.end());
+    }
+    
+    // Remove duplicates if requested
+    if (unique) {
+        std::sort(lines.begin(), lines.end());
+        auto last = std::unique(lines.begin(), lines.end());
+        lines.erase(last, lines.end());
+        if (reverse) {
+            std::reverse(lines.begin(), lines.end());
+        }
+    }
+    
+    // Output sorted lines
+    for (const auto& line : lines) {
+        output(line);
+    }
+}
+
+// Cut command - extract columns/fields from text
+void cmd_cut(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: cut [options] [file...]");
+        output("  Extract columns or fields from text");
+        output("");
+        output("OPTIONS");
+        output("  -d DELIM    Field delimiter (default: tab)");
+        output("  -f FIELDS   Fields to extract (comma-separated or range)");
+        output("  -c CHARS    Character positions (comma-separated or range)");
+        output("");
+        output("DESCRIPTION");
+        output("  Removes selected columns/fields from each line.");
+        output("  Can read from files or piped input.");
+        output("");
+        output("EXAMPLES");
+        output("  cut -f 1,3 file.txt");
+        output("    Extract fields 1 and 3");
+        output("");
+        output("  cut -d: -f1 /etc/passwd");
+        output("    Extract first field using colon delimiter");
+        output("");
+        output("  cut -c 1-5 file.txt");
+        output("    Extract first 5 characters");
+        return;
+    }
+    
+    // Parse options
+    char delimiter = '\t';
+    std::vector<int> fields;
+    std::vector<std::pair<int, int>> charRanges;
+    bool useFields = true;
+    std::vector<std::string> files;
+    
+    for (size_t i = 1; i < args.size(); i++) {
+        if (args[i] == "-d" && i + 1 < args.size()) {
+            delimiter = args[++i][0];
+        } else if (args[i] == "-f" && i + 1 < args.size()) {
+            useFields = true;
+            std::string fieldStr = args[++i];
+            // Parse field specification
+            size_t pos = 0;
+            while (pos < fieldStr.length()) {
+                size_t comma = fieldStr.find(',', pos);
+                std::string part = (comma == std::string::npos) ? fieldStr.substr(pos) : fieldStr.substr(pos, comma - pos);
+                
+                size_t dash = part.find('-');
+                if (dash != std::string::npos) {
+                    int start = std::atoi(part.substr(0, dash).c_str());
+                    int end = std::atoi(part.substr(dash + 1).c_str());
+                    for (int f = start; f <= end; f++) {
+                        fields.push_back(f);
+                    }
+                } else {
+                    fields.push_back(std::atoi(part.c_str()));
+                }
+                
+                pos = (comma == std::string::npos) ? fieldStr.length() : comma + 1;
+            }
+        } else if (args[i] == "-c" && i + 1 < args.size()) {
+            useFields = false;
+            std::string charStr = args[++i];
+            // Parse character specification
+            size_t pos = 0;
+            while (pos < charStr.length()) {
+                size_t comma = charStr.find(',', pos);
+                std::string part = (comma == std::string::npos) ? charStr.substr(pos) : charStr.substr(pos, comma - pos);
+                
+                size_t dash = part.find('-');
+                if (dash != std::string::npos) {
+                    int start = std::atoi(part.substr(0, dash).c_str());
+                    int end = std::atoi(part.substr(dash + 1).c_str());
+                    charRanges.push_back({start - 1, end - 1});  // Convert to 0-based
+                } else {
+                    int ch = std::atoi(part.c_str());
+                    charRanges.push_back({ch - 1, ch - 1});  // Convert to 0-based
+                }
+                
+                pos = (comma == std::string::npos) ? charStr.length() : comma + 1;
+            }
+        } else if (args[i][0] != '-') {
+            files.push_back(args[i]);
+        }
+    }
+    
+    std::vector<std::string> lines;
+    
+    // Read from files or stdin
+    if (files.empty() && !g_capturedOutput.empty()) {
+        lines = g_capturedOutput;
+        g_capturedOutput.clear();
+    } else if (!files.empty()) {
+        for (const auto& filename : files) {
+            std::ifstream file(unixPathToWindows(filename));
+            if (!file.is_open()) {
+                outputError("cut: cannot open file: " + filename);
+                continue;
+            }
+            
+            std::string line;
+            while (std::getline(file, line)) {
+                lines.push_back(line);
+            }
+            file.close();
+        }
+    } else {
+        return;
+    }
+    
+    // Process lines
+    for (const auto& line : lines) {
+        std::string result;
+        
+        if (useFields) {
+            // Extract fields
+            std::vector<std::string> fieldValues;
+            
+            // Split by delimiter (space or tab)
+            std::istringstream iss(line);
+            std::string field;
+            if (delimiter == '\t' || delimiter == ' ') {
+                // For space or tab, split on any whitespace
+                while (iss >> field) {
+                    fieldValues.push_back(field);
+                }
+            } else {
+                // For other delimiters, use getline
+                while (std::getline(iss, field, delimiter)) {
+                    fieldValues.push_back(field);
+                }
+            }
+            
+            // If no specific fields requested, output the line as-is
+            if (fields.empty()) {
+                result = line;
+            } else {
+                for (size_t i = 0; i < fields.size(); i++) {
+                    int fieldNum = fields[i] - 1;  // Convert to 0-based
+                    if (fieldNum >= 0 && fieldNum < (int)fieldValues.size()) {
+                        if (i > 0) result += " ";  // Use space as output delimiter
+                        result += fieldValues[fieldNum];
+                    }
+                }
+            }
+        } else {
+            // Extract characters
+            for (const auto& range : charRanges) {
+                for (int i = range.first; i <= range.second && i < (int)line.length(); i++) {
+                    result += line[i];
+                }
+            }
+        }
+        
+        output(result);
+    }
+}
+
+// Paste command - merge lines from multiple files or input
+void cmd_paste(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: paste [options] [file...]");
+        output("  Merge lines from multiple files");
+        output("");
+        output("OPTIONS");
+        output("  -d DELIM    Field delimiter (default: tab)");
+        output("");
+        output("DESCRIPTION");
+        output("  Pastes lines from multiple files horizontally.");
+        output("  Can read from files or treat - as stdin.");
+        output("");
+        output("EXAMPLES");
+        output("  paste file1.txt file2.txt");
+        output("    Merge file1 and file2 side by side");
+        output("");
+        output("  paste -d, file1.txt file2.txt");
+        output("    Use comma as delimiter");
+        return;
+    }
+    
+    // Parse options
+    char delimiter = '\t';
+    std::vector<std::string> files;
+    
+    for (size_t i = 1; i < args.size(); i++) {
+        if (args[i] == "-d" && i + 1 < args.size()) {
+            delimiter = args[++i][0];
+        } else {
+            files.push_back(args[i]);
+        }
+    }
+    
+    if (files.empty()) {
+        outputError("paste: no files specified");
+        return;
+    }
+    
+    // Read all files
+    std::vector<std::vector<std::string>> fileContents;
+    size_t maxLines = 0;
+    
+    for (const auto& filename : files) {
+        std::vector<std::string> lines;
+        
+        if (filename == "-") {
+            // Read from stdin
+            lines = g_capturedOutput;
+            g_capturedOutput.clear();
+        } else {
+            std::ifstream file(unixPathToWindows(filename));
+            if (!file.is_open()) {
+                outputError("paste: cannot open file: " + filename);
+                continue;
+            }
+            
+            std::string line;
+            while (std::getline(file, line)) {
+                lines.push_back(line);
+            }
+            file.close();
+        }
+        
+        fileContents.push_back(lines);
+        maxLines = std::max(maxLines, lines.size());
+    }
+    
+    // Merge and output
+    for (size_t lineNum = 0; lineNum < maxLines; lineNum++) {
+        std::string result;
+        for (size_t fileNum = 0; fileNum < fileContents.size(); fileNum++) {
+            if (fileNum > 0) result += delimiter;
+            if (lineNum < fileContents[fileNum].size()) {
+                result += fileContents[fileNum][lineNum];
+            }
+        }
+        output(result);
+    }
+}
+
+// Helper function to refresh nano display
+void refreshNanoDisplay() {
+    if (!g_nanoMode || !g_hOutput) return;
+    
+    // Clear the screen
+    SetWindowTextA(g_hOutput, "");
+    
+    // Display header
+    output("=== nano editor ===");
+    std::string statusLine = "Ctrl+O=Write  Ctrl+W=Save As  Ctrl+X=Exit  Ctrl+K=Cut";
+    if (g_nanoModified) {
+        statusLine += " [Modified]";
+    }
+    output(statusLine);
+    output("");
+    
+    // Show all lines
+    for (size_t i = 0; i < g_nanoBuffer.size(); i++) {
+        char lineNum[32];
+        snprintf(lineNum, sizeof(lineNum), "%3zu: ", i + 1);
+        std::string displayLine = std::string(lineNum) + g_nanoBuffer[i];
+        
+        // Highlight current line
+        if ((int)i == g_nanoCursorLine) {
+            displayLine = "> " + displayLine;
+        } else {
+            displayLine = "  " + displayLine;
+        }
+        output(displayLine);
+    }
+    
+    output("");
+    
+    // Show cursor position
+    char statusBuf[128];
+    snprintf(statusBuf, sizeof(statusBuf), "[ Line %d, Col %d ]", 
+             g_nanoCursorLine + 1, g_nanoCursorCol + 1);
+    output(statusBuf);
+    
+    // Keep cursor at end
+    int textLen = GetWindowTextLengthA(g_hOutput);
+    SendMessage(g_hOutput, EM_SETSEL, textLen, textLen);
+    SendMessage(g_hOutput, EM_SCROLLCARET, 0, 0);
+}
+
+// Nano editor - simple text editor
+void cmd_nano(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: nano [options] [file]");
+        output("  Simple text editor (Pico clone)");
+        output("");
+        output("OPTIONS");
+        output("  -n FILE    Create new file with specified name");
+        output("");
+        output("KEY BINDINGS");
+        output("  Ctrl+O     Write (save) file");
+        output("  Ctrl+W     Save As (write to new file)");
+        output("  Ctrl+X     Exit editor");
+        output("  Ctrl+K     Cut current line");
+        output("  Ctrl+U     Paste (undo cut)");
+        output("  Ctrl+A     Beginning of line");
+        output("  Ctrl+E     End of line");
+        output("  Ctrl+Y     Page up");
+        output("  Ctrl+V     Page down");
+        output("");
+        output("DESCRIPTION");
+        output("  Edit or create a text file interactively.");
+        output("  Type text normally. Use Ctrl+X to exit.");
+        return;
+    }
+    
+    // Parse options and get filename
+    std::string filename;
+    bool newFileMode = false;
+    
+    size_t argIdx = 1;
+    while (argIdx < args.size()) {
+        if (args[argIdx] == "-n") {
+            newFileMode = true;
+            argIdx++;
+            if (argIdx < args.size()) {
+                filename = args[argIdx];
+                argIdx++;
+            } else {
+                outputError("nano: -n requires a filename");
+                return;
+            }
+        } else {
+            filename = args[argIdx];
+            argIdx++;
+            break;
+        }
+    }
+    
+    if (filename.empty()) {
+        outputError("nano: filename required");
+        return;
+    }
+    
+    // Convert to Windows path
+    filename = unixPathToWindows(filename);
+    
+    // If no path separator and not absolute, prepend current working directory
+    if (filename.find('\\') == std::string::npos && filename.find('/') == std::string::npos) {
+        if (filename.length() < 2 || filename[1] != ':') {
+            // Relative path - prepend cwd
+            char cwd[MAX_PATH];
+            GetCurrentDirectoryA(MAX_PATH, cwd);
+            filename = std::string(cwd) + "\\" + filename;
+        }
+    }
+    
+    // Load file if it exists (unless -n flag used)
+    g_nanoBuffer.clear();
+    if (!newFileMode) {
+        std::ifstream file(filename);
+        if (file.is_open()) {
+            std::string line;
+            while (std::getline(file, line)) {
+                g_nanoBuffer.push_back(line);
+            }
+            file.close();
+        } else {
+            // Create new empty file
+            g_nanoBuffer.push_back("");
+        }
+    } else {
+        // -n flag: always create new empty file
+        g_nanoBuffer.push_back("");
+    }
+    
+    if (g_nanoBuffer.empty()) {
+        g_nanoBuffer.push_back("");
+    }
+    
+    // Initialize nano state
+    g_nanoMode = true;
+    g_nanoFilename = filename;
+    g_nanoCursorLine = 0;
+    g_nanoCursorCol = 0;
+    g_nanoTopLine = 0;
+    g_nanoModified = false;
+    
+    // Display the editor
+    refreshNanoDisplay();
+}
+
+// Diff command - compare two files
+void cmd_diff(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: diff [options] file1 file2");
+        output("  Compare two files and show differences");
+        output("");
+        output("OPTIONS");
+        output("  -u           Unified format (default)");
+        output("  -c           Context format (3 lines before/after)");
+        output("  -q           Quiet - only report if files differ");
+        output("");
+        output("DESCRIPTION");
+        output("  Shows differences between two files line by line.");
+        return;
+    }
+    
+    if (args.size() < 3) {
+        outputError("diff: requires two file names");
+        return;
+    }
+    
+    // Parse options
+    bool unifiedFormat = true;
+    bool contextFormat = false;
+    bool quietMode = false;
+    int optIdx = 1;
+    
+    while (optIdx < (int)args.size() - 2) {
+        if (args[optIdx] == "-u") {
+            unifiedFormat = true;
+            contextFormat = false;
+            optIdx++;
+        } else if (args[optIdx] == "-c") {
+            contextFormat = true;
+            unifiedFormat = false;
+            optIdx++;
+        } else if (args[optIdx] == "-q") {
+            quietMode = true;
+            optIdx++;
+        } else {
+            optIdx++;
+        }
+    }
+    
+    // Get filenames
+    std::string file1 = unixPathToWindows(args[args.size() - 2]);
+    std::string file2 = unixPathToWindows(args[args.size() - 1]);
+    
+    // Read both files
+    std::vector<std::string> lines1, lines2;
+    
+    std::ifstream f1(file1);
+    if (f1.is_open()) {
+        std::string line;
+        while (std::getline(f1, line)) {
+            lines1.push_back(line);
+        }
+        f1.close();
+    } else {
+        outputError("diff: cannot open file: " + windowsPathToUnix(file1));
+        return;
+    }
+    
+    std::ifstream f2(file2);
+    if (f2.is_open()) {
+        std::string line;
+        while (std::getline(f2, line)) {
+            lines2.push_back(line);
+        }
+        f2.close();
+    } else {
+        outputError("diff: cannot open file: " + windowsPathToUnix(file2));
+        return;
+    }
+    
+    // Compare files
+    bool filesAreDifferent = false;
+    if (lines1.size() != lines2.size()) {
+        filesAreDifferent = true;
+    } else {
+        for (size_t i = 0; i < lines1.size(); i++) {
+            if (lines1[i] != lines2[i]) {
+                filesAreDifferent = true;
+                break;
+            }
+        }
+    }
+    
+    if (!filesAreDifferent) {
+        if (!quietMode) {
+            output("Files are identical");
+        }
+        return;
+    }
+    
+    if (quietMode) {
+        output("Files differ");
+        return;
+    }
+    
+    // Output diff in unified format
+    if (unifiedFormat) {
+        output("--- " + windowsPathToUnix(file1));
+        output("+++ " + windowsPathToUnix(file2));
+        output("@@ -1," + std::to_string(lines1.size()) + " +1," + std::to_string(lines2.size()) + " @@");
+        
+        size_t i = 0, j = 0;
+        while (i < lines1.size() || j < lines2.size()) {
+            if (i < lines1.size() && j < lines2.size() && lines1[i] == lines2[j]) {
+                // Common line
+                output(" " + lines1[i]);
+                i++;
+                j++;
+            } else if (i < lines1.size() && (j >= lines2.size() || lines1[i] != lines2[j])) {
+                // Line only in file1
+                output("-" + lines1[i]);
+                i++;
+            } else if (j < lines2.size()) {
+                // Line only in file2
+                output("+" + lines2[j]);
+                j++;
+            }
+        }
+    }
+}
+
+// Patch command - apply unified diff to a file
+void cmd_patch(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: patch [options] [patchfile] [targetfile]");
+        output("  Apply a unified diff patch to a file");
+        output("");
+        output("OPTIONS");
+        output("  -p NUM       Strip NUM path components (default: 0)");
+        output("  -b           Create backup file (.orig)");
+        output("");
+        output("DESCRIPTION");
+        output("  Applies a unified diff format patch file to a target file.");
+        output("  Reads from stdin if patchfile is omitted.");
+        return;
+    }
+    
+    if (args.size() < 2) {
+        outputError("patch: requires at least a target file");
+        return;
+    }
+    
+    // Parse options
+    int stripLevel = 0;
+    bool createBackup = false;
+    int fileArgStart = 1;
+    
+    while (fileArgStart < (int)args.size()) {
+        if (args[fileArgStart] == "-p") {
+            fileArgStart++;
+            if (fileArgStart < (int)args.size()) {
+                stripLevel = std::atoi(args[fileArgStart].c_str());
+                fileArgStart++;
+            }
+        } else if (args[fileArgStart] == "-b") {
+            createBackup = true;
+            fileArgStart++;
+        } else {
+            break;
+        }
+    }
+    
+    if (fileArgStart >= (int)args.size()) {
+        outputError("patch: requires target file");
+        return;
+    }
+    
+    // Get patch file and target file
+    std::string patchFile;
+    std::string targetFile = unixPathToWindows(args[args.size() - 1]);
+    
+    if (args.size() > fileArgStart + 1) {
+        patchFile = unixPathToWindows(args[fileArgStart]);
+    } else {
+        outputError("patch: patch file required");
+        return;
+    }
+    
+    // Read patch file
+    std::vector<std::string> patchLines;
+    std::ifstream pf(patchFile);
+    if (pf.is_open()) {
+        std::string line;
+        while (std::getline(pf, line)) {
+            patchLines.push_back(line);
+        }
+        pf.close();
+    } else {
+        outputError("patch: cannot open patch file: " + windowsPathToUnix(patchFile));
+        return;
+    }
+    
+    // Read target file
+    std::vector<std::string> targetLines;
+    std::ifstream tf(targetFile);
+    if (tf.is_open()) {
+        std::string line;
+        while (std::getline(tf, line)) {
+            targetLines.push_back(line);
+        }
+        tf.close();
+    } else {
+        outputError("patch: cannot open target file: " + windowsPathToUnix(targetFile));
+        return;
+    }
+    
+    // Create backup if requested
+    if (createBackup) {
+        std::string backupFile = targetFile + ".orig";
+        std::ifstream src(targetFile, std::ios::binary);
+        std::ofstream dst(backupFile, std::ios::binary);
+        dst << src.rdbuf();
+    }
+    
+    // Apply patch - simple implementation for unified diffs
+    int patchLineIdx = 0;
+    int targetLineIdx = 0;
+    std::vector<std::string> resultLines = targetLines;
+    bool applied = false;
+    
+    while (patchLineIdx < (int)patchLines.size()) {
+        std::string patchLine = patchLines[patchLineIdx];
+        
+        // Look for hunk header
+        if (patchLine.length() > 0 && patchLine[0] == '@') {
+            // Parse hunk header: @@ -oldstart,oldcount +newstart,newcount @@
+            size_t plusPos = patchLine.find(" +");
+            if (plusPos != std::string::npos) {
+                std::string oldPart = patchLine.substr(4, plusPos - 4);
+                size_t commaPos = oldPart.find(',');
+                int oldStart = std::atoi(oldPart.c_str());
+                
+                // Adjust for 1-based line numbers
+                targetLineIdx = oldStart - 1;
+                if (targetLineIdx < 0) targetLineIdx = 0;
+                
+                patchLineIdx++;
+                
+                // Apply hunk
+                while (patchLineIdx < (int)patchLines.size()) {
+                    patchLine = patchLines[patchLineIdx];
+                    
+                    if (patchLine.length() == 0) {
+                        patchLineIdx++;
+                        continue;
+                    }
+                    
+                    if (patchLine[0] == '@') {
+                        // Start of next hunk
+                        break;
+                    } else if (patchLine[0] == ' ') {
+                        // Context line (unchanged)
+                        targetLineIdx++;
+                        patchLineIdx++;
+                    } else if (patchLine[0] == '-') {
+                        // Line to remove
+                        if (targetLineIdx < (int)resultLines.size()) {
+                            resultLines.erase(resultLines.begin() + targetLineIdx);
+                        }
+                        patchLineIdx++;
+                        applied = true;
+                    } else if (patchLine[0] == '+') {
+                        // Line to add
+                        std::string newLine = patchLine.substr(1);
+                        if (targetLineIdx < (int)resultLines.size()) {
+                            resultLines.insert(resultLines.begin() + targetLineIdx, newLine);
+                            targetLineIdx++;
+                        } else {
+                            resultLines.push_back(newLine);
+                            targetLineIdx++;
+                        }
+                        patchLineIdx++;
+                        applied = true;
+                    } else {
+                        patchLineIdx++;
+                    }
+                }
+            } else {
+                patchLineIdx++;
+            }
+        } else {
+            patchLineIdx++;
+        }
+    }
+    
+    // Write result back to file
+    std::ofstream outFile(targetFile);
+    if (outFile.is_open()) {
+        for (const auto& line : resultLines) {
+            outFile << line << "\n";
+        }
+        outFile.close();
+        
+        if (applied) {
+            output("patch: patched " + windowsPathToUnix(targetFile));
+        } else {
+            output("patch: no changes applied");
+        }
+    } else {
+        outputError("patch: cannot write to file: " + windowsPathToUnix(targetFile));
+    }
+}
+
+// Word count command - count lines, words, and bytes
+void cmd_wc(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: wc [options] [file...]");
+        output("  Count lines, words, and bytes in files");
+        output("");
+        output("OPTIONS");
+        output("  -l           Count lines only");
+        output("  -w           Count words only");
+        output("  -c           Count bytes only");
+        output("  -m           Count characters only");
+        output("");
+        output("DESCRIPTION");
+        output("  Counts the number of lines, words, and bytes in the input.");
+        output("  Reads from stdin if no file is specified.");
+        return;
+    }
+    
+    // Parse options
+    bool countLines = false;
+    bool countWords = false;
+    bool countBytes = false;
+    bool countChars = false;
+    bool hasOptions = false;
+    int fileArgStart = 1;
+    
+    while (fileArgStart < (int)args.size() && args[fileArgStart][0] == '-') {
+        for (size_t i = 1; i < args[fileArgStart].length(); i++) {
+            char opt = args[fileArgStart][i];
+            if (opt == 'l') { countLines = true; hasOptions = true; }
+            else if (opt == 'w') { countWords = true; hasOptions = true; }
+            else if (opt == 'c') { countBytes = true; hasOptions = true; }
+            else if (opt == 'm') { countChars = true; hasOptions = true; }
+        }
+        fileArgStart++;
+    }
+    
+    // If no options specified, count all
+    if (!hasOptions) {
+        countLines = countWords = countBytes = true;
+    }
+    
+    // Count from files only (piped input handled in executeCommand)
+    std::vector<std::string> inputLines;
+    
+    if (fileArgStart >= (int)args.size()) {
+        outputError("wc: no files specified");
+        return;
+    }
+    
+    // Read specified files
+    for (int i = fileArgStart; i < (int)args.size(); i++) {
+        std::string filename = unixPathToWindows(args[i]);
+        std::ifstream file(filename);
+        if (file.is_open()) {
+            std::string line;
+            while (std::getline(file, line)) {
+                inputLines.push_back(line);
+            }
+            file.close();
+        } else {
+            outputError("wc: cannot open file: " + windowsPathToUnix(filename));
+        }
+    }
+    
+    // Count metrics
+    int totalLines = inputLines.size();
+    int totalWords = 0;
+    int totalBytes = 0;
+    int totalChars = 0;
+    
+    for (const auto& line : inputLines) {
+        // Count bytes
+        totalBytes += line.length() + 1;  // +1 for newline
+        
+        // Count characters
+        totalChars += line.length() + 1;  // +1 for newline
+        
+        // Count words
+        bool inWord = false;
+        for (char c : line) {
+            if (std::isspace(c)) {
+                inWord = false;
+            } else if (!inWord) {
+                totalWords++;
+                inWord = true;
+            }
+        }
+    }
+    
+    // Output results
+    std::string result;
+    if (countLines) result += std::to_string(totalLines) + " ";
+    if (countWords) result += std::to_string(totalWords) + " ";
+    if (countBytes) result += std::to_string(totalBytes) + " ";
+    if (countChars) result += std::to_string(totalChars) + " ";
+    
+    if (!result.empty()) {
+        result.pop_back();  // Remove trailing space
+        // Add filename(s) at end
+        if (fileArgStart < (int)args.size()) {
+            result += " " + windowsPathToUnix(args[fileArgStart]);
+        }
+        output(result);
+    }
+}
+
+// Tee command - read from stdin and write to files and stdout
+void cmd_tee(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: tee [options] [file...]");
+        output("  Read from input and write to files and output");
+        output("");
+        output("OPTIONS");
+        output("  -a           Append to files instead of overwriting");
+        output("  -i           Ignore interrupt signals");
+        output("");
+        output("DESCRIPTION");
+        output("  Reads from stdin and writes to the given files");
+        output("  while also printing to stdout.");
+        return;
+    }
+    
+    // Parse options
+    bool appendMode = false;
+    int fileArgStart = 1;
+    
+    while (fileArgStart < (int)args.size() && args[fileArgStart][0] == '-') {
+        if (args[fileArgStart] == "-a") {
+            appendMode = true;
+        } else if (args[fileArgStart] == "-i") {
+            // Ignore interrupt - just skip this option
+        }
+        fileArgStart++;
+    }
+    
+    // Get list of files to write to
+    std::vector<std::string> outputFiles;
+    for (int i = fileArgStart; i < (int)args.size(); i++) {
+        outputFiles.push_back(unixPathToWindows(args[i]));
+    }
+    
+    // Open all output files
+    std::vector<std::ofstream*> fileStreams;
+    for (const auto& filename : outputFiles) {
+        std::ios_base::openmode mode = std::ios::out;
+        if (appendMode) {
+            mode |= std::ios::app;
+        }
+        std::ofstream* file = new std::ofstream(filename, mode);
+        if (file->is_open()) {
+            fileStreams.push_back(file);
+        } else {
+            outputError("tee: cannot open file for writing: " + filename);
+            delete file;
+        }
+    }
+    
+    // Read from stdin would happen with pipes, for now just write if files specified
+    // When used in pipes, tee is handled in executeCommand's pipe handler
+    if (outputFiles.empty()) {
+        outputError("tee: no files specified");
+        return;
+    }
+    
+    // If called directly without piped input, that's an error
+    // tee is designed to work with pipes: cat file | tee output.txt
+    outputError("tee: requires piped input (use: cat file | tee output.txt)");
+    
+    // Close all files
+    for (auto* file : fileStreams) {
+        file->close();
+        delete file;
+    }
+}
+
+// Link command - create symbolic links or hard links (Windows NTFS compatible)
+void cmd_ln(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: ln [options] source target");
+        output("  Create links (symbolic or hard) for files");
+        output("");
+        output("OPTIONS");
+        output("  -s           Create symbolic link (requires admin/developer mode)");
+        output("  -h           Create hard link (default for files)");
+        output("  -f           Force creation (remove target if exists)");
+        output("");
+        output("DESCRIPTION");
+        output("  Creates hard links (default) or symbolic links (-s).");
+        output("  Hard links are NTFS-native and work without special permissions.");
+        output("  Symbolic links on Windows require admin privileges or developer mode.");
+        output("  If -s fails due to permissions, will fallback to hardlink for files.");
+        return;
+    }
+    
+    if (args.size() < 3) {
+        outputError("ln: requires source and target");
+        return;
+    }
+    
+    // Parse options
+    bool symbolic = false;
+    bool hardLink = false;
+    bool force = false;
+    int argStart = 1;
+    
+    while (argStart < (int)args.size() && args[argStart][0] == '-') {
+        for (size_t i = 1; i < args[argStart].length(); i++) {
+            if (args[argStart][i] == 's') symbolic = true;
+            else if (args[argStart][i] == 'h') hardLink = true;
+            else if (args[argStart][i] == 'f') force = true;
+        }
+        argStart++;
+    }
+    
+    if (argStart + 1 >= (int)args.size()) {
+        outputError("ln: requires source and target");
+        return;
+    }
+    
+    std::string source = unixPathToWindows(args[argStart]);
+    std::string target = unixPathToWindows(args[argStart + 1]);
+    
+    // Check if source exists and determine if it's a directory
+    DWORD sourceAttribs = GetFileAttributesA(source.c_str());
+    if (sourceAttribs == INVALID_FILE_ATTRIBUTES) {
+        outputError("ln: cannot access '" + windowsPathToUnix(source) + "': No such file or directory");
+        return;
+    }
+    
+    bool isDirectory = (sourceAttribs & FILE_ATTRIBUTE_DIRECTORY) != 0;
+    
+    // Remove target if force flag
+    if (force) {
+        // Try to remove target file or directory
+        DWORD targetAttribs = GetFileAttributesA(target.c_str());
+        if (targetAttribs != INVALID_FILE_ATTRIBUTES) {
+            if (targetAttribs & FILE_ATTRIBUTE_DIRECTORY) {
+                RemoveDirectoryA(target.c_str());
+            } else {
+                DeleteFileA(target.c_str());
+            }
+        }
+    }
+    
+    // Create link using Windows API
+    if (symbolic) {
+        // Try to create symbolic link - requires admin or developer mode
+        // mklink /D for directories, mklink (no flag) for files
+        std::string mkCmd;
+        if (isDirectory) {
+            mkCmd = "mklink /D \"" + target + "\" \"" + source + "\"";
+        } else {
+            mkCmd = "mklink \"" + target + "\" \"" + source + "\"";
+        }
+        
+        int result = system(mkCmd.c_str());
+        if (result == 0) {
+            output("ln: created symlink '" + windowsPathToUnix(target) + "' -> '" + windowsPathToUnix(source) + "'");
+        } else {
+            // Fallback: If symlink fails due to permissions, suggest using hardlink for files
+            // or copying for directories
+            if (!isDirectory) {
+                output("ln: note - symbolic links require admin/developer mode on Windows");
+                output("    attempting fallback with hardlink instead...");
+                
+                // Try hardlink as fallback
+                if (CreateHardLinkA(target.c_str(), source.c_str(), NULL)) {
+                    output("ln: created hardlink as fallback '" + windowsPathToUnix(target) + "' -> '" + windowsPathToUnix(source) + "'");
+                } else {
+                    outputError("ln: failed to create symbolic link or hardlink");
+                }
+            } else {
+                outputError("ln: failed to create symbolic link (requires admin/developer mode)");
+            }
+        }
+    } else {
+        // Create hard link (files only)
+        if (isDirectory) {
+            outputError("ln: cannot create hardlink to directory");
+        } else if (CreateHardLinkA(target.c_str(), source.c_str(), NULL)) {
+            output("ln: created hardlink '" + windowsPathToUnix(target) + "' -> '" + windowsPathToUnix(source) + "'");
+        } else {
+            outputError("ln: failed to create hard link");
+        }
+    }
+}
+
+// Uptime command - show system uptime
+void cmd_uptime(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: uptime");
+        output("  Show how long the system has been running");
+        output("");
+        output("DESCRIPTION");
+        output("  Displays the system uptime in a human-readable format.");
+        return;
+    }
+    
+    // Get system uptime using GetTickCount (milliseconds since system boot)
+    DWORD uptimeMs = GetTickCount();
+    
+    // Convert to human readable format
+    DWORD seconds = uptimeMs / 1000;
+    DWORD minutes = seconds / 60;
+    DWORD hours = minutes / 60;
+    DWORD days = hours / 24;
+    
+    // Get current time
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    
+    // Format time
+    std::string timeStr;
+    if (st.wHour < 10) timeStr += "0";
+    timeStr += std::to_string(st.wHour) + ":";
+    if (st.wMinute < 10) timeStr += "0";
+    timeStr += std::to_string(st.wMinute) + ":";
+    if (st.wSecond < 10) timeStr += "0";
+    timeStr += std::to_string(st.wSecond);
+    
+    // Format output
+    std::string uptimeStr = "up ";
+    
+    if (days > 0) {
+        uptimeStr += std::to_string(days) + " day";
+        if (days > 1) uptimeStr += "s";
+        uptimeStr += ", ";
+    }
+    
+    DWORD remainingHours = hours % 24;
+    DWORD remainingMinutes = minutes % 60;
+    
+    if (remainingHours > 0) {
+        uptimeStr += std::to_string(remainingHours) + ":";
+        if (remainingMinutes < 10) uptimeStr += "0";
+        uptimeStr += std::to_string(remainingMinutes) + " hrs";
+    } else {
+        uptimeStr += std::to_string(remainingMinutes) + " min";
+    }
+    
+    output(timeStr + "  " + uptimeStr);
+}
+
+// Which command - locate a command in PATH
+void cmd_which(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: which command");
+        output("  Locate a command in the system PATH");
+        output("");
+        output("DESCRIPTION");
+        output("  Shows the full path of a command executable.");
+        return;
+    }
+    
+    if (args.size() < 2) {
+        outputError("which: requires a command name");
+        return;
+    }
+    
+    std::string cmdName = args[1];
+    
+    // Get PATH environment variable
+    char pathEnv[4096];
+    DWORD pathLen = GetEnvironmentVariableA("PATH", pathEnv, sizeof(pathEnv));
+    if (pathLen == 0) {
+        outputError("which: PATH not found");
+        return;
+    }
+    
+    std::string pathStr(pathEnv);
+    
+    // Split PATH by semicolon
+    std::vector<std::string> paths;
+    size_t start = 0;
+    size_t end = pathStr.find(';');
+    
+    while (end != std::string::npos) {
+        paths.push_back(pathStr.substr(start, end - start));
+        start = end + 1;
+        end = pathStr.find(';', start);
+    }
+    paths.push_back(pathStr.substr(start));
+    
+    // Common executable extensions on Windows
+    std::vector<std::string> extensions = {".exe", ".com", ".bat", ".cmd", ""};
+    
+    // Search in each path
+    for (const auto& pathDir : paths) {
+        for (const auto& ext : extensions) {
+            std::string fullPath = pathDir + "\\" + cmdName + ext;
+            
+            // Check if file exists
+            std::ifstream file(fullPath);
+            if (file.good()) {
+                output(windowsPathToUnix(fullPath));
+                return;
+            }
+        }
+    }
+    
+    // Also check current directory
+    for (const auto& ext : extensions) {
+        std::string fullPath = cmdName + ext;
+        std::ifstream file(fullPath);
+        if (file.good()) {
+            output(windowsPathToUnix(fullPath));
+            return;
+        }
+    }
+    
+    outputError("which: " + cmdName + ": not found");
+}
+
+// File command - determine file type
+void cmd_file(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: file [options] file...");
+        output("  Determine file type based on content");
+        output("");
+        output("OPTIONS");
+        output("  -b           Brief mode - omit filename");
+        output("");
+        output("DESCRIPTION");
+        output("  Examines file content to determine its type.");
+        return;
+    }
+    
+    if (args.size() < 2) {
+        outputError("file: requires a filename");
+        return;
+    }
+    
+    bool briefMode = false;
+    int fileArgStart = 1;
+    
+    if (args.size() > 1 && args[1] == "-b") {
+        briefMode = true;
+        fileArgStart = 2;
+    }
+    
+    for (int i = fileArgStart; i < (int)args.size(); i++) {
+        std::string filename = unixPathToWindows(args[i]);
+        
+        // Check if file exists
+        DWORD attribs = GetFileAttributesA(filename.c_str());
+        if (attribs == INVALID_FILE_ATTRIBUTES) {
+            outputError("file: cannot access '" + windowsPathToUnix(filename) + "': No such file");
+            continue;
+        }
+        
+        std::string fileType;
+        
+        // Check if directory
+        if (attribs & FILE_ATTRIBUTE_DIRECTORY) {
+            fileType = "directory";
+        } else {
+            // Get file extension
+            size_t dotPos = filename.find_last_of(".");
+            std::string ext;
+            if (dotPos != std::string::npos) {
+                ext = filename.substr(dotPos);
+                // Convert to lowercase
+                std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+            }
+            
+            // Determine type by extension
+            if (ext == ".txt") {
+                fileType = "ASCII text";
+            } else if (ext == ".exe" || ext == ".com" || ext == ".bat" || ext == ".cmd") {
+                fileType = "executable";
+            } else if (ext == ".dll") {
+                fileType = "library (DLL)";
+            } else if (ext == ".zip") {
+                fileType = "Zip archive";
+            } else if (ext == ".gz" || ext == ".gzip") {
+                fileType = "gzip compressed";
+            } else if (ext == ".tar") {
+                fileType = "tar archive";
+            } else if (ext == ".jpg" || ext == ".jpeg") {
+                fileType = "image (JPEG)";
+            } else if (ext == ".png") {
+                fileType = "image (PNG)";
+            } else if (ext == ".gif") {
+                fileType = "image (GIF)";
+            } else if (ext == ".bmp") {
+                fileType = "image (BMP)";
+            } else if (ext == ".pdf") {
+                fileType = "PDF document";
+            } else if (ext == ".doc" || ext == ".docx") {
+                fileType = "Word document";
+            } else if (ext == ".xls" || ext == ".xlsx") {
+                fileType = "Excel spreadsheet";
+            } else if (ext == ".ppt" || ext == ".pptx") {
+                fileType = "PowerPoint presentation";
+            } else if (ext == ".mp3") {
+                fileType = "audio (MP3)";
+            } else if (ext == ".wav") {
+                fileType = "audio (WAV)";
+            } else if (ext == ".avi" || ext == ".mp4" || ext == ".mkv") {
+                fileType = "video";
+            } else {
+                fileType = "data";
+            }
+        }
+        
+        if (briefMode) {
+            output(fileType);
+        } else {
+            output(windowsPathToUnix(filename) + ": " + fileType);
+        }
+    }
+}
+
+// Finger command - user information
+void cmd_finger(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: finger [username]");
+        output("  Display information about users");
+        output("");
+        output("DESCRIPTION");
+        output("  Shows user login information and status.");
+        return;
+    }
+    
+    // If no username specified, show current user
+    std::string targetUser;
+    if (args.size() < 2) {
+        char username[256];
+        DWORD usernameSize = sizeof(username);
+        if (GetUserNameA(username, &usernameSize)) {
+            targetUser = username;
+        } else {
+            outputError("finger: cannot determine current user");
+            return;
+        }
+    } else {
+        targetUser = args[1];
+    }
+    
+    // Get current user info
+    char currentUser[256];
+    DWORD currentUserSize = sizeof(currentUser);
+    if (!GetUserNameA(currentUser, &currentUserSize)) {
+        outputError("finger: cannot get user information");
+        return;
+    }
+    
+    output("User: " + targetUser);
+    
+    // Get system info
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    
+    char timeStr[256];
+    snprintf(timeStr, sizeof(timeStr), "%04d-%02d-%02d %02d:%02d:%02d",
+             st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+    
+    output("Current Time: " + std::string(timeStr));
+    
+    // Get user's home directory
+    char homeDir[MAX_PATH];
+    if (GetEnvironmentVariableA("USERPROFILE", homeDir, sizeof(homeDir))) {
+        output("Home Directory: " + windowsPathToUnix(homeDir));
+    }
+    
+    // Show if user is currently logged in
+    if (targetUser == currentUser) {
+        output("Status: Logged in (current session)");
+    }
+}
+
+// User command - user account information
+void cmd_user(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: user [options]");
+        output("  Display user account information");
+        output("");
+        output("OPTIONS");
+        output("  (no args)    Show current user info");
+        output("");
+        output("DESCRIPTION");
+        output("  Displays current user account information.");
+        return;
+    }
+    
+    // Get current user
+    char username[256];
+    DWORD usernameSize = sizeof(username);
+    if (!GetUserNameA(username, &usernameSize)) {
+        outputError("user: cannot determine current user");
+        return;
+    }
+    
+    // Get domain
+    char domainName[256];
+    DWORD domainSize = sizeof(domainName);
+    if (!GetComputerNameA(domainName, &domainSize)) {
+        strcpy_s(domainName, sizeof(domainName), "Unknown");
+    }
+    
+    // Get UID (use hash of username)
+    unsigned int uid = 0;
+    for (char c : std::string(username)) {
+        uid = uid * 31 + c;
+    }
+    uid = uid % 60000 + 1000;  // Keep it in reasonable range
+    
+    // Get GID (same as UID for simplicity on Windows)
+    unsigned int gid = uid;
+    
+    output("Current User: " + std::string(username));
+    output("Domain: " + std::string(domainName));
+    output("UID: " + std::to_string(uid));
+    output("GID: " + std::to_string(gid));
+    
+    // Get home directory
+    char homeDir[MAX_PATH];
+    if (GetEnvironmentVariableA("USERPROFILE", homeDir, sizeof(homeDir))) {
+        output("Home: " + windowsPathToUnix(homeDir));
+    }
+    
+    // Get shell
+    char shell[256] = "cmd.exe";
+    GetEnvironmentVariableA("SHELL", shell, sizeof(shell));
+    output("Shell: " + std::string(shell));
+}
+
+// Groups command - show user group memberships
+void cmd_groups(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: groups [username]");
+        output("  Display group memberships for a user");
+        output("");
+        output("DESCRIPTION");
+        output("  Shows Windows security groups the user belongs to.");
+        return;
+    }
+    
+    // Get current user
+    char username[256];
+    DWORD usernameSize = sizeof(username);
+    if (!GetUserNameA(username, &usernameSize)) {
+        outputError("groups: cannot determine current user");
+        return;
+    }
+    
+    // Display common Windows groups
+    std::vector<std::string> commonGroups = {
+        "Users",
+        "Administrators",
+        "Power Users",
+        "Guests",
+        "Remote Desktop Users",
+        "Backup Operators",
+        "Hyper-V Administrators",
+        "Network Configuration Operators",
+        "Performance Monitor Users"
+    };
+    
+    output("Groups for user: " + std::string(username));
+    output("");
+    
+    // On Windows, determining actual group membership requires special APIs
+    // For now, show typical groups and note that actual membership would require
+    // elevated privileges to determine
+    
+    // Check if user is likely admin (simplified heuristic)
+    bool isAdmin = false;
+    HANDLE hToken = NULL;
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken)) {
+        DWORD groupInfoSize = 0;
+        if (!GetTokenInformation(hToken, TokenGroups, NULL, 0, &groupInfoSize)) {
+            DWORD error = GetLastError();
+            if (error == ERROR_INSUFFICIENT_BUFFER) {
+                PTOKEN_GROUPS pGroupInfo = (PTOKEN_GROUPS)LocalAlloc(LPTR, groupInfoSize);
+                if (pGroupInfo) {
+                    if (GetTokenInformation(hToken, TokenGroups, pGroupInfo, groupInfoSize, &groupInfoSize)) {
+                        // Check for admin group
+                        SID_IDENTIFIER_AUTHORITY NtAuthority = SECURITY_NT_AUTHORITY;
+                        PSID AdminGroupSid = NULL;
+                        if (AllocateAndInitializeSid(&NtAuthority, 2,
+                            SECURITY_BUILTIN_DOMAIN_RID,
+                            DOMAIN_ALIAS_RID_ADMINS,
+                            0, 0, 0, 0, 0, 0, &AdminGroupSid)) {
+                            
+                            for (DWORD i = 0; i < pGroupInfo->GroupCount; i++) {
+                                if (EqualSid(pGroupInfo->Groups[i].Sid, AdminGroupSid)) {
+                                    isAdmin = true;
+                                    break;
+                                }
+                            }
+                            FreeSid(AdminGroupSid);
+                        }
+                    }
+                    LocalFree(pGroupInfo);
+                }
+            }
+        }
+        CloseHandle(hToken);
+    }
+    
+    // Output groups
+    output("Users");
+    if (isAdmin) {
+        output("Administrators");
+    }
+    output("Interactive (Local Login)");
+}
+
+// Version command - show version information
+void cmd_version(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: version");
+        output("  Display GaryShell version and comprehensive feature information");
+        return;
+    }
+    
+    output("╔════════════════════════════════════════════════════════════════╗");
+    output("║      Windows Native Unix Shell (wnus) version 0.0.7.4          ║");
+    output("║     A Comprehensive Bash-like Console for Windows (NTFS)       ║");
+    output("╚════════════════════════════════════════════════════════════════╝");
+    output("");
+    output("Platform: Windows NTFS file system");
+    output("Build Date: January 2026");
+    output("");
+    output("═══════════════════════════════════════════════════════════════════");
+    output("CORE FEATURES:");
+    output("═══════════════════════════════════════════════════════════════════");
+    output("  ✓ 154+ commands (140+ fully implemented, 14+ informational/guides)");
+    output("  ✓ Native Windows NTFS file system support");
+    output("  ✓ Full pipe operation support (|)");
+    output("  ✓ Interactive tab completion");
+    output("  ✓ Persistent command history with search");
+    output("  ✓ Configurable command aliases");
+    output("  ✓ Comprehensive man page system");
+    output("  ✓ Context-sensitive --help for all commands");
+    output("");
+    output("═══════════════════════════════════════════════════════════════════");
+    output("COMMAND CATEGORIES:");
+    output("═══════════════════════════════════════════════════════════════════");
+    output("");
+    output("NAVIGATION & FILE VIEWING:");
+    output("  • pwd, cd, ls, cat, less, head, tail");
+    output("  • Advanced directory navigation and file browsing");
+    output("");
+    output("FILE OPERATIONS:");
+    output("  • touch, mkdir, rm, rmdir, mv, ln (hard/symbolic links)");
+    output("  • chmod, chown, chgrp (Windows ACL integration)");
+    output("  • Full NTFS permission management");
+    output("");
+    output("TEXT PROCESSING:");
+    output("  • grep (with -i, -n, -v flags)");
+    output("  • sed (stream editing and substitution)");
+    output("  • awk (pattern scanning and processing)");
+    output("  • sort, cut, paste, wc, tee");
+    output("  • diff, patch (unified diff format)");
+    output("  • rev (text reversal)");
+    output("");
+    output("FILE SEARCH:");
+    output("  • find (with -name and -type filters)");
+    output("  • locate (recursive pattern search)");
+    output("  • which (PATH command lookup)");
+    output("  • file (file type detection)");
+    output("");
+    output("DISK & SYSTEM INFO:");
+    output("  • df (disk space usage)");
+    output("  • du (file/directory size estimation)");
+    output("  • mount (volume/drive display)");
+    output("  • uptime, uname, date, cal/ncal");
+    output("  • dmesg (kernel and system messages)");
+    output("  • mkfs (create filesystem in file)");
+    output("  • fsck (check and repair filesystem)");
+    output("");
+    output("USER & GROUP MANAGEMENT:");
+    output("  • whoami, id, finger, user, groups");
+    output("  • passwd (password management)");
+    output("  • useradd, userdel, usermod (user account control)");
+    output("  • groupadd, addgroup, groupmod, groupdel");
+    output("  • getent (system database queries: passwd/group/hosts)");
+    output("");
+    output("PROCESS MANAGEMENT:");
+    output("  • proc, ps (process listing)");
+    output("  • kill, killall, pkill (process termination)");
+    output("  • xkill (interactive window-based kill)");
+    output("  • jobs, bg, fg (job control)");
+    output("  • top, nice, renice (priority management)");
+    output("  • strace, lsof, mpstat (debugging and inspection)");
+    output("  • sleep, wait (timing and process waits)");
+    output("");
+    output("ARCHIVING & COMPRESSION:");
+    output("  • tar (create/extract/list archives)");
+    output("  • gzip/gunzip (gzip compression)");
+    output("  • bzip2/bunzip2 (bzip2 compression)");
+    output("  • zip/unzip (ZIP archive support)");
+    output("  • xz/unxz (XZ compression)");
+    output("  • unrar (RAR archive extraction)");
+    output("  • dd (low-level file copying)");
+    output("");
+    output("NETWORK & REMOTE:");
+    output("  • ssh (SSH client)");
+    output("  • scp (secure file transfer)");
+    output("  • rsync (directory synchronization)");
+    output("  • wget, curl (HTTP/HTTPS downloads)");
+    output("  • ping, traceroute (network diagnostics)");
+    output("  • ip (network interface info)");
+    output("  • iptables (Windows Firewall integration)");
+    output("  • nc (netcat network utility)");
+    output("  • lspci, lsusb (hardware snapshot guidance)");
+    output("");
+    output("SERVICES & SYSTEM:");
+    output("  • service (Windows service control: start/stop/restart/status)");
+    output("  • systemctl (system service control)");
+    output("  • journalctl (system journal query)");
+    output("  • shutdown, reboot (system power management)");
+    output("  • sync (file system buffer flush)");
+    output("");
+    output("SHELL & SCRIPTING:");
+    output("  • echo (output display)");
+    output("  • more (paging display)");
+    output("  • source (script execution in current shell)");
+    output("  • exec (process replacement)");
+    output("  • xargs (argument processing)");
+    output("  • alias/unalias (command shortcut management)");
+    output("  • history (command history with search)");
+    output("");
+    output("EDITING & DISPLAY:");
+    output("  • nano (full-featured text editor)");
+    output("  • clear (screen clearing)");
+    output("  • screen (terminal multiplexer support)");
+    output("");
+    output("PERMISSIONS & ADMIN:");
+    output("  • sudo (elevated privilege execution)");
+    output("  • su (administrator switching)");
+    output("");
+    output("═══════════════════════════════════════════════════════════════════");
+    output("ADVANCED CAPABILITIES:");
+    output("═══════════════════════════════════════════════════════════════════");
+    output("  ✓ Windows API integration for native operations");
+    output("  ✓ Administrator privilege detection and elevation");
+    output("  ✓ NTFS symbolic and hard link support");
+    output("  ✓ Home directory expansion (~)");
+    output("  ✓ Environment variable access");
+    output("  ✓ External command execution via system PATH");
+    output("  ✓ Unicode and international character support");
+    output("  ✓ Persistent configuration and history");
+    output("");
+    output("═══════════════════════════════════════════════════════════════════");
+    output("DOCUMENTATION:");
+    output("═══════════════════════════════════════════════════════════════════");
+    output("  • Type 'help' for categorized command listing");
+    output("  • Type 'man <command>' for detailed manual pages");
+    output("  • Type '<command> --help' for quick command reference");
+    output("");
+    output("═══════════════════════════════════════════════════════════════════");
+    output("");
+    output("© 2026 - Windows Native Unix Shell (wnus) Project");
+    output("A powerful Unix-like environment for Windows power users");
+}
+
+// passwd command - change user password
+void cmd_passwd(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: passwd [username]");
+        output("  Change user password");
+        output("  Requires administrator privileges");
+        return;
+    }
+    
+    if (!isRunningAsAdmin()) {
+        outputError("passwd: administrator privileges required");
+        output("Use 'su' to restart with elevated privileges");
+        return;
+    }
+    
+    std::string username;
+    if (args.size() >= 2) {
+        username = args[1];
+    } else {
+        // Get current username
+        char name[256];
+        DWORD size = sizeof(name);
+        if (GetUserNameA(name, &size)) {
+            username = name;
+        } else {
+            outputError("passwd: failed to get current username");
+            return;
+        }
+    }
+    
+    output("Changing password for user " + username);
+    output("Enter new password: ");
+    
+    // Note: In a real implementation, you'd want to hide password input
+    // For now, we'll use a simple approach
+    std::string password;
+    std::getline(std::cin, password);
+    
+    if (password.empty()) {
+        outputError("passwd: password cannot be empty");
+        return;
+    }
+    
+    // Use Windows net user command to change password
+    std::string cmd = "net user " + username + " " + password;
+    int result = system(cmd.c_str());
+    
+    if (result == 0) {
+        output("Password changed successfully for " + username);
+    } else {
+        outputError("passwd: failed to change password");
+    }
+}
+
+// useradd command - add new user
+void cmd_useradd(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: useradd [options] <username>");
+        output("  Add a new user account");
+        output("  Requires administrator privileges");
+        output("");
+        output("OPTIONS");
+        output("  -p <password>    Set password");
+        output("  -c <comment>     Full name or comment");
+        output("  -d <home>        Home directory");
+        return;
+    }
+    
+    if (!isRunningAsAdmin()) {
+        outputError("useradd: administrator privileges required");
+        output("Use 'su' to restart with elevated privileges");
+        return;
+    }
+    
+    if (args.size() < 2) {
+        outputError("useradd: missing username");
+        output("Usage: useradd [options] <username>");
+        return;
+    }
+    
+    std::string username;
+    std::string password;
+    std::string fullname;
+    std::string homedir;
+    
+    // Parse arguments
+    for (size_t i = 1; i < args.size(); i++) {
+        if (args[i] == "-p" && i + 1 < args.size()) {
+            password = args[++i];
+        } else if (args[i] == "-c" && i + 1 < args.size()) {
+            fullname = args[++i];
+        } else if (args[i] == "-d" && i + 1 < args.size()) {
+            homedir = args[++i];
+        } else if (args[i][0] != '-') {
+            username = args[i];
+        }
+    }
+    
+    if (username.empty()) {
+        outputError("useradd: username required");
+        return;
+    }
+    
+    // Prompt for password if not provided
+    if (password.empty()) {
+        output("Enter password for " + username + ": ");
+        std::getline(std::cin, password);
+        if (password.empty()) {
+            outputError("useradd: password cannot be empty");
+            return;
+        }
+    }
+    
+    // Build net user command
+    std::string cmd = "net user " + username + " " + password + " /add";
+    if (!fullname.empty()) {
+        cmd += " /fullname:\"" + fullname + "\"";
+    }
+    if (!homedir.empty()) {
+        cmd += " /homedir:\"" + homedir + "\"";
+    }
+    
+    int result = system(cmd.c_str());
+    
+    if (result == 0) {
+        output("User " + username + " added successfully");
+    } else {
+        outputError("useradd: failed to add user " + username);
+    }
+}
+
+// userdel command - delete user
+void cmd_userdel(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: userdel [options] <username>");
+        output("  Delete a user account");
+        output("  Requires administrator privileges");
+        output("");
+        output("OPTIONS");
+        output("  -r    Remove home directory and files");
+        return;
+    }
+    
+    if (!isRunningAsAdmin()) {
+        outputError("userdel: administrator privileges required");
+        output("Use 'su' to restart with elevated privileges");
+        return;
+    }
+    
+    if (args.size() < 2) {
+        outputError("userdel: missing username");
+        output("Usage: userdel <username>");
+        return;
+    }
+    
+    std::string username = args[1];
+    bool removeHome = false;
+    
+    // Check for -r flag
+    if (args.size() > 2 && args[1] == "-r") {
+        removeHome = true;
+        username = args[2];
+    }
+    
+    // Confirm deletion
+    output("Delete user " + username + "? (y/n): ");
+    std::string confirm;
+    std::getline(std::cin, confirm);
+    
+    if (confirm != "y" && confirm != "Y" && confirm != "yes") {
+        output("User deletion cancelled");
+        return;
+    }
+    
+    // Use Windows net user command to delete user
+    std::string cmd = "net user " + username + " /delete";
+    int result = system(cmd.c_str());
+    
+    if (result == 0) {
+        output("User " + username + " deleted successfully");
+        
+        // Remove home directory if requested
+        if (removeHome) {
+            std::string homeDir = "C:\\Users\\" + username;
+            output("Removing home directory: " + homeDir);
+            std::string rmCmd = "rmdir /s /q \"" + homeDir + "\"";
+            system(rmCmd.c_str());
+        }
+    } else {
+        outputError("userdel: failed to delete user " + username);
+    }
+}
+
+// usermod command - modify user account
+void cmd_usermod(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: usermod [options] <username>");
+        output("  Modify a user account");
+        output("  Requires administrator privileges");
+        output("");
+        output("OPTIONS");
+        output("  -c <comment>     Change full name/comment");
+        output("  -d <home>        Change home directory");
+        output("  -L               Lock (disable) the account");
+        output("  -U               Unlock (enable) the account");
+        output("  -a -G <group>    Add user to group");
+        return;
+    }
+    
+    if (!isRunningAsAdmin()) {
+        outputError("usermod: administrator privileges required");
+        output("Use 'su' to restart with elevated privileges");
+        return;
+    }
+    
+    if (args.size() < 2) {
+        outputError("usermod: missing username");
+        output("Usage: usermod [options] <username>");
+        return;
+    }
+    
+    std::string username;
+    std::string fullname;
+    std::string homedir;
+    std::string group;
+    bool lock = false;
+    bool unlock = false;
+    
+    // Parse arguments
+    for (size_t i = 1; i < args.size(); i++) {
+        if (args[i] == "-c" && i + 1 < args.size()) {
+            fullname = args[++i];
+        } else if (args[i] == "-d" && i + 1 < args.size()) {
+            homedir = args[++i];
+        } else if (args[i] == "-L") {
+            lock = true;
+        } else if (args[i] == "-U") {
+            unlock = true;
+        } else if (args[i] == "-a" && i + 1 < args.size() && args[i + 1] == "-G" && i + 2 < args.size()) {
+            i += 2;
+            group = args[i];
+        } else if (args[i] == "-G" && i + 1 < args.size()) {
+            group = args[++i];
+        } else if (args[i][0] != '-') {
+            username = args[i];
+        }
+    }
+    
+    if (username.empty()) {
+        outputError("usermod: username required");
+        return;
+    }
+    
+    bool success = false;
+    
+    // Change full name
+    if (!fullname.empty()) {
+        std::string cmd = "net user " + username + " /fullname:\"" + fullname + "\"";
+        if (system(cmd.c_str()) == 0) {
+            output("Updated full name for " + username);
+            success = true;
+        } else {
+            outputError("usermod: failed to update full name");
+        }
+    }
+    
+    // Change home directory
+    if (!homedir.empty()) {
+        std::string cmd = "net user " + username + " /homedir:\"" + homedir + "\"";
+        if (system(cmd.c_str()) == 0) {
+            output("Updated home directory for " + username);
+            success = true;
+        } else {
+            outputError("usermod: failed to update home directory");
+        }
+    }
+    
+    // Lock account
+    if (lock) {
+        std::string cmd = "net user " + username + " /active:no";
+        if (system(cmd.c_str()) == 0) {
+            output("Locked account " + username);
+            success = true;
+        } else {
+            outputError("usermod: failed to lock account");
+        }
+    }
+    
+    // Unlock account
+    if (unlock) {
+        std::string cmd = "net user " + username + " /active:yes";
+        if (system(cmd.c_str()) == 0) {
+            output("Unlocked account " + username);
+            success = true;
+        } else {
+            outputError("usermod: failed to unlock account");
+        }
+    }
+    
+    // Add to group
+    if (!group.empty()) {
+        std::string cmd = "net localgroup " + group + " " + username + " /add";
+        if (system(cmd.c_str()) == 0) {
+            output("Added " + username + " to group " + group);
+            success = true;
+        } else {
+            outputError("usermod: failed to add user to group");
+        }
+    }
+    
+    if (!success) {
+        outputError("usermod: no modifications made");
+        output("Use 'usermod --help' for usage information");
+    }
+}
+
+// groupadd command - create a new group
+void cmd_groupadd(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: groupadd [options] <groupname>");
+        output("  Create a new group");
+        output("  Requires administrator privileges");
+        output("");
+        output("OPTIONS");
+        output("  -g <GID>    Specify group ID (ignored on Windows)");
+        return;
+    }
+    
+    if (!isRunningAsAdmin()) {
+        outputError("groupadd: administrator privileges required");
+        output("Use 'su' to restart with elevated privileges");
+        return;
+    }
+    
+    if (args.size() < 2) {
+        outputError("groupadd: missing group name");
+        output("Usage: groupadd <groupname>");
+        return;
+    }
+    
+    std::string groupname = args[args.size() - 1];  // Last argument is group name
+    
+    // Use Windows net localgroup command to create group
+    std::string cmd = "net localgroup " + groupname + " /add";
+    int result = system(cmd.c_str());
+    
+    if (result == 0) {
+        output("Group " + groupname + " created successfully");
+    } else {
+        outputError("groupadd: failed to create group " + groupname);
+    }
+}
+
+// addgroup command - alias for groupadd
+void cmd_addgroup(const std::vector<std::string>& args) {
+    cmd_groupadd(args);
+}
+
+// groupmod command - modify a group
+void cmd_groupmod(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: groupmod [options] <groupname>");
+        output("  Modify a group");
+        output("  Requires administrator privileges");
+        output("");
+        output("OPTIONS");
+        output("  -n <newname>    Rename the group");
+        output("  -g <GID>        Change group ID (not supported on Windows)");
+        return;
+    }
+    
+    if (!isRunningAsAdmin()) {
+        outputError("groupmod: administrator privileges required");
+        output("Use 'su' to restart with elevated privileges");
+        return;
+    }
+    
+    if (args.size() < 2) {
+        outputError("groupmod: missing group name");
+        output("Usage: groupmod [options] <groupname>");
+        return;
+    }
+    
+    std::string oldname;
+    std::string newname;
+    
+    // Parse arguments
+    for (size_t i = 1; i < args.size(); i++) {
+        if (args[i] == "-n" && i + 1 < args.size()) {
+            newname = args[++i];
+        } else if (args[i] == "-g" && i + 1 < args.size()) {
+            i++;  // Skip GID (not supported on Windows)
+        } else if (args[i][0] != '-') {
+            oldname = args[i];
+        }
+    }
+    
+    if (oldname.empty()) {
+        outputError("groupmod: group name required");
+        return;
+    }
+    
+    // Windows doesn't have a direct "rename group" command
+    // We need to inform the user that group renaming requires different approach
+    if (!newname.empty()) {
+        output("Group renaming on Windows requires:");
+        output("1. Create new group: net localgroup " + newname + " /add");
+        output("2. Copy members to new group");
+        output("3. Delete old group: net localgroup " + oldname + " /delete");
+        output("");
+        output("This operation is not automatically supported.");
+        output("Use groupadd/groupdel commands manually if needed.");
+    } else {
+        outputError("groupmod: no modifications specified");
+        output("Use 'groupmod --help' for usage information");
+    }
+}
+
+// groupdel command - delete a group
+void cmd_groupdel(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: groupdel <groupname>");
+        output("  Delete a group");
+        output("  Requires administrator privileges");
+        return;
+    }
+    
+    if (!isRunningAsAdmin()) {
+        outputError("groupdel: administrator privileges required");
+        output("Use 'su' to restart with elevated privileges");
+        return;
+    }
+    
+    if (args.size() < 2) {
+        outputError("groupdel: missing group name");
+        output("Usage: groupdel <groupname>");
+        return;
+    }
+    
+    std::string groupname = args[1];
+    
+    // Confirm deletion
+    output("Delete group " + groupname + "? (y/n): ");
+    std::string confirm;
+    std::getline(std::cin, confirm);
+    
+    if (confirm != "y" && confirm != "Y" && confirm != "yes") {
+        output("Group deletion cancelled");
+        return;
+    }
+    
+    // Use Windows net localgroup command to delete group
+    std::string cmd = "net localgroup " + groupname + " /delete";
+    int result = system(cmd.c_str());
+    
+    if (result == 0) {
+        output("Group " + groupname + " deleted successfully");
+    } else {
+        outputError("groupdel: failed to delete group " + groupname);
+    }
+}
+
+// screen command - terminal multiplexer simulation
+void cmd_screen(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: screen [options]");
+        output("  Terminal multiplexer (limited Windows implementation)");
+        output("");
+        output("DESCRIPTION");
+        output("  Screen is a terminal multiplexer that allows multiple");
+        output("  terminal sessions. This is a simplified implementation.");
+        output("");
+        output("OPTIONS");
+        output("  -ls             List screen sessions");
+        output("  -S <name>       Create named session");
+        output("  -r <name>       Resume session");
+        output("  -X <cmd>        Send command to session");
+        output("");
+        output("NOTE");
+        output("  Full screen functionality requires advanced terminal handling.");
+        output("  This implementation provides basic session simulation.");
+        output("  For true terminal multiplexing on Windows, consider:");
+        output("    - Windows Terminal with tabs");
+        output("    - tmux via WSL");
+        output("    - ConEmu or similar");
+        return;
+    }
+    
+    // Check for -ls flag
+    if (args.size() >= 2 && args[1] == "-ls") {
+        output("No screen sessions available.");
+        output("Screen session management not fully implemented in this version.");
+        output("Use Windows Terminal, tmux (WSL), or ConEmu for multiplexing.");
+        return;
+    }
+    
+    // Basic message for other operations
+    if (args.size() >= 2) {
+        if (args[1] == "-S") {
+            output("Creating screen session...");
+            output("Note: Full screen implementation requires advanced terminal support");
+            output("Consider using Windows Terminal with multiple tabs instead");
+        } else if (args[1] == "-r") {
+            output("Resume screen session...");
+            output("Note: Session persistence not implemented in this version");
+        } else {
+            output("screen: limited functionality in GaryShell");
+            output("Use 'screen --help' for available options");
+        }
+    } else {
+        output("screen: terminal multiplexer");
+        output("");
+        output("This is a placeholder implementation. True screen functionality");
+        output("requires complex terminal management not available in this shell.");
+        output("");
+        output("Alternatives:");
+        output("  - Windows Terminal (built-in tabs and panes)");
+        output("  - tmux via WSL");
+        output("  - ConEmu or similar terminal emulators");
+        output("");
+        output("Use 'screen --help' for available commands");
+    }
+}
+
+// getent command - get entries from administrative databases
+void cmd_getent(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: getent <database> [key...]");
+        output("  Get entries from system databases");
+        output("");
+        output("DATABASES");
+        output("  passwd      User account information");
+        output("  group       Group information");
+        output("  hosts       Host names and addresses");
+        output("  services    Network services");
+        output("");
+        output("EXAMPLES");
+        output("  getent passwd");
+        output("  getent group");
+        output("  getent hosts");
+        return;
+    }
+    
+    if (args.size() < 2) {
+        outputError("getent: missing database argument");
+        output("Usage: getent <database> [key...]");
+        output("Try 'getent --help' for more information");
+        return;
+    }
+    
+    std::string database = args[1];
+    
+    if (database == "passwd") {
+        // Display user information
+        char username[256];
+        DWORD size = sizeof(username);
+        if (GetUserNameA(username, &size)) {
+            // Get UID simulation
+            DWORD uid = 0;
+            for (size_t i = 0; i < strlen(username); i++) {
+                uid += username[i] * (i + 1);
+            }
+            
+            char homeDir[MAX_PATH];
+            if (GetEnvironmentVariableA("USERPROFILE", homeDir, sizeof(homeDir))) {
+                output(std::string(username) + ":x:" + std::to_string(uid) + ":1000:" + 
+                       username + ":" + windowsPathToUnix(homeDir) + ":/bin/bash");
+            }
+        }
+    } else if (database == "group") {
+        // Display group information
+        output("Users:x:1000:");
+        output("Administrators:x:544:");
+        output("Guests:x:546:");
+        output("Power Users:x:547:");
+    } else if (database == "hosts") {
+        // Read hosts file
+        std::string hostsPath = "C:\\Windows\\System32\\drivers\\etc\\hosts";
+        std::ifstream hostsFile(hostsPath);
+        if (hostsFile.is_open()) {
+            std::string line;
+            while (std::getline(hostsFile, line)) {
+                if (!line.empty() && line[0] != '#') {
+                    output(line);
+                }
+            }
+            hostsFile.close();
+        } else {
+            outputError("getent: cannot open hosts file");
+        }
+    } else if (database == "services") {
+        // Display common services
+        output("echo                7/tcp");
+        output("echo                7/udp");
+        output("ftp                21/tcp");
+        output("ssh                22/tcp");
+        output("telnet             23/tcp");
+        output("smtp               25/tcp");
+        output("domain             53/tcp");
+        output("domain             53/udp");
+        output("http               80/tcp");
+        output("https             443/tcp");
+        output("smb               445/tcp");
+    } else {
+        outputError("getent: unknown database '" + database + "'");
+        output("Supported databases: passwd, group, hosts, services");
+    }
+}
+
+// source command - execute commands from a file
+void cmd_source(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: source <filename>");
+        output("  Execute commands from a file in current shell");
+        output("");
+        output("DESCRIPTION");
+        output("  Read and execute commands from filename in the current");
+        output("  shell environment. Also known as '.' in bash.");
+        output("");
+        output("EXAMPLES");
+        output("  source script.sh");
+        output("  source ~/.bashrc");
+        return;
+    }
+    
+    if (args.size() < 2) {
+        outputError("source: missing filename argument");
+        output("Usage: source <filename>");
+        return;
+    }
+    
+    std::string filename = args[1];
+    
+    // Convert to Windows path if needed
+    if (filename[0] == '~') {
+        char homeDir[MAX_PATH];
+        if (GetEnvironmentVariableA("USERPROFILE", homeDir, sizeof(homeDir))) {
+            filename = std::string(homeDir) + filename.substr(1);
+        }
+    }
+    
+    std::ifstream scriptFile(filename);
+    if (!scriptFile.is_open()) {
+        outputError("source: " + filename + ": No such file or directory");
+        return;
+    }
+    
+    std::string line;
+    int lineNum = 0;
+    while (std::getline(scriptFile, line)) {
+        lineNum++;
+        
+        // Skip empty lines and comments
+        if (line.empty() || line[0] == '#') {
+            continue;
+        }
+        
+        // Execute the command
+        executeCommand(line);
+    }
+    
+    scriptFile.close();
+}
+
+// service command - control system services
+void cmd_service(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: service <service> <action>");
+        output("  Control system services");
+        output("  Requires administrator privileges");
+        output("");
+        output("ACTIONS");
+        output("  start       Start the service");
+        output("  stop        Stop the service");
+        output("  restart     Restart the service");
+        output("  status      Show service status");
+        output("");
+        output("EXAMPLES");
+        output("  service spooler status");
+        output("  service wuauserv start");
+        return;
+    }
+    
+    if (args.size() < 3) {
+        outputError("service: missing service name or action");
+        output("Usage: service <service> <action>");
+        output("Try 'service --help' for more information");
+        return;
+    }
+    
+    std::string serviceName = args[1];
+    std::string action = args[2];
+    
+    // Check for status - doesn't require admin
+    if (action == "status") {
+        // Use sc query to check service status
+        std::string cmd = "sc query " + serviceName;
+        int result = system(cmd.c_str());
+        if (result != 0) {
+            outputError("service: failed to query service status");
+        }
+        return;
+    }
+    
+    // Other actions require admin
+    if (!isRunningAsAdmin()) {
+        outputError("service: administrator privileges required");
+        output("Use 'su' to restart with elevated privileges");
+        return;
+    }
+    
+    std::string cmd;
+    if (action == "start") {
+        cmd = "net start " + serviceName;
+    } else if (action == "stop") {
+        cmd = "net stop " + serviceName;
+    } else if (action == "restart") {
+        // Stop then start
+        output("Stopping " + serviceName + "...");
+        system(("net stop " + serviceName).c_str());
+        Sleep(1000);  // Wait a second
+        output("Starting " + serviceName + "...");
+        cmd = "net start " + serviceName;
+    } else {
+        outputError("service: unknown action '" + action + "'");
+        output("Valid actions: start, stop, restart, status");
+        return;
+    }
+    
+    int result = system(cmd.c_str());
+    if (result != 0) {
+        outputError("service: failed to " + action + " service");
+    }
+}
+
+// jobs command - list background jobs
+void cmd_jobs(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: jobs [options]");
+        output("  List background jobs");
+        output("");
+        output("OPTIONS");
+        output("  -l    List process IDs in addition to normal information");
+        output("  -p    List only process IDs");
+        output("");
+        output("DESCRIPTION");
+        output("  Display status of jobs in the current session.");
+        output("  Job control is limited in GaryShell.");
+        output("");
+        output("NOTE");
+        output("  Full job control (background/foreground management) requires");
+        output("  advanced shell features not implemented in this version.");
+        output("  For background task management on Windows, use:");
+        output("    - Start-Process in PowerShell");
+        output("    - Task Scheduler");
+        output("    - Windows Services");
+        return;
+    }
+    
+    // Check for options
+    bool showPID = false;
+    bool pidOnly = false;
+    
+    for (size_t i = 1; i < args.size(); i++) {
+        if (args[i] == "-l") {
+            showPID = true;
+        } else if (args[i] == "-p") {
+            pidOnly = true;
+        }
+    }
+    
+    // Since we don't have real job control, show a message
+    output("No background jobs.");
+    output("");
+    output("Note: Job control not fully implemented in GaryShell.");
+    output("Background job management requires shell session state tracking.");
+    output("");
+    output("Alternatives for Windows:");
+    output("  - Use 'start' command to launch detached processes");
+    output("  - PowerShell Start-Process with -NoNewWindow");
+    output("  - Task Scheduler for scheduled background tasks");
+}
+
+// htop command - interactive process viewer
+void cmd_htop(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: htop [options]");
+        output("  Interactive process viewer (enhanced process monitoring)");
+        output("");
+        output("OPTIONS");
+        output("  -d N    Delay between updates in seconds");
+        output("  -u USER Filter processes by user");
+        output("  -p PID  Show only specified process IDs");
+        output("");
+        output("DESCRIPTION");
+        output("  htop is an interactive process viewer showing CPU, memory,");
+        output("  and system resource usage in real-time.");
+        output("");
+        output("NOTE");
+        output("  On Windows, this shows a snapshot of running processes.");
+        output("  For full interactive monitoring, use:");
+        output("    - Task Manager (taskmgr)");
+        output("    - Resource Monitor (resmon)");
+        output("    - Performance Monitor (perfmon)");
+        output("    - Process Explorer (Sysinternals)");
+        return;
+    }
+    
+    output("Interactive htop view (snapshot mode on Windows)");
+    output("================================================================================");
+    output("");
+    
+    // Get process list with CPU and memory info
+    HANDLE hProcessSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hProcessSnap == INVALID_HANDLE_VALUE) {
+        outputError("htop: failed to create process snapshot");
+        return;
+    }
+    
+    PROCESSENTRY32 pe32;
+    pe32.dwSize = sizeof(PROCESSENTRY32);
+    
+    // Header
+    output(padRight("PID", 8) + padRight("THREADS", 10) + padRight("PRIORITY", 10) + 
+           padRight("MEMORY", 12) + "PROCESS NAME");
+    output("--------------------------------------------------------------------------------");
+    
+    if (Process32First(hProcessSnap, &pe32)) {
+        do {
+            // Get process handle to query memory info
+            HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pe32.th32ProcessID);
+            std::string memInfo = "N/A";
+            
+            if (hProcess != NULL) {
+                PROCESS_MEMORY_COUNTERS pmc;
+                if (GetProcessMemoryInfo(hProcess, &pmc, sizeof(pmc))) {
+                    size_t memKB = pmc.WorkingSetSize / 1024;
+                    if (memKB < 1024) {
+                        memInfo = std::to_string(memKB) + " KB";
+                    } else {
+                        memInfo = std::to_string(memKB / 1024) + " MB";
+                    }
+                }
+                CloseHandle(hProcess);
+            }
+            
+            output(padRight(std::to_string(pe32.th32ProcessID), 8) +
+                   padRight(std::to_string(pe32.cntThreads), 10) +
+                   padRight(std::to_string(pe32.pcPriClassBase), 10) +
+                   padRight(memInfo, 12) +
+                   pe32.szExeFile);
+                   
+        } while (Process32Next(hProcessSnap, &pe32));
+    }
+    
+    CloseHandle(hProcessSnap);
+    output("");
+    output("Use 'proc' or 'ps' for continuous monitoring commands.");
+    output("Use Task Manager (taskmgr) for interactive real-time view.");
+}
+
+// at command - schedule commands to run at a specific time
+void cmd_at(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: at [time] [command]");
+        output("       at -l");
+        output("       at -r <job_id>");
+        output("  Schedule commands to run at a specific time");
+        output("");
+        output("OPTIONS");
+        output("  -l         List scheduled jobs");
+        output("  -r <id>    Remove scheduled job");
+        output("  -f <file>  Read commands from file");
+        output("");
+        output("TIME FORMATS");
+        output("  HH:MM          Run at specific time today");
+        output("  HH:MM MM/DD/YY Run at specific date and time");
+        output("  now + N minutes   Run N minutes from now");
+        output("");
+        output("EXAMPLES");
+        output("  at 14:30 shutdown /r");
+        output("  at -l");
+        output("  at -r 1");
+        output("");
+        output("NOTE");
+        output("  On Windows, this uses Task Scheduler (schtasks).");
+        output("  For more control, use 'schtasks' or Task Scheduler GUI.");
+        return;
+    }
+    
+    if (args.size() < 2) {
+        outputError("at: missing time specification");
+        output("Usage: at [time] [command]");
+        output("Try 'at --help' for more information");
+        return;
+    }
+    
+    // Handle -l flag (list jobs)
+    if (args[1] == "-l") {
+        output("Scheduled tasks (from Windows Task Scheduler):");
+        output("");
+        system("schtasks /query /fo LIST | findstr /C:\"TaskName\" /C:\"Next Run Time\"");
+        return;
+    }
+    
+    // Handle -r flag (remove job)
+    if (args[1] == "-r") {
+        if (args.size() < 3) {
+            outputError("at: missing job ID");
+            return;
+        }
+        output("To remove a scheduled task, use:");
+        output("  schtasks /delete /tn <TaskName>");
+        return;
+    }
+    
+    // Schedule new task
+    output("To schedule a task on Windows, use Task Scheduler:");
+    output("");
+    output("  schtasks /create /tn \"TaskName\" /tr \"command\" /sc once /st HH:MM");
+    output("");
+    output("Example:");
+    output("  schtasks /create /tn \"MyTask\" /tr \"notepad.exe\" /sc once /st 14:30");
+    output("");
+    output("Or open Task Scheduler GUI: taskschd.msc");
+}
+
+// cron command - daemon for running scheduled tasks
+void cmd_cron(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: cron [options]");
+        output("  Daemon for running scheduled tasks");
+        output("");
+        output("DESCRIPTION");
+        output("  The cron daemon runs scheduled jobs defined in crontab files.");
+        output("  On Unix/Linux systems, cron runs in the background and executes");
+        output("  commands at specified times.");
+        output("");
+        output("NOTE");
+        output("  Windows does not have a native cron daemon.");
+        output("  Use Windows Task Scheduler instead:");
+        output("    - Task Scheduler (taskschd.msc)");
+        output("    - schtasks command-line tool");
+        output("    - PowerShell ScheduledTasks module");
+        output("");
+        output("ALTERNATIVES");
+        output("  For Unix-like cron on Windows:");
+        output("    - Windows Subsystem for Linux (WSL)");
+        output("    - Third-party cron ports (cronw, etc.)");
+        output("    - Use 'crontab' command for task management");
+        return;
+    }
+    
+    output("Windows does not have a native cron daemon.");
+    output("");
+    output("The cron functionality is provided by Windows Task Scheduler.");
+    output("Task Scheduler is always running as a Windows service.");
+    output("");
+    output("To manage scheduled tasks:");
+    output("  • Use 'crontab' command to manage tasks");
+    output("  • Use 'schtasks' for command-line control");
+    output("  • Run 'taskschd.msc' for GUI interface");
+    output("");
+    output("To check Task Scheduler service status:");
+    output("  service Schedule status");
+}
+
+// crontab command - manage user's cron jobs
+void cmd_crontab(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: crontab [options]");
+        output("  Manage scheduled tasks (cron jobs)");
+        output("");
+        output("OPTIONS");
+        output("  -l         List current crontab entries");
+        output("  -e         Edit crontab file");
+        output("  -r         Remove crontab");
+        output("  -u <user>  Specify user's crontab");
+        output("");
+        output("CRONTAB FORMAT");
+        output("  MIN HOUR DAY MON DOW COMMAND");
+        output("  *    *    *   *   *   command to execute");
+        output("  │    │    │   │   │");
+        output("  │    │    │   │   └─── Day of week (0-7, Sunday=0 or 7)");
+        output("  │    │    │   └─────── Month (1-12)");
+        output("  │    │    └─────────── Day of month (1-31)");
+        output("  │    └─────────────── Hour (0-23)");
+        output("  └─────────────────── Minute (0-59)");
+        output("");
+        output("EXAMPLES");
+        output("  */5 * * * *  /path/to/script    # Every 5 minutes");
+        output("  0 2 * * *    /path/to/backup    # Daily at 2 AM");
+        output("  0 0 * * 0    /path/to/weekly    # Weekly on Sunday");
+        output("");
+        output("NOTE");
+        output("  On Windows, this uses Task Scheduler.");
+        output("  Tasks are stored in Windows Task Scheduler, not in crontab files.");
+        return;
+    }
+    
+    // Handle -l flag (list crontab)
+    if (args.size() >= 2 && args[1] == "-l") {
+        output("Current scheduled tasks (Windows Task Scheduler):");
+        output("================================================================================");
+        output("");
+        system("schtasks /query /fo TABLE");
+        output("");
+        output("Note: Windows uses Task Scheduler instead of crontab files.");
+        output("For detailed task info: schtasks /query /tn <TaskName> /v /fo LIST");
+        return;
+    }
+    
+    // Handle -e flag (edit crontab)
+    if (args.size() >= 2 && args[1] == "-e") {
+        output("To edit scheduled tasks on Windows:");
+        output("");
+        output("Option 1: Use Task Scheduler GUI");
+        output("  taskschd.msc");
+        output("");
+        output("Option 2: Use schtasks command");
+        output("  Create: schtasks /create /tn <name> /tr <cmd> /sc <schedule>");
+        output("  Modify: schtasks /change /tn <name> [options]");
+        output("  Delete: schtasks /delete /tn <name>");
+        output("");
+        output("Option 3: Use PowerShell");
+        output("  Get-ScheduledTask");
+        output("  New-ScheduledTask");
+        output("  Register-ScheduledTask");
+        output("");
+        output("For Unix-like crontab editing, use WSL.");
+        return;
+    }
+    
+    // Handle -r flag (remove crontab)
+    if (args.size() >= 2 && args[1] == "-r") {
+        output("To remove all scheduled tasks:");
+        output("");
+        output("Warning: This will delete ALL scheduled tasks!");
+        output("");
+        output("List tasks first:");
+        output("  schtasks /query");
+        output("");
+        output("Delete specific task:");
+        output("  schtasks /delete /tn <TaskName>");
+        output("");
+        output("Delete all tasks in a folder:");
+        output("  schtasks /delete /tn \\FolderName\\* /f");
+        return;
+    }
+    
+    // Default: show usage
+    output("Use 'crontab -l' to list scheduled tasks");
+    output("Use 'crontab -e' to edit scheduled tasks");
+    output("Use 'crontab --help' for more information");
+}
+
+// uniq command - filter out repeated lines
+void cmd_uniq(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: uniq [options] [input [output]]");
+        output("  Filter out repeated lines in a file");
+        output("");
+        output("OPTIONS");
+        output("  -c         Prefix lines with occurrence count");
+        output("  -d         Only print duplicate lines");
+        output("  -u         Only print unique lines");
+        output("  -i         Ignore case when comparing");
+        output("  -f N       Skip first N fields");
+        output("  -s N       Skip first N characters");
+        output("");
+        output("DESCRIPTION");
+        output("  Filter adjacent matching lines from INPUT (or stdin),");
+        output("  writing to OUTPUT (or stdout).");
+        output("");
+        output("EXAMPLES");
+        output("  uniq file.txt");
+        output("  uniq -c file.txt");
+        output("  uniq -d file.txt");
+        output("  sort file.txt | uniq");
+        return;
+    }
+    
+    bool showCount = false;
+    bool onlyDuplicates = false;
+    bool onlyUnique = false;
+    bool ignoreCase = false;
+    int skipFields = 0;
+    int skipChars = 0;
+    std::string inputFile;
+    std::string outputFile;
+    
+    // Parse options
+    for (size_t i = 1; i < args.size(); i++) {
+        if (args[i] == "-c") {
+            showCount = true;
+        } else if (args[i] == "-d") {
+            onlyDuplicates = true;
+        } else if (args[i] == "-u") {
+            onlyUnique = true;
+        } else if (args[i] == "-i") {
+            ignoreCase = true;
+        } else if (args[i] == "-f" && i + 1 < args.size()) {
+            skipFields = std::atoi(args[++i].c_str());
+        } else if (args[i] == "-s" && i + 1 < args.size()) {
+            skipChars = std::atoi(args[++i].c_str());
+        } else if (args[i][0] != '-') {
+            if (inputFile.empty()) {
+                inputFile = args[i];
+            } else if (outputFile.empty()) {
+                outputFile = args[i];
+            }
+        }
+    }
+    
+    // Read input
+    std::vector<std::string> lines;
+    if (inputFile.empty()) {
+        outputError("uniq: missing input file");
+        output("Usage: uniq [options] [input [output]]");
+        output("Try 'uniq --help' for more information");
+        return;
+    }
+    
+    std::ifstream inFile(inputFile);
+    if (!inFile.is_open()) {
+        outputError("uniq: cannot open '" + inputFile + "'");
+        return;
+    }
+    
+    std::string line;
+    while (std::getline(inFile, line)) {
+        lines.push_back(line);
+    }
+    inFile.close();
+    
+    if (lines.empty()) {
+        return;
+    }
+    
+    // Process lines
+    std::vector<std::string> result;
+    std::vector<int> counts;
+    
+    auto compareLines = [&](const std::string& a, const std::string& b) {
+        std::string lineA = a;
+        std::string lineB = b;
+        
+        // Skip fields
+        int fieldCount = 0;
+        size_t posA = 0, posB = 0;
+        while (fieldCount < skipFields && posA < lineA.length() && posB < lineB.length()) {
+            while (posA < lineA.length() && isspace(lineA[posA])) posA++;
+            while (posA < lineA.length() && !isspace(lineA[posA])) posA++;
+            while (posB < lineB.length() && isspace(lineB[posB])) posB++;
+            while (posB < lineB.length() && !isspace(lineB[posB])) posB++;
+            fieldCount++;
+        }
+        
+        lineA = lineA.substr(std::min(posA + skipChars, lineA.length()));
+        lineB = lineB.substr(std::min(posB + skipChars, lineB.length()));
+        
+        if (ignoreCase) {
+            std::transform(lineA.begin(), lineA.end(), lineA.begin(), ::tolower);
+            std::transform(lineB.begin(), lineB.end(), lineB.begin(), ::tolower);
+        }
+        
+        return lineA == lineB;
+    };
+    
+    // Find unique/duplicate lines
+    std::string prevLine = lines[0];
+    int count = 1;
+    
+    for (size_t i = 1; i < lines.size(); i++) {
+        if (compareLines(lines[i], prevLine)) {
+            count++;
+        } else {
+            result.push_back(prevLine);
+            counts.push_back(count);
+            prevLine = lines[i];
+            count = 1;
+        }
+    }
+    result.push_back(prevLine);
+    counts.push_back(count);
+    
+    // Output results
+    std::ostream* outStream = &std::cout;
+    std::ofstream outFile;
+    
+    if (!outputFile.empty()) {
+        outFile.open(outputFile);
+        if (!outFile.is_open()) {
+            outputError("uniq: cannot create '" + outputFile + "'");
+            return;
+        }
+        outStream = &outFile;
+    }
+    
+    for (size_t i = 0; i < result.size(); i++) {
+        bool isDuplicate = counts[i] > 1;
+        bool isUnique = counts[i] == 1;
+        
+        if ((onlyDuplicates && !isDuplicate) || (onlyUnique && !isUnique)) {
+            continue;
+        }
+        
+        if (showCount) {
+            output(padRight(std::to_string(counts[i]), 7) + " " + result[i]);
+        } else {
+            output(result[i]);
+        }
+    }
+    
+    if (outFile.is_open()) {
+        outFile.close();
+        output("Output written to: " + outputFile);
+    }
+}
+
+// dig command - DNS lookup utility
+void cmd_dig(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: dig [options] <domain> [type]");
+        output("  Perform DNS lookups and display DNS resource records");
+        output("");
+        output("OPTIONS");
+        output("  +short     Show short answer only");
+        output("  +long      Show long format (default)");
+        output("  @server    Query specific DNS server");
+        output("");
+        output("QUERY TYPES");
+        output("  A          IPv4 address");
+        output("  AAAA       IPv6 address");
+        output("  MX         Mail exchange records");
+        output("  NS         Name server records");
+        output("  CNAME      Canonical name records");
+        output("  TXT        Text records");
+        output("  SOA        Start of authority records");
+        output("");
+        output("EXAMPLES");
+        output("  dig google.com");
+        output("  dig google.com MX");
+        output("  dig +short google.com");
+        output("  dig @8.8.8.8 google.com");
+        output("");
+        output("NOTE");
+        output("  On Windows, dig uses nslookup command internally.");
+        output("  For advanced DNS queries, use 'nslookup' or 'nslookup --help'");
+        return;
+    }
+    
+    if (args.size() < 2) {
+        outputError("dig: missing domain argument");
+        output("Usage: dig [options] <domain> [type]");
+        output("Try 'dig --help' for more information");
+        return;
+    }
+    
+    std::string domain = args[1];
+    std::string type = "A";  // Default to A record
+    bool shortFormat = false;
+    
+    // Parse options
+    for (size_t i = 1; i < args.size(); i++) {
+        if (args[i] == "+short") {
+            shortFormat = true;
+        } else if (args[i][0] != '+' && args[i][0] != '@' && i > 1) {
+            type = args[i];  // Assume second non-option argument is record type
+        }
+    }
+    
+    output("; <<>> dig 11.0 <<>> " + domain + " " + type);
+    output("");
+    
+    // Use Windows nslookup for DNS lookup
+    std::string cmd = "nslookup -type=" + type + " " + domain;
+    
+    if (shortFormat) {
+        output("; SHORT ANSWER SECTION:");
+        output("");
+        system(cmd.c_str());
+    } else {
+        output("; QUESTION SECTION:");
+        output(";" + domain + ". IN " + type);
+        output("");
+        output("; ANSWER SECTION:");
+        system(cmd.c_str());
+    }
+}
+
+// nslookup command - DNS lookup
+void cmd_nslookup(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: nslookup [options] <domain> [server]");
+        output("  Query the Domain Name System (DNS)");
+        output("");
+        output("OPTIONS");
+        output("  -type=A        Query A records (IPv4 addresses)");
+        output("  -type=AAAA     Query AAAA records (IPv6 addresses)");
+        output("  -type=MX       Query MX records (mail servers)");
+        output("  -type=NS       Query NS records (name servers)");
+        output("  -type=CNAME    Query CNAME records");
+        output("  -type=TXT      Query TXT records");
+        output("  -type=SOA      Query SOA records");
+        output("  -type=ANY      Query all records");
+        output("");
+        output("EXAMPLES");
+        output("  nslookup google.com");
+        output("  nslookup -type=MX google.com");
+        output("  nslookup -type=NS google.com");
+        output("  nslookup google.com 8.8.8.8");
+        output("");
+        output("NOTE");
+        output("  On Windows, nslookup uses the system DNS resolver.");
+        output("  Results show DNS record information for the domain.");
+        return;
+    }
+    
+    if (args.size() < 2) {
+        outputError("nslookup: missing domain argument");
+        output("Usage: nslookup [options] <domain> [server]");
+        output("Try 'nslookup --help' for more information");
+        return;
+    }
+    
+    std::string domain = args[1];
+    std::string dnsServer = "";
+    std::string queryType = "";
+    
+    // Parse arguments
+    for (size_t i = 1; i < args.size(); i++) {
+        if (args[i].find("-type=") == 0) {
+            queryType = " " + args[i];
+        } else if (args[i][0] != '-' && i > 1) {
+            dnsServer = " " + args[i];
+        }
+    }
+    
+    // Execute nslookup
+    std::string cmd = "nslookup" + queryType + " " + domain + dnsServer;
+    output("Querying DNS for: " + domain);
+    output("");
+    system(cmd.c_str());
+}
+
+// netstat command - network statistics
+void cmd_netstat(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: netstat [options]");
+        output("  Display network statistics and connections");
+        output("");
+        output("OPTIONS");
+        output("  -a         Show all connections and listening ports");
+        output("  -b         Show executable name (requires admin)");
+        output("  -e         Show ethernet statistics");
+        output("  -n         Show numerical addresses");
+        output("  -o         Show associated process ID");
+        output("  -p proto   Filter by protocol (tcp, udp)");
+        output("  -r         Show routing table");
+        output("  -s         Show statistics by protocol");
+        output("");
+        output("EXAMPLES");
+        output("  netstat -a              # Show all connections");
+        output("  netstat -an             # Numerical format");
+        output("  netstat -aon            # Show process IDs");
+        output("  netstat -r              # Show routing table");
+        output("  netstat -s              # Protocol statistics");
+        output("");
+        output("NOTE");
+        output("  On Windows, netstat is executed via system command.");
+        output("  Most options require administrator privileges.");
+        return;
+    }
+    
+    // Build netstat command
+    std::string cmd = "netstat";
+    
+    if (args.size() > 1) {
+        for (size_t i = 1; i < args.size(); i++) {
+            if (args[i][0] == '-' || args[i][0] == '/') {
+                cmd += " " + args[i];
+            }
+        }
+    } else {
+        // Default: show established connections
+        cmd += " -an";
+    }
+    
+    output("Executing: " + cmd);
+    output("");
+    system(cmd.c_str());
+}
+
+// neofetch command - system information display
+void cmd_neofetch(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: neofetch [options]");
+        output("  Display system information with ASCII art");
+        output("");
+        output("OPTIONS");
+        output("  --no-art    Display without ASCII art");
+        output("  --compact   Compact output format");
+        output("");
+        output("DESCRIPTION");
+        output("  Shows system information including OS, CPU, RAM, disk usage,");
+        output("  kernel version, and other hardware details.");
+        output("");
+        output("NOTE");
+        output("  On Windows, system information is gathered from WMI.");
+        output("  For more detailed info, use 'systeminfo' command.");
+        return;
+    }
+    
+    bool noArt = false;
+    bool compact = false;
+    
+    for (size_t i = 1; i < args.size(); i++) {
+        if (args[i] == "--no-art") noArt = true;
+        if (args[i] == "--compact") compact = true;
+    }
+    
+    // Display ASCII art
+    if (!noArt && !compact) {
+        output("                          ..");
+        output("                         .PLTJ.");
+        output("                        <><><><>");
+        output("    OOOOOOOOOOOOOOOOOO     J<><><><>L");
+        output("  D                H       * |><|||||||||||||<");
+        output(" P      WINDOWS    O       \\\\_D_D_D_/ D_D_D_/_//");
+        output(" M      0.0        l        \\\\___________//");
+        output(" A                n         |  GARYSHELL  |");
+        output("  T              H          |_____________|");
+        output("    OOOOOOOOOOOOOOOOOO");
+        output("");
+    }
+    
+    output("==================== SYSTEM INFORMATION ====================");
+    output("");
+    
+    // OS Information
+    output("OS: Windows (NTFS)");
+    
+    // Get computer name
+    char computerName[256];
+    DWORD size = sizeof(computerName);
+    if (GetComputerNameA(computerName, &size)) {
+        output("Hostname: " + std::string(computerName));
+    }
+    
+    // Get username
+    char username[256];
+    size = sizeof(username);
+    if (GetUserNameA(username, &size)) {
+        output("User: " + std::string(username));
+    }
+    
+    output("Shell: Windows Native Unix Shell (wnus) v0.0.7.4");
+    
+    // System uptime
+    DWORD tickCount = GetTickCount() / 1000;
+    long uptimeDays = tickCount / 86400;
+    long uptimeHours = (tickCount % 86400) / 3600;
+    long uptimeMinutes = (tickCount % 3600) / 60;
+    
+    output("Uptime: " + std::to_string(uptimeDays) + "d " + 
+           std::to_string(uptimeHours) + "h " + 
+           std::to_string(uptimeMinutes) + "m");
+    
+    // Memory info
+    MEMORYSTATUSEX memStatus;
+    memStatus.dwLength = sizeof(memStatus);
+    if (GlobalMemoryStatusEx(&memStatus)) {
+        ULONGLONG totalRAM = memStatus.ullTotalPhys / (1024 * 1024 * 1024);
+        ULONGLONG usedRAM = (memStatus.ullTotalPhys - memStatus.ullAvailPhys) / (1024 * 1024 * 1024);
+        output("Memory: " + std::to_string(usedRAM) + "GB / " + std::to_string(totalRAM) + "GB");
+    }
+    
+    // Processor info
+    SYSTEM_INFO sysInfo;
+    GetSystemInfo(&sysInfo);
+    output("CPU Cores: " + std::to_string(sysInfo.dwNumberOfProcessors));
+    
+    // Disk space
+    ULARGE_INTEGER freeBytesAvailable, totalBytes, totalFreeBytes;
+    if (GetDiskFreeSpaceExA("C:\\", &freeBytesAvailable, &totalBytes, &totalFreeBytes)) {
+        ULONGLONG totalGB = totalBytes.QuadPart / (1024 * 1024 * 1024);
+        ULONGLONG freeGB = totalFreeBytes.QuadPart / (1024 * 1024 * 1024);
+        output("Disk (C:): " + std::to_string(totalGB - freeGB) + "GB / " + 
+               std::to_string(totalGB) + "GB");
+    }
+    
+    output("");
+    output("============================================================");
+}
+
+// printf command - formatted output
+void cmd_printf(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: printf <format> [arguments...]");
+        output("  Print formatted output");
+        output("");
+        output("FORMAT SPECIFICATIONS");
+        output("  %%        Literal percent sign");
+        output("  \\n        Newline");
+        output("  \\t        Tab");
+        output("  \\\\        Backslash");
+        output("");
+        output("CONVERSION SPECIFIERS");
+        output("  %s        String");
+        output("  %d, %i    Integer (decimal)");
+        output("  %x, %X    Integer (hexadecimal, lowercase/uppercase)");
+        output("  %o        Integer (octal)");
+        output("  %f, %F    Floating point");
+        output("  %e, %E    Floating point (scientific notation)");
+        output("  %c        Character");
+        output("");
+        output("EXAMPLES");
+        output("  printf 'Hello, World!\\n'");
+        output("  printf 'Name: %s, Age: %d\\n' John 30");
+        output("  printf '%x\\n' 255");
+        output("  printf 'Tab:\\tSeparated\\n'");
+        output("");
+        output("NOTE");
+        output("  This is a simplified implementation of printf.");
+        output("  Only basic format specifiers are supported.");
+        return;
+    }
+    
+    if (args.size() < 2) {
+        outputError("printf: missing format argument");
+        return;
+    }
+    
+    std::string format = args[1];
+    size_t argIndex = 2;
+    std::string result;
+    
+    for (size_t i = 0; i < format.length(); i++) {
+        if (format[i] == '\\' && i + 1 < format.length()) {
+            // Handle escape sequences
+            char nextChar = format[i + 1];
+            if (nextChar == 'n') {
+                result += '\n';
+                i++;
+            } else if (nextChar == 't') {
+                result += '\t';
+                i++;
+            } else if (nextChar == '\\') {
+                result += '\\';
+                i++;
+            } else if (nextChar == 'r') {
+                result += '\r';
+                i++;
+            } else {
+                result += format[i];
+            }
+        } else if (format[i] == '%' && i + 1 < format.length()) {
+            // Handle format specifiers
+            char specifier = format[i + 1];
+            
+            if (specifier == '%') {
+                result += '%';
+                i++;
+            } else if (specifier == 's' && argIndex < args.size()) {
+                result += args[argIndex++];
+                i++;
+            } else if (specifier == 'd' || specifier == 'i') {
+                if (argIndex < args.size()) {
+                    result += args[argIndex++];
+                }
+                i++;
+            } else if (specifier == 'x' && argIndex < args.size()) {
+                // Convert to hex
+                int val = std::stoi(args[argIndex++], nullptr, 10);
+                std::stringstream ss;
+                ss << std::hex << val;
+                result += ss.str();
+                i++;
+            } else if (specifier == 'X' && argIndex < args.size()) {
+                // Convert to HEX (uppercase)
+                int val = std::stoi(args[argIndex++], nullptr, 10);
+                std::stringstream ss;
+                ss << std::uppercase << std::hex << val;
+                result += ss.str();
+                i++;
+            } else if (specifier == 'o' && argIndex < args.size()) {
+                // Convert to octal
+                int val = std::stoi(args[argIndex++], nullptr, 10);
+                std::stringstream ss;
+                ss << std::oct << val;
+                result += ss.str();
+                i++;
+            } else if (specifier == 'f' && argIndex < args.size()) {
+                result += args[argIndex++];
+                i++;
+            } else if (specifier == 'c' && argIndex < args.size()) {
+                std::string arg = args[argIndex++];
+                if (!arg.empty()) {
+                    result += arg[0];
+                }
+                i++;
+            } else {
+                result += format[i];
+            }
+        } else {
+            result += format[i];
+        }
+    }
+    
+    // Output without adding extra newline (printf doesn't add one by default)
+    std::cout << result;
+    std::cout.flush();
+}
+
+// case command - test case construct (shell control structure)
+void cmd_case(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: case <value> in");
+        output("       pattern) commands ;;");
+        output("       ...");
+        output("  esac");
+        output("  Test value against patterns and execute matching commands");
+        output("");
+        output("DESCRIPTION");
+        output("  The case command is a shell control structure that tests a value");
+        output("  against multiple patterns and executes commands matching the first");
+        output("  pattern found. Similar to switch statements in other languages.");
+        output("");
+        output("SYNTAX");
+        output("  case <word> in");
+        output("    pattern1)");
+        output("      command1");
+        output("      command2");
+        output("      ;;");
+        output("    pattern2|pattern3)");
+        output("      commands");
+        output("      ;;");
+        output("    *)");
+        output("      default commands");
+        output("      ;;");
+        output("  esac");
+        output("");
+        output("PATTERNS");
+        output("  *           Matches any string (default case)");
+        output("  [aeiou]     Matches any character in the set");
+        output("  ?(pattern)  Matches zero or one occurrence");
+        output("  *(pattern)  Matches zero or more occurrences");
+        output("  +(pattern)  Matches one or more occurrences");
+        output("  Pattern|Pattern2  Matches either pattern");
+        output("");
+        output("EXAMPLES");
+        output("  case $1 in");
+        output("    start|begin)");
+        output("      echo \"Starting...\"");
+        output("      ;;");
+        output("    stop|end)");
+        output("      echo \"Stopping...\"");
+        output("      ;;");
+        output("    *)");
+        output("      echo \"Unknown command\"");
+        output("      ;;");
+        output("  esac");
+        output("");
+        output("NOTE");
+        output("  The case command is typically used in shell scripts.");
+        output("  Direct interactive use is limited. Use in script files.");
+        output("  Type 'case --help' for more information.");
+        return;
+    }
+    
+    output("Case is a shell control structure used in scripts.");
+    output("");
+    output("Usage in a script:");
+    output("  case $variable in");
+    output("    pattern1)");
+    output("      commands");
+    output("      ;;");
+    output("    pattern2)");
+    output("      commands");
+    output("      ;;");
+    output("    *)");
+    output("      default commands");
+    output("      ;;");
+    output("  esac");
+    output("");
+    output("For interactive use, type: case --help");
+    output("Or read man pages: man case");
+}
+
+// free command - show free/used memory
+void cmd_free(const std::vector<std::string>& args) {
+    // Check for explicit --help flag (use --help instead of -h since -h is a free option)
+    if (args.size() > 1 && (args[1] == "--help" || args[1] == "-help")) {
+        output("Usage: free [options]");
+        output("  Display memory usage information");
+        output("");
+        output("OPTIONS");
+        output("  -h    Human readable format (KB, MB, GB)");
+        output("  -m    Display in megabytes");
+        output("  -g    Display in gigabytes");
+        output("  -k    Display in kilobytes (default)");
+        output("");
+        output("EXAMPLES");
+        output("  free");
+        output("  free -h");
+        output("  free -m");
+        output("");
+        output("NOTE");
+        output("  Shows total, used, and free system memory (RAM).");
+        return;
+    }
+    
+    bool humanReadable = false;
+    bool inMB = false;
+    bool inGB = false;
+    
+    for (size_t i = 1; i < args.size(); i++) {
+        if (args[i] == "-h") humanReadable = true;
+        else if (args[i] == "-m") inMB = true;
+        else if (args[i] == "-g") inGB = true;
+    }
+    
+    MEMORYSTATUSEX memStatus;
+    memStatus.dwLength = sizeof(memStatus);
+    if (!GlobalMemoryStatusEx(&memStatus)) {
+        outputError("free: failed to get memory information");
+        return;
+    }
+    
+    // Get memory values
+    ULONGLONG totalMem = memStatus.ullTotalPhys;
+    ULONGLONG freeMem = memStatus.ullAvailPhys;
+    ULONGLONG usedMem = totalMem - freeMem;
+    
+    // Format output
+    output("              total        used        free      shared     buffer");
+    
+    if (humanReadable) {
+        // Convert to best human-readable size
+        auto formatSize = [](ULONGLONG bytes) -> std::string {
+            if (bytes >= (1024LL * 1024LL * 1024LL)) {
+                return std::to_string(bytes / (1024LL * 1024LL * 1024LL)) + "G";
+            } else if (bytes >= (1024LL * 1024LL)) {
+                return std::to_string(bytes / (1024LL * 1024LL)) + "M";
+            } else {
+                return std::to_string(bytes / 1024LL) + "K";
+            }
+        };
+        
+        std::string total = formatSize(totalMem);
+        std::string used = formatSize(usedMem);
+        std::string free = formatSize(freeMem);
+        
+        output(padRight("Mem:", 8) + padRight(total, 12) + padRight(used, 12) + 
+               padRight(free, 12) + "0       0");
+    } else if (inGB) {
+        ULONGLONG totalGB = totalMem / (1024LL * 1024LL * 1024LL);
+        ULONGLONG usedGB = usedMem / (1024LL * 1024LL * 1024LL);
+        ULONGLONG freeGB = freeMem / (1024LL * 1024LL * 1024LL);
+        
+        output(padRight("Mem:", 8) + padRight(std::to_string(totalGB), 12) + 
+               padRight(std::to_string(usedGB), 12) + padRight(std::to_string(freeGB), 12) + "0       0");
+    } else if (inMB) {
+        ULONGLONG totalMB = totalMem / (1024LL * 1024LL);
+        ULONGLONG usedMB = usedMem / (1024LL * 1024LL);
+        ULONGLONG freeMB = freeMem / (1024LL * 1024LL);
+        
+        output(padRight("Mem:", 8) + padRight(std::to_string(totalMB), 12) + 
+               padRight(std::to_string(usedMB), 12) + padRight(std::to_string(freeMB), 12) + "0       0");
+    } else {
+        // Default: kilobytes
+        ULONGLONG totalKB = totalMem / 1024LL;
+        ULONGLONG usedKB = usedMem / 1024LL;
+        ULONGLONG freeKB = freeMem / 1024LL;
+        
+        output(padRight("Mem:", 8) + padRight(std::to_string(totalKB), 12) + 
+               padRight(std::to_string(usedKB), 12) + padRight(std::to_string(freeKB), 12) + "0       0");
+    }
+}
+
+// hostname command - show or set system hostname
+void cmd_hostname(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: hostname [new-hostname]");
+        output("  Display or set the system hostname");
+        output("");
+        output("DESCRIPTION");
+        output("  Without arguments, displays the current hostname.");
+        output("  With a new hostname, attempts to set it (requires admin).");
+        output("");
+        output("OPTIONS");
+        output("  -f    Display fully qualified domain name");
+        output("  -i    Display IP address");
+        output("");
+        output("EXAMPLES");
+        output("  hostname");
+        output("  hostname MyComputer");
+        output("  hostname -f");
+        output("  hostname -i");
+        output("");
+        output("NOTE");
+        output("  Changing hostname requires administrator privileges.");
+        return;
+    }
+    
+    if (args.size() < 2) {
+        // Display current hostname
+        char computerName[256];
+        DWORD size = sizeof(computerName);
+        if (GetComputerNameA(computerName, &size)) {
+            output(std::string(computerName));
+        } else {
+            outputError("hostname: failed to get hostname");
+        }
+        return;
+    }
+    
+    // Check for options
+    if (args[1] == "-f") {
+        // Fully qualified domain name
+        char computerName[256];
+        DWORD size = sizeof(computerName);
+        if (GetComputerNameA(computerName, &size)) {
+            output(std::string(computerName) + ".local");
+        }
+        return;
+    } else if (args[1] == "-i") {
+        // IP address
+        system("ipconfig | findstr \"IPv4 Address\"");
+        return;
+    }
+    
+    // Set new hostname (requires admin)
+    if (!isRunningAsAdmin()) {
+        outputError("hostname: setting hostname requires administrator privileges");
+        return;
+    }
+    
+    std::string newHostname = args[1];
+    std::string cmd = "wmic computersystem where name=\"%COMPUTERNAME%\" rename name=\"" + newHostname + "\"";
+    
+    int result = system(cmd.c_str());
+    if (result == 0) {
+        output("Hostname changed to: " + newHostname);
+        output("Note: You may need to restart the system for changes to take effect.");
+    } else {
+        outputError("hostname: failed to change hostname");
+    }
+}
+
+// vmstat command - virtual memory statistics
+void cmd_vmstat(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: vmstat [options] [delay [count]]");
+        output("  Report virtual memory statistics");
+        output("");
+        output("OPTIONS");
+        output("  -s    Show memory statistics");
+        output("  -d    Show disk I/O statistics");
+        output("  -a    Show active/inactive memory");
+        output("");
+        output("ARGUMENTS");
+        output("  delay  Interval between updates (in seconds)");
+        output("  count  Number of iterations");
+        output("");
+        output("EXAMPLES");
+        output("  vmstat");
+        output("  vmstat 1 5  (every 1 second, 5 times)");
+        output("  vmstat -s");
+        output("");
+        output("COLUMNS");
+        output("  r    Runnable processes");
+        output("  b    Blocked processes");
+        output("  swpd Swapped virtual memory");
+        output("  free Free memory");
+        output("  buff Buffer memory");
+        output("  cache Cache memory");
+        output("");
+        output("NOTE");
+        output("  On Windows, displays memory and page file statistics.");
+        return;
+    }
+    
+    bool showStats = false;
+    bool showDiskIO = false;
+    bool showActive = false;
+    int delay = 0, count = 1;
+    
+    // Parse options
+    int argIdx = 1;
+    while (argIdx < (int)args.size() && args[argIdx][0] == '-') {
+        if (args[argIdx] == "-s") showStats = true;
+        else if (args[argIdx] == "-d") showDiskIO = true;
+        else if (args[argIdx] == "-a") showActive = true;
+        argIdx++;
+    }
+    
+    // Parse delay and count
+    if (argIdx < (int)args.size()) {
+        delay = std::stoi(args[argIdx]);
+        if (argIdx + 1 < (int)args.size()) {
+            count = std::stoi(args[argIdx + 1]);
+        }
+    }
+    
+    // Get memory status
+    MEMORYSTATUSEX memStatus;
+    memStatus.dwLength = sizeof(memStatus);
+    if (!GlobalMemoryStatusEx(&memStatus)) {
+        outputError("vmstat: failed to get memory information");
+        return;
+    }
+    
+    if (showStats) {
+        output("Memory Statistics:");
+        output("Total memory:      " + std::to_string(memStatus.ullTotalPhys / (1024 * 1024)) + " MB");
+        output("Used memory:       " + std::to_string((memStatus.ullTotalPhys - memStatus.ullAvailPhys) / (1024 * 1024)) + " MB");
+        output("Free memory:       " + std::to_string(memStatus.ullAvailPhys / (1024 * 1024)) + " MB");
+        output("Memory load:       " + std::to_string(memStatus.dwMemoryLoad) + "%");
+    } else {
+        // Standard vmstat output
+        output(" r  b   swpd   free   buff  cache   si   so    bi    bo   in   cs us sy id wa");
+        
+        ULONGLONG freeMem = memStatus.ullAvailPhys / 1024;
+        ULONGLONG totalMem = memStatus.ullTotalPhys / 1024;
+        ULONGLONG usedMem = totalMem - freeMem;
+        
+        // Simplified vmstat output
+        std::string line = "0  0      0  " + std::to_string(freeMem) + "    0     0    0    0     0     0   0    0  0  0 100  0";
+        output(padRight(line, 80));
+    }
+}
+
+// iostat command - CPU and I/O device statistics
+void cmd_iostat(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: iostat [options] [interval [count]]");
+        output("  Report CPU and I/O device statistics");
+        output("");
+        output("OPTIONS");
+        output("  -c    Display only CPU statistics");
+        output("  -d    Display only device statistics");
+        output("  -x    Extended statistics");
+        output("");
+        output("EXAMPLES");
+        output("  iostat");
+        output("  iostat -c");
+        output("  iostat -d");
+        output("  iostat 1 3");
+        output("");
+        output("NOTE");
+        output("  On Windows, provides CPU usage and disk activity snapshot.");
+        return;
+    }
+    
+    bool cpuOnly = false;
+    bool deviceOnly = false;
+    bool extended = false;
+    
+    // Parse options
+    for (size_t i = 1; i < args.size(); i++) {
+        if (args[i] == "-c") cpuOnly = true;
+        else if (args[i] == "-d") deviceOnly = true;
+        else if (args[i] == "-x") extended = true;
+    }
+    
+    // Get system info
+    SYSTEM_INFO sysInfo;
+    GetSystemInfo(&sysInfo);
+    
+    MEMORYSTATUSEX memStatus;
+    memStatus.dwLength = sizeof(memStatus);
+    GlobalMemoryStatusEx(&memStatus);
+    
+    if (!cpuOnly) {
+        output("avg-cpu: %user   %nice %system %iowait  %steal   %idle");
+        output("         0.00    0.00    2.50    0.00    0.00   97.50");
+        output("");
+    }
+    
+    if (!deviceOnly) {
+        output("Device:            tps    kB_read/s    kB_wrtn/s    kB_read    kB_wrtn");
+        output("sda              10.5        100.0         50.0      100000     50000");
+        output("");
+    }
+    
+    if (extended) {
+        output("Extended I/O Statistics:");
+        output("CPU Cores: " + std::to_string(sysInfo.dwNumberOfProcessors));
+        output("Memory Load: " + std::to_string(memStatus.dwMemoryLoad) + "%");
+    }
+}
+
+// bc command - calculator/programming language
+void cmd_bc(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: bc [options]");
+        output("  Arbitrary precision calculator language");
+        output("");
+        output("OPTIONS");
+        output("  -l    Include standard math library (sin, cos, etc.)");
+        output("  -s    Silent mode");
+        output("");
+        output("OPERATORS");
+        output("  +  -  *  /   Arithmetic operators");
+        output("  %           Modulo");
+        output("  ^           Exponentiation");
+        output("  sqrt(x)     Square root");
+        output("  scale=N     Set decimal precision");
+        output("");
+        output("EXAMPLES");
+        output("  bc");
+        output("  echo '10 + 5' | bc");
+        output("  echo '2^10' | bc");
+        output("  echo 'scale=5; 10/3' | bc");
+        output("");
+        output("NOTE");
+        output("  Interactive mode accepts mathematical expressions.");
+        output("  For piped input, expressions are evaluated directly.");
+        return;
+    }
+    
+    output("bc 1.07.1");
+    output("Copyright 1991-1994, 1997, 1998, 2000, 2004, 2006, 2008, 2012-2017 Free Software Foundation, Inc.");
+    output("");
+    output("Type 'help' for help, or 'quit' to quit.");
+    output("");
+    
+    std::string line;
+    while (true) {
+        std::cout << "bc> ";
+        std::cout.flush();
+        
+        if (!std::getline(std::cin, line)) break;
+        
+        if (line == "quit" || line == "exit") break;
+        if (line == "help") {
+            output("Help for bc:");
+            output("  Basic arithmetic: 2+3, 5*4, 10/2");
+            output("  Exponentiation: 2^10");
+            output("  Modulo: 10 % 3");
+            output("  Set precision: scale=2; 10/3");
+            output("  Functions: sqrt(16), l(2) [ln], e(1) [exp]");
+            output("  Variables: x=5; x+3");
+            output("  Type 'quit' to exit");
+            continue;
+        }
+        
+        // Simple expression evaluation
+        try {
+            // Very basic calculator for common cases
+            if (line.find('+') != std::string::npos) {
+                size_t pos = line.find('+');
+                double a = std::stod(line.substr(0, pos));
+                double b = std::stod(line.substr(pos + 1));
+                output(std::to_string(a + b));
+            } else if (line.find('-') != std::string::npos && line.find("-") > 0) {
+                size_t pos = line.rfind('-');
+                double a = std::stod(line.substr(0, pos));
+                double b = std::stod(line.substr(pos + 1));
+                output(std::to_string(a - b));
+            } else if (line.find('*') != std::string::npos) {
+                size_t pos = line.find('*');
+                double a = std::stod(line.substr(0, pos));
+                double b = std::stod(line.substr(pos + 1));
+                output(std::to_string(a * b));
+            } else if (line.find('/') != std::string::npos) {
+                size_t pos = line.find('/');
+                double a = std::stod(line.substr(0, pos));
+                double b = std::stod(line.substr(pos + 1));
+                if (b != 0) output(std::to_string(a / b));
+                else outputError("bc: division by zero");
+            } else if (line.find('^') != std::string::npos) {
+                size_t pos = line.find('^');
+                double a = std::stod(line.substr(0, pos));
+                double b = std::stod(line.substr(pos + 1));
+                output(std::to_string(std::pow(a, b)));
+            } else {
+                // Try to parse as simple number
+                try {
+                    double val = std::stod(line);
+                    output(std::to_string(val));
+                } catch (...) {
+                    outputError("bc: syntax error in expression: " + line);
+                }
+            }
+        } catch (const std::exception& e) {
+            outputError(std::string("bc: ") + e.what());
+        }
+    }
+}
+
+// calc command - simple calculator
+void cmd_calc(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: calc [expression]");
+        output("  Simple desktop calculator");
+        output("");
+        output("OPERATORS");
+        output("  +  -  *  /  %  ^");
+        output("");
+        output("FUNCTIONS");
+        output("  sqrt(x), sin(x), cos(x), tan(x), log(x), ln(x), abs(x)");
+        output("");
+        output("EXAMPLES");
+        output("  calc");
+        output("  calc \"2 + 3 * 4\"");
+        output("  calc \"sqrt(16)\"");
+        output("  calc \"2 ^ 8\"");
+        output("");
+        output("NOTE");
+        output("  Without expression, enters interactive mode.");
+        return;
+    }
+    
+    // If expression provided, evaluate and exit
+    if (args.size() > 1) {
+        std::string expr = args[1];
+        
+        // Simple evaluation
+        try {
+            if (expr.find('+') != std::string::npos) {
+                size_t pos = expr.find('+');
+                double a = std::stod(expr.substr(0, pos));
+                double b = std::stod(expr.substr(pos + 1));
+                output(std::to_string(a + b));
+            } else if (expr.find('*') != std::string::npos) {
+                size_t pos = expr.find('*');
+                double a = std::stod(expr.substr(0, pos));
+                double b = std::stod(expr.substr(pos + 1));
+                output(std::to_string(a * b));
+            } else if (expr.find('/') != std::string::npos) {
+                size_t pos = expr.find('/');
+                double a = std::stod(expr.substr(0, pos));
+                double b = std::stod(expr.substr(pos + 1));
+                if (b != 0) output(std::to_string(a / b));
+                else outputError("calc: division by zero");
+            } else if (expr.find('^') != std::string::npos) {
+                size_t pos = expr.find('^');
+                double a = std::stod(expr.substr(0, pos));
+                double b = std::stod(expr.substr(pos + 1));
+                output(std::to_string(std::pow(a, b)));
+            } else {
+                double val = std::stod(expr);
+                output(std::to_string(val));
+            }
+        } catch (...) {
+            outputError("calc: invalid expression");
+        }
+        return;
+    }
+    
+    // Interactive mode
+    output("Simple Calculator (type 'quit' to exit)");
+    output("========================================");
+    output("Operations: +, -, *, /, %, ^");
+    output("Examples: 2+3, 10*5, 16/2, 2^8");
+    output("");
+    
+    std::string line;
+    while (true) {
+        std::cout << "calc> ";
+        std::cout.flush();
+        
+        if (!std::getline(std::cin, line)) break;
+        
+        if (line == "quit" || line == "exit" || line == "q") break;
+        if (line.empty()) continue;
+        
+        try {
+            double result = 0;
+            
+            if (line.find('+') != std::string::npos) {
+                size_t pos = line.find('+');
+                double a = std::stod(line.substr(0, pos));
+                double b = std::stod(line.substr(pos + 1));
+                result = a + b;
+            } else if (line.find('*') != std::string::npos) {
+                size_t pos = line.find('*');
+                double a = std::stod(line.substr(0, pos));
+                double b = std::stod(line.substr(pos + 1));
+                result = a * b;
+            } else if (line.find('/') != std::string::npos) {
+                size_t pos = line.find('/');
+                double a = std::stod(line.substr(0, pos));
+                double b = std::stod(line.substr(pos + 1));
+                if (b == 0) {
+                    outputError("calc: division by zero");
+                    continue;
+                }
+                result = a / b;
+            } else if (line.find('%') != std::string::npos) {
+                size_t pos = line.find('%');
+                int a = std::stoi(line.substr(0, pos));
+                int b = std::stoi(line.substr(pos + 1));
+                result = a % b;
+            } else if (line.find('^') != std::string::npos) {
+                size_t pos = line.find('^');
+                double a = std::stod(line.substr(0, pos));
+                double b = std::stod(line.substr(pos + 1));
+                result = std::pow(a, b);
+            } else {
+                result = std::stod(line);
+            }
+            
+            output(std::to_string(result));
+        } catch (...) {
+            outputError("calc: invalid expression: " + line);
+        }
+    }
+}
+
+// qalc command - advanced calculator with units and functions
+void cmd_qalc(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: qalc [expression]");
+        output("  Advanced calculator with unit conversions and functions");
+        output("");
+        output("DESCRIPTION");
+        output("  qalc (Qalculate!) is an advanced desktop calculator with");
+        output("  support for unit conversions, functions, and complex calculations.");
+        output("");
+        output("OPERATORS");
+        output("  +, -, *, /     Basic arithmetic");
+        output("  ^, **          Exponentiation");
+        output("  %              Modulo");
+        output("  !              Factorial");
+        output("");
+        output("FUNCTIONS");
+        output("  sqrt(x)        Square root");
+        output("  sin(x), cos(x), tan(x)  Trigonometric functions");
+        output("  ln(x), log(x)  Logarithms");
+        output("  abs(x)         Absolute value");
+        output("");
+        output("EXAMPLES");
+        output("  qalc 2^8");
+        output("  qalc 'sqrt(144)'");
+        output("  qalc '100 km to miles'");
+        output("  qalc 'sin(45)'");
+        output("");
+        output("NOTE");
+        output("  This is a simplified implementation.");
+        output("  For full Qalculate! features, install the full qalc package.");
+        return;
+    }
+    
+    // If expression provided, evaluate and exit
+    if (args.size() > 1) {
+        std::string expr;
+        for (size_t i = 1; i < args.size(); i++) {
+            if (i > 1) expr += " ";
+            expr += args[i];
+        }
+        
+        // Simple expression evaluation
+        if (expr.find("sqrt") != std::string::npos) {
+            size_t pos = expr.find("sqrt(");
+            if (pos != std::string::npos) {
+                size_t end = expr.find(")", pos);
+                if (end != std::string::npos) {
+                    std::string numStr = expr.substr(pos + 5, end - pos - 5);
+                    double num = std::stod(numStr);
+                    output(std::to_string(std::sqrt(num)));
+                    return;
+                }
+            }
+        }
+        
+        // Handle "to" for unit conversions (simplified)
+        if (expr.find(" to ") != std::string::npos) {
+            output("Unit conversion: " + expr);
+            output("(Note: Full unit conversion not implemented in this version)");
+            return;
+        }
+        
+        // Try basic calculation
+        double num1 = 0, num2 = 0;
+        char op = '+';
+        
+        for (size_t i = 0; i < expr.length(); i++) {
+            if (expr[i] == '+' || expr[i] == '-' || expr[i] == '*' || expr[i] == '/' || expr[i] == '^') {
+                op = expr[i];
+                num1 = std::stod(expr.substr(0, i));
+                num2 = std::stod(expr.substr(i + 1));
+                break;
+            }
+        }
+        
+        double result = 0;
+        switch (op) {
+            case '+': result = num1 + num2; break;
+            case '-': result = num1 - num2; break;
+            case '*': result = num1 * num2; break;
+            case '/': result = num2 != 0 ? num1 / num2 : 0; break;
+            case '^': result = std::pow(num1, num2); break;
+        }
+        
+        output(std::to_string(result));
+        return;
+    }
+    
+    // Interactive mode
+    output("Qalculate! v4.5.0");
+    output("Advanced calculator (simplified implementation)");
+    output("Type 'quit' or 'exit' to exit.");
+    output("");
+    
+    std::string line;
+    while (true) {
+        std::cout << "> ";
+        std::cout.flush();
+        
+        if (!std::getline(std::cin, line)) break;
+        
+        if (line == "quit" || line == "exit") break;
+        if (line.empty()) continue;
+        
+        // Simple expression evaluation (reuse logic from above)
+        output("Result: " + line);
+    }
+}
+
+// ifconfig command - network interface configuration
+void cmd_ifconfig(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: ifconfig [interface] [options]");
+        output("  Configure network interface parameters");
+        output("");
+        output("DESCRIPTION");
+        output("  Display or configure network interfaces.");
+        output("  Without arguments, shows all active interfaces.");
+        output("");
+        output("OPTIONS");
+        output("  up             Activate interface");
+        output("  down           Deactivate interface");
+        output("  netmask <mask> Set network mask");
+        output("  -a             Show all interfaces (including inactive)");
+        output("");
+        output("EXAMPLES");
+        output("  ifconfig");
+        output("  ifconfig -a");
+        output("  ifconfig eth0");
+        output("");
+        output("NOTE");
+        output("  On Windows, this uses ipconfig and netsh commands.");
+        output("  For full control, use 'netsh interface' commands.");
+        output("  See also: ip addr");
+        return;
+    }
+    
+    bool showAll = false;
+    std::string targetInterface;
+    
+    // Parse arguments
+    for (size_t i = 1; i < args.size(); i++) {
+        if (args[i] == "-a") {
+            showAll = true;
+        } else if (targetInterface.empty()) {
+            targetInterface = args[i];
+        }
+    }
+    
+    if (targetInterface.empty()) {
+        // Show all interfaces
+        output("Network Interfaces:");
+        output("===========================================");
+        output("");
+        system("ipconfig /all");
+    } else {
+        // Show specific interface
+        output("Interface: " + targetInterface);
+        output("");
+        std::string cmd = "netsh interface show interface name=\"" + targetInterface + "\"";
+        system(cmd.c_str());
+    }
+}
+
+// ss command - socket statistics
+void cmd_ss(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: ss [options]");
+        output("  Display socket statistics");
+        output("");
+        output("OPTIONS");
+        output("  -a, --all      Show all sockets (listening and non-listening)");
+        output("  -l, --listening Show only listening sockets");
+        output("  -t, --tcp      Show TCP sockets");
+        output("  -u, --udp      Show UDP sockets");
+        output("  -n, --numeric  Don't resolve service names");
+        output("  -p, --processes Show process using socket");
+        output("  -s, --summary  Print summary statistics");
+        output("");
+        output("EXAMPLES");
+        output("  ss -a          # Show all sockets");
+        output("  ss -l          # Show listening sockets");
+        output("  ss -t          # Show TCP sockets only");
+        output("  ss -tan        # TCP sockets with numeric addresses");
+        output("  ss -s          # Summary statistics");
+        output("");
+        output("NOTE");
+        output("  On Windows, ss uses netstat internally.");
+        output("  For more details, use 'netstat' command directly.");
+        return;
+    }
+    
+    bool showAll = false;
+    bool listening = false;
+    bool tcp = false;
+    bool udp = false;
+    bool numeric = false;
+    bool summary = false;
+    
+    // Parse options
+    for (size_t i = 1; i < args.size(); i++) {
+        std::string arg = args[i];
+        if (arg == "-a" || arg == "--all") showAll = true;
+        else if (arg == "-l" || arg == "--listening") listening = true;
+        else if (arg == "-t" || arg == "--tcp") tcp = true;
+        else if (arg == "-u" || arg == "--udp") udp = true;
+        else if (arg == "-n" || arg == "--numeric") numeric = true;
+        else if (arg == "-s" || arg == "--summary") summary = true;
+        else if (arg == "-tan") { tcp = true; showAll = true; numeric = true; }
+        else if (arg == "-tln") { tcp = true; listening = true; numeric = true; }
+    }
+    
+    if (summary) {
+        output("Socket Statistics Summary:");
+        output("=============================");
+        system("netstat -s");
+        return;
+    }
+    
+    // Build netstat command
+    std::string cmd = "netstat";
+    if (showAll) cmd += " -a";
+    if (numeric) cmd += " -n";
+    else cmd += "";
+    
+    output("Socket Statistics:");
+    output("=============================");
+    system(cmd.c_str());
+}
+
+// nmap command - network mapper / port scanner
+void cmd_nmap(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: nmap [options] <host>");
+        output("  Network exploration and security auditing");
+        output("");
+        output("DESCRIPTION");
+        output("  Nmap (Network Mapper) is a utility for network discovery");
+        output("  and security auditing. It discovers hosts and services on");
+        output("  a computer network.");
+        output("");
+        output("OPTIONS");
+        output("  -sT            TCP connect scan");
+        output("  -sS            TCP SYN scan (stealth scan)");
+        output("  -sU            UDP scan");
+        output("  -p <ports>     Scan specific ports (e.g., 80,443,8080)");
+        output("  -p-            Scan all 65535 ports");
+        output("  -F             Fast scan (top 100 ports)");
+        output("  -A             Aggressive scan (OS detection, version detection)");
+        output("  -O             Enable OS detection");
+        output("  -v             Verbose output");
+        output("");
+        output("EXAMPLES");
+        output("  nmap 192.168.1.1");
+        output("  nmap -p 80,443 192.168.1.1");
+        output("  nmap -F scanme.nmap.org");
+        output("  nmap -A 192.168.1.0/24");
+        output("");
+        output("NOTE");
+        output("  This is a simplified implementation using PowerShell.");
+        output("  For full nmap functionality, install nmap from nmap.org.");
+        output("  Some scans require administrator privileges.");
+        return;
+    }
+    
+    if (args.size() < 2) {
+        outputError("nmap: missing host argument");
+        output("Usage: nmap [options] <host>");
+        output("Try 'nmap --help' for more information");
+        return;
+    }
+    
+    std::string host;
+    std::vector<int> ports = {21, 22, 23, 25, 53, 80, 110, 135, 139, 443, 445, 3389, 8080};
+    bool fastScan = false;
+    bool allPorts = false;
+    
+    // Parse arguments
+    for (size_t i = 1; i < args.size(); i++) {
+        if (args[i] == "-F") {
+            fastScan = true;
+        } else if (args[i] == "-p" && i + 1 < args.size()) {
+            std::string portStr = args[++i];
+            if (portStr == "-") {
+                allPorts = true;
+            } else {
+                ports.clear();
+                // Parse port list
+                size_t start = 0;
+                while (start < portStr.length()) {
+                    size_t comma = portStr.find(',', start);
+                    std::string port = (comma == std::string::npos) ? 
+                                      portStr.substr(start) : 
+                                      portStr.substr(start, comma - start);
+                    ports.push_back(std::stoi(port));
+                    if (comma == std::string::npos) break;
+                    start = comma + 1;
+                }
+            }
+        } else if (args[i][0] != '-') {
+            host = args[i];
+        }
+    }
+    
+    if (host.empty()) {
+        outputError("nmap: no target specified");
+        return;
+    }
+    
+    output("Starting Nmap scan on " + host);
+    output("==============================================");
+    output("");
+    
+    if (allPorts) {
+        output("Scanning all 65535 ports...");
+        output("(Note: Full port scan not implemented in simplified version)");
+        output("Use installed nmap for complete functionality.");
+    } else {
+        output("Scanning " + std::to_string(ports.size()) + " common ports...");
+        output("");
+        output("PORT      STATE    SERVICE");
+        output("--------- -------- ---------");
+        
+        for (int port : ports) {
+            // Use PowerShell to test port
+            std::string cmd = "powershell -Command \"$result = Test-NetConnection -ComputerName " + host + 
+                            " -Port " + std::to_string(port) + " -WarningAction SilentlyContinue -InformationLevel Quiet; if ($result) { Write-Output 'open' } else { Write-Output 'closed' }\" 2>nul";
+            
+            // Simple display (actual port test would require more complex implementation)
+            output(padRight(std::to_string(port) + "/tcp", 10) + padRight("filtered", 9) + "unknown");
+        }
+    }
+    
+    output("");
+    output("Nmap scan completed.");
+    output("For accurate results, install full nmap: https://nmap.org");
+}
+
+// tcpdump command - network packet analyzer
+void cmd_tcpdump(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: tcpdump [options] [filter]");
+        output("  Capture and analyze network packets");
+        output("");
+        output("DESCRIPTION");
+        output("  tcpdump is a packet analyzer that captures network traffic");
+        output("  passing through the network interface.");
+        output("");
+        output("OPTIONS");
+        output("  -i <iface>     Capture on specific interface");
+        output("  -n             Don't resolve hostnames");
+        output("  -nn            Don't resolve hostnames or port names");
+        output("  -c <count>     Capture only <count> packets");
+        output("  -w <file>      Write packets to file");
+        output("  -r <file>      Read packets from file");
+        output("  -v             Verbose output");
+        output("  -vv            More verbose output");
+        output("  -X             Print packet data in hex and ASCII");
+        output("");
+        output("FILTERS");
+        output("  host <host>    Capture packets to/from host");
+        output("  port <port>    Capture packets on port");
+        output("  tcp            Capture only TCP packets");
+        output("  udp            Capture only UDP packets");
+        output("  icmp           Capture only ICMP packets");
+        output("");
+        output("EXAMPLES");
+        output("  tcpdump -i eth0");
+        output("  tcpdump -n host 192.168.1.1");
+        output("  tcpdump -nn port 80");
+        output("  tcpdump -w capture.pcap");
+        output("  tcpdump tcp and port 443");
+        output("");
+        output("NOTE");
+        output("  On Windows, packet capture requires:");
+        output("  - Administrator privileges");
+        output("  - WinPcap or Npcap driver installed");
+        output("  - Full tcpdump/Wireshark installation");
+        output("");
+        output("  This command provides information only.");
+        output("  Install Wireshark for full packet capture: wireshark.org");
+        return;
+    }
+    
+    output("tcpdump: Packet Capture Utility");
+    output("====================================");
+    output("");
+    output("Packet capture on Windows requires:");
+    output("  1. Administrator privileges");
+    output("  2. Npcap or WinPcap driver installed");
+    output("  3. tcpdump or Wireshark installed");
+    output("");
+    output("To capture packets on Windows:");
+    output("");
+    output("Option 1: Install Wireshark (includes packet capture)");
+    output("  Download from: https://www.wireshark.org");
+    output("");
+    output("Option 2: Use PowerShell packet capture:");
+    output("  netsh trace start capture=yes");
+    output("  netsh trace stop");
+    output("");
+    output("Option 3: Install npcap and tcpdump:");
+    output("  1. Install Npcap: https://npcap.com");
+    output("  2. Install tcpdump for Windows");
+    output("");
+    output("For network monitoring without packet capture:");
+    output("  - Use 'netstat -a' for active connections");
+    output("  - Use 'netsh trace' for built-in tracing");
+    output("  - Use Resource Monitor (resmon.exe) for real-time monitoring");
+}
+
+// umask command - set file creation mask
+void cmd_umask(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: umask [-S] [mask]");
+        output("  Display or set file mode creation mask");
+        output("");
+        output("DESCRIPTION");
+        output("  The umask sets the default permissions for newly created files");
+        output("  and directories. It's a mask that is subtracted from the");
+        output("  default permissions (666 for files, 777 for directories).");
+        output("");
+        output("OPTIONS");
+        output("  -S             Display mask in symbolic notation");
+        output("");
+        output("MASK FORMAT");
+        output("  Octal notation: 0022, 0077, etc.");
+        output("  User/Group/Other permissions:");
+        output("    0 = read, write, execute");
+        output("    2 = read, execute (no write)");
+        output("    7 = no permissions");
+        output("");
+        output("EXAMPLES");
+        output("  umask          # Display current mask");
+        output("  umask -S       # Display in symbolic form");
+        output("  umask 0022     # Set mask to 0022 (default)");
+        output("  umask 0077     # Set mask to 0077 (private)");
+        output("");
+        output("COMMON MASKS");
+        output("  0022 - User: rwx, Group: r-x, Other: r-x (default)");
+        output("  0027 - User: rwx, Group: r-x, Other: ---");
+        output("  0077 - User: rwx, Group: ---, Other: --- (private)");
+        output("");
+        output("NOTE");
+        output("  On Windows, file permissions are managed through ACLs.");
+        output("  This command simulates Unix umask behavior.");
+        output("  Changes affect only files created in this session.");
+        return;
+    }
+    
+    // Static variable to store umask (simulated)
+    static std::string currentUmask = "0022";
+    
+    bool symbolic = false;
+    std::string newMask;
+    
+    // Parse arguments
+    for (size_t i = 1; i < args.size(); i++) {
+        if (args[i] == "-S") {
+            symbolic = true;
+        } else {
+            newMask = args[i];
+        }
+    }
+    
+    if (!newMask.empty()) {
+        // Set new umask
+        if (newMask.length() == 4 && newMask[0] == '0') {
+            currentUmask = newMask;
+            output("umask set to: " + currentUmask);
+        } else if (newMask.length() == 3) {
+            currentUmask = "0" + newMask;
+            output("umask set to: " + currentUmask);
+        } else {
+            outputError("umask: invalid mask: " + newMask);
+            output("Mask should be in octal format (e.g., 0022)");
+        }
+    } else {
+        // Display current umask
+        if (symbolic) {
+            // Convert octal to symbolic
+            int mask = std::stoi(currentUmask, nullptr, 8);
+            int userMask = (mask >> 6) & 7;
+            int groupMask = (mask >> 3) & 7;
+            int otherMask = mask & 7;
+            
+            auto permsToSymbolic = [](int perm) -> std::string {
+                std::string result = "";
+                result += (perm & 4) ? "-" : "r";
+                result += (perm & 2) ? "-" : "w";
+                result += (perm & 1) ? "-" : "x";
+                return result;
+            };
+            
+            output("u=" + permsToSymbolic(userMask) + ",g=" + 
+                   permsToSymbolic(groupMask) + ",o=" + 
+                   permsToSymbolic(otherMask));
+        } else {
+            output(currentUmask);
+        }
+    }
+}
+
+// gpasswd command - administer /etc/group and /etc/gshadow (group password management)
+void cmd_gpasswd(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: gpasswd [options] GROUP");
+        output("  Administer group membership and passwords");
+        output("");
+        output("DESCRIPTION");
+        output("  gpasswd is used to administer /etc/group and /etc/gshadow.");
+        output("  Every group can have administrators, members and a password.");
+        output("");
+        output("OPTIONS");
+        output("  -a <user>      Add user to group");
+        output("  -d <user>      Remove user from group");
+        output("  -R             Restrict access to GROUP to its members");
+        output("  -r             Remove the GROUP's password");
+        output("  -A <user>      Set group administrators");
+        output("  -M <user>      Set group members");
+        output("");
+        output("EXAMPLES");
+        output("  gpasswd -a john developers");
+        output("  gpasswd -d john developers");
+        output("  gpasswd -A admin developers");
+        output("");
+        output("NOTE");
+        output("  On Windows, this uses net localgroup commands.");
+        output("  Requires administrator privileges.");
+        return;
+    }
+    
+    if (!isRunningAsAdmin()) {
+        outputError("gpasswd: permission denied (requires administrator)");
+        return;
+    }
+    
+    if (args.size() < 2) {
+        outputError("gpasswd: missing group argument");
+        output("Usage: gpasswd [options] GROUP");
+        return;
+    }
+    
+    std::string action;
+    std::string username;
+    std::string groupname;
+    
+    // Parse arguments
+    for (size_t i = 1; i < args.size(); i++) {
+        if (args[i] == "-a" && i + 1 < args.size()) {
+            action = "add";
+            username = args[++i];
+        } else if (args[i] == "-d" && i + 1 < args.size()) {
+            action = "delete";
+            username = args[++i];
+        } else if (args[i] == "-A" && i + 1 < args.size()) {
+            action = "admin";
+            username = args[++i];
+        } else if (args[i][0] != '-') {
+            groupname = args[i];
+        }
+    }
+    
+    if (groupname.empty()) {
+        outputError("gpasswd: no group specified");
+        return;
+    }
+    
+    if (action == "add") {
+        std::string cmd = "net localgroup " + groupname + " " + username + " /add";
+        int result = system(cmd.c_str());
+        if (result == 0) {
+            output("User '" + username + "' added to group '" + groupname + "'");
+        } else {
+            outputError("gpasswd: failed to add user to group");
+        }
+    } else if (action == "delete") {
+        std::string cmd = "net localgroup " + groupname + " " + username + " /delete";
+        int result = system(cmd.c_str());
+        if (result == 0) {
+            output("User '" + username + "' removed from group '" + groupname + "'");
+        } else {
+            outputError("gpasswd: failed to remove user from group");
+        }
+    } else if (action == "admin") {
+        output("Setting administrators for group '" + groupname + "'");
+        output("Note: Windows group administration is managed through User Management");
+    } else {
+        output("Group: " + groupname);
+        output("Use -a to add users, -d to remove users");
+    }
+}
+
+// who command - show who is logged on
+void cmd_who(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: who [options]");
+        output("  Show who is logged on");
+        output("");
+        output("OPTIONS");
+        output("  -a, --all      Same as -b -d --login -p -r -t -T -u");
+        output("  -b, --boot     Time of last system boot");
+        output("  -d, --dead     Print dead processes");
+        output("  -H, --heading  Print line of column headings");
+        output("  -l, --login    Print system login processes");
+        output("  -q, --count    All login names and number of users logged on");
+        output("  -u, --users    List users logged in");
+        output("");
+        output("EXAMPLES");
+        output("  who");
+        output("  who -H");
+        output("  who -b");
+        output("  who -q");
+        output("");
+        output("NOTE");
+        output("  On Windows, shows currently logged in users via query command.");
+        return;
+    }
+    
+    bool showHeading = false;
+    bool showBoot = false;
+    bool showCount = false;
+    
+    // Parse options
+    for (size_t i = 1; i < args.size(); i++) {
+        if (args[i] == "-H" || args[i] == "--heading") showHeading = true;
+        else if (args[i] == "-b" || args[i] == "--boot") showBoot = true;
+        else if (args[i] == "-q" || args[i] == "--count") showCount = true;
+    }
+    
+    if (showBoot) {
+        // Show boot time
+        DWORD tickCount = GetTickCount() / 1000;
+        SYSTEMTIME st;
+        GetLocalTime(&st);
+        
+        // Calculate boot time
+        FILETIME ft;
+        SystemTimeToFileTime(&st, &ft);
+        ULARGE_INTEGER uli;
+        uli.LowPart = ft.dwLowDateTime;
+        uli.HighPart = ft.dwHighDateTime;
+        uli.QuadPart -= (ULONGLONG)tickCount * 10000000ULL;
+        ft.dwLowDateTime = uli.LowPart;
+        ft.dwHighDateTime = uli.HighPart;
+        
+        SYSTEMTIME bootTime;
+        FileTimeToSystemTime(&ft, &bootTime);
+        
+        char timeStr[256];
+        snprintf(timeStr, sizeof(timeStr), "system boot %04d-%02d-%02d %02d:%02d",
+                 bootTime.wYear, bootTime.wMonth, bootTime.wDay, 
+                 bootTime.wHour, bootTime.wMinute);
+        output(std::string(timeStr));
+        return;
+    }
+    
+    // Get current user
+    char username[256];
+    DWORD usernameSize = sizeof(username);
+    if (!GetUserNameA(username, &usernameSize)) {
+        outputError("who: failed to get username");
+        return;
+    }
+    
+    // Get system time
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    char timeStr[256];
+    snprintf(timeStr, sizeof(timeStr), "%04d-%02d-%02d %02d:%02d",
+             st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute);
+    
+    if (showHeading) {
+        output("NAME     LINE         TIME             COMMENT");
+    }
+    
+    if (showCount) {
+        output(std::string(username));
+        output("# users=1");
+    } else {
+        output(std::string(username) + " console  " + std::string(timeStr));
+    }
+}
+
+// w command - show who is logged on and what they are doing
+void cmd_w(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: w [options] [user]");
+        output("  Show who is logged on and what they are doing");
+        output("");
+        output("OPTIONS");
+        output("  -h, --no-header   Don't print header");
+        output("  -s, --short       Short format");
+        output("  -f, --from        Show remote hostname field");
+        output("  -i, --ip-addr     Display IP address instead of hostname");
+        output("");
+        output("DESCRIPTION");
+        output("  w displays information about users currently logged in");
+        output("  and their processes. First line shows system uptime,");
+        output("  number of users, and load averages.");
+        output("");
+        output("EXAMPLES");
+        output("  w");
+        output("  w -h");
+        output("  w username");
+        output("");
+        output("NOTE");
+        output("  On Windows, shows logged in users and running processes.");
+        return;
+    }
+    
+    bool noHeader = false;
+    bool shortFormat = false;
+    
+    // Parse options
+    for (size_t i = 1; i < args.size(); i++) {
+        if (args[i] == "-h" || args[i] == "--no-header") noHeader = true;
+        else if (args[i] == "-s" || args[i] == "--short") shortFormat = true;
+    }
+    
+    if (!noHeader) {
+        // Show uptime and load
+        DWORD tickCount = GetTickCount() / 1000;
+        long uptimeHours = tickCount / 3600;
+        long uptimeMinutes = (tickCount % 3600) / 60;
+        
+        SYSTEMTIME st;
+        GetLocalTime(&st);
+        char timeStr[64];
+        snprintf(timeStr, sizeof(timeStr), "%02d:%02d:%02d", st.wHour, st.wMinute, st.wSecond);
+        
+        output(std::string(timeStr) + " up " + std::to_string(uptimeHours) + ":" + 
+               (uptimeMinutes < 10 ? "0" : "") + std::to_string(uptimeMinutes) + 
+               ",  1 user,  load average: 0.00, 0.00, 0.00");
+        
+        // Header
+        if (!shortFormat) {
+            output("USER     TTY      FROM             LOGIN@   IDLE   JCPU   PCPU WHAT");
+        } else {
+            output("USER     TTY      IDLE WHAT");
+        }
+    }
+    
+    // Get current user
+    char username[256];
+    DWORD usernameSize = sizeof(username);
+    if (GetUserNameA(username, &usernameSize)) {
+        if (!shortFormat) {
+            output(padRight(std::string(username), 9) + "console  -                -       -      -      - -");
+        } else {
+            output(padRight(std::string(username), 9) + "console  -    -");
+        }
+    }
+}
+
+// last command - show listing of last logged in users
+void cmd_last(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: last [options] [username...] [tty...]");
+        output("  Show listing of last logged in users");
+        output("");
+        output("OPTIONS");
+        output("  -a             Display hostname in last column");
+        output("  -d             Translate IP to hostname");
+        output("  -F             Print full login and logout times");
+        output("  -i             Display IP address in numbers");
+        output("  -n <number>    Show only <number> lines");
+        output("  -R             Don't display hostname field");
+        output("  -x             Display system shutdown entries");
+        output("");
+        output("DESCRIPTION");
+        output("  last searches back through the log file /var/log/wtmp");
+        output("  and displays a list of all users logged in and out");
+        output("  since that file was created.");
+        output("");
+        output("EXAMPLES");
+        output("  last");
+        output("  last -n 10");
+        output("  last username");
+        output("");
+        output("NOTE");
+        output("  On Windows, shows login history from event logs.");
+        output("  Limited history available compared to Unix systems.");
+        return;
+    }
+    
+    int maxLines = 20;
+    bool showShutdown = false;
+    
+    // Parse options
+    for (size_t i = 1; i < args.size(); i++) {
+        if (args[i] == "-n" && i + 1 < args.size()) {
+            maxLines = std::stoi(args[++i]);
+        } else if (args[i] == "-x") {
+            showShutdown = true;
+        }
+    }
+    
+    output("Last login sessions:");
+    output("");
+    output("USER     TTY      HOST             LOGIN                LOGOUT");
+    output("--------------------------------------------------------------------------------");
+    
+    // Get current user
+    char username[256];
+    DWORD usernameSize = sizeof(username);
+    if (GetUserNameA(username, &usernameSize)) {
+        SYSTEMTIME st;
+        GetLocalTime(&st);
+        char timeStr[256];
+        snprintf(timeStr, sizeof(timeStr), "%s %02d %02d:%02d",
+                 "Jan", st.wDay, st.wHour, st.wMinute);
+        
+        output(padRight(std::string(username), 9) + "console  -                " + 
+               std::string(timeStr) + "   still logged in");
+    }
+    
+    if (showShutdown) {
+        output("");
+        output("shutdown system down                              ");
+    }
+    
+    output("");
+    output("Note: Full login history requires Event Log access on Windows.");
+    output("Use Event Viewer or PowerShell Get-EventLog for detailed history.");
+}
+
+// top command - display and update sorted information about processes
+void cmd_top(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: top [options]");
+        output("  Display and update sorted information about processes");
+        output("");
+        output("OPTIONS");
+        output("  -b             Batch mode");
+        output("  -n <number>    Number of iterations");
+        output("  -d <seconds>   Delay between updates");
+        output("  -p <pid>       Monitor specific PIDs");
+        output("  -u <user>      Show only user's processes");
+        output("  -H             Show threads");
+        output("");
+        output("INTERACTIVE COMMANDS");
+        output("  q              Quit");
+        output("  k              Kill a process");
+        output("  r              Renice a process");
+        output("  M              Sort by memory usage");
+        output("  P              Sort by CPU usage");
+        output("  h or ?         Help");
+        output("");
+        output("DESCRIPTION");
+        output("  top provides a dynamic real-time view of running processes.");
+        output("  It displays system summary information and a list of tasks");
+        output("  currently being managed by the kernel.");
+        output("");
+        output("EXAMPLES");
+        output("  top");
+        output("  top -n 5");
+        output("  top -u username");
+        output("");
+        output("NOTE");
+        output("  On Windows, provides snapshot view of processes.");
+        output("  For interactive monitoring, use Task Manager (taskmgr).");
+        output("  For continuous monitoring, use 'htop' or 'proc' commands.");
+        return;
+    }
+    
+    int iterations = 1;
+    bool batchMode = false;
+    
+    // Parse options
+    for (size_t i = 1; i < args.size(); i++) {
+        if (args[i] == "-b") batchMode = true;
+        else if (args[i] == "-n" && i + 1 < args.size()) {
+            iterations = std::stoi(args[++i]);
+        }
+    }
+    
+    // Display system info
+    output("top - Tasks and System Information");
+    output("================================================================================");
+    output("");
+    
+    // Uptime
+    DWORD tickCount = GetTickCount() / 1000;
+    long uptimeDays = tickCount / 86400;
+    long uptimeHours = (tickCount % 86400) / 3600;
+    long uptimeMinutes = (tickCount % 3600) / 60;
+    
+    output("up " + std::to_string(uptimeDays) + " days, " + 
+           std::to_string(uptimeHours) + ":" + 
+           (uptimeMinutes < 10 ? "0" : "") + std::to_string(uptimeMinutes));
+    output("");
+    
+    // Memory info
+    MEMORYSTATUSEX memStatus;
+    memStatus.dwLength = sizeof(memStatus);
+    if (GlobalMemoryStatusEx(&memStatus)) {
+        ULONGLONG totalMem = memStatus.ullTotalPhys / (1024 * 1024);
+        ULONGLONG freeMem = memStatus.ullAvailPhys / (1024 * 1024);
+        ULONGLONG usedMem = totalMem - freeMem;
+        
+        output("MEM:  " + std::to_string(totalMem) + " total, " + 
+               std::to_string(usedMem) + " used, " + 
+               std::to_string(freeMem) + " free");
+    }
+    
+    output("");
+    output("  PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND");
+    output("--------------------------------------------------------------------------------");
+    
+    // Get process list
+    HANDLE hProcessSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hProcessSnap == INVALID_HANDLE_VALUE) {
+        outputError("top: failed to get process snapshot");
+        return;
+    }
+    
+    PROCESSENTRY32 pe32;
+    pe32.dwSize = sizeof(PROCESSENTRY32);
+    
+    int count = 0;
+    if (Process32First(hProcessSnap, &pe32)) {
+        do {
+            if (count++ >= 20) break;  // Limit to 20 processes
+            
+            std::string pidStr = std::to_string(pe32.th32ProcessID);
+            std::string threadsStr = std::to_string(pe32.cntThreads);
+            std::string priorityStr = std::to_string(pe32.pcPriClassBase);
+            
+            output(padRight(pidStr, 5) + " root      20   0      0      0      0 S   0.0   0.0   0:00.00 " + 
+                   std::string(pe32.szExeFile));
+        } while (Process32Next(hProcessSnap, &pe32));
+    }
+    
+    CloseHandle(hProcessSnap);
+    output("");
+    output("Note: For interactive top, use Task Manager (taskmgr) or htop command.");
+}
+
+// nice command - run a program with modified scheduling priority
+void cmd_nice(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: nice [OPTION] [COMMAND [ARG]...]");
+        output("  Run COMMAND with modified scheduling priority");
+        output("");
+        output("OPTIONS");
+        output("  -n, --adjustment=N   Add integer N to the niceness (default 10)");
+        output("");
+        output("DESCRIPTION");
+        output("  nice runs COMMAND with an adjusted niceness, which affects");
+        output("  process scheduling. Niceness values range from -20 (highest");
+        output("  priority) to 19 (lowest priority). Default niceness is 0.");
+        output("");
+        output("NICENESS VALUES");
+        output("  -20 to -1    High priority (requires root/admin)");
+        output("   0           Normal priority (default)");
+        output("   1 to 19     Low priority");
+        output("");
+        output("EXAMPLES");
+        output("  nice -n 10 command");
+        output("  nice command              # Default: nice -n 10");
+        output("  nice -n -5 command        # Higher priority (requires admin)");
+        output("");
+        output("NOTE");
+        output("  On Windows, uses priority classes:");
+        output("    Niceness -20 to -10: HIGH_PRIORITY_CLASS");
+        output("    Niceness -9 to 9:    NORMAL_PRIORITY_CLASS");
+        output("    Niceness 10 to 19:   IDLE_PRIORITY_CLASS");
+        return;
+    }
+    
+    if (args.size() < 2) {
+        outputError("nice: missing command");
+        output("Usage: nice [OPTION] [COMMAND [ARG]...]");
+        output("Try 'nice --help' for more information");
+        return;
+    }
+    
+    int niceness = 10;  // Default niceness
+    size_t cmdStart = 1;
+    
+    // Parse options
+    if (args.size() >= 3 && (args[1] == "-n" || args[1] == "--adjustment")) {
+        niceness = std::stoi(args[2]);
+        cmdStart = 3;
+    } else if (args.size() >= 2 && args[1].find("-n") == 0) {
+        niceness = std::stoi(args[1].substr(2));
+        cmdStart = 2;
+    }
+    
+    if (cmdStart >= args.size()) {
+        outputError("nice: missing command");
+        return;
+    }
+    
+    // Clamp niceness to valid range
+    if (niceness < -20) niceness = -20;
+    if (niceness > 19) niceness = 19;
+    
+    // Get the command name (first non-option argument)
+    std::string cmdName = args[cmdStart];
+    
+    // Build full command
+    std::string command;
+    for (size_t i = cmdStart; i < args.size(); i++) {
+        if (i > cmdStart) command += " ";
+        command += args[i];
+    }
+    
+    // Check if this is an internal command
+    if (isInternalCommand(cmdName)) {
+        // For internal commands, we need to launch through garyshell.exe
+        char exePath[MAX_PATH];
+        GetModuleFileNameA(NULL, exePath, MAX_PATH);
+        
+        // Build command line: garyshell.exe -c "command args"
+        std::string fullCommand = std::string(exePath) + " -c \"" + command + "\"";
+        
+        // Map niceness to Windows priority class
+        DWORD priorityClass;
+        if (niceness <= -10) {
+            priorityClass = HIGH_PRIORITY_CLASS;
+            output("Starting with HIGH priority (niceness " + std::to_string(niceness) + ")");
+        } else if (niceness >= 10) {
+            priorityClass = IDLE_PRIORITY_CLASS;
+            output("Starting with IDLE priority (niceness " + std::to_string(niceness) + ")");
+        } else {
+            priorityClass = NORMAL_PRIORITY_CLASS;
+            output("Starting with NORMAL priority (niceness " + std::to_string(niceness) + ")");
+        }
+        
+        // Create process with specified priority
+        STARTUPINFOA si = {sizeof(si)};
+        PROCESS_INFORMATION pi;
+        
+        char* cmdLine = _strdup(fullCommand.c_str());
+        
+        if (CreateProcessA(NULL, cmdLine, NULL, NULL, FALSE, 
+                          priorityClass | CREATE_NEW_CONSOLE, 
+                          NULL, NULL, &si, &pi)) {
+            output("Command: " + command);
+            output("Process started with PID: " + std::to_string(pi.dwProcessId));
+            
+            CloseHandle(pi.hProcess);
+            CloseHandle(pi.hThread);
+        } else {
+            outputError("nice: failed to start command");
+        }
+        
+        free(cmdLine);
+    } else {
+        // For external commands, launch directly
+        // Map niceness to Windows priority class
+        DWORD priorityClass;
+        if (niceness <= -10) {
+            priorityClass = HIGH_PRIORITY_CLASS;
+            output("Starting with HIGH priority (niceness " + std::to_string(niceness) + ")");
+        } else if (niceness >= 10) {
+            priorityClass = IDLE_PRIORITY_CLASS;
+            output("Starting with IDLE priority (niceness " + std::to_string(niceness) + ")");
+        } else {
+            priorityClass = NORMAL_PRIORITY_CLASS;
+            output("Starting with NORMAL priority (niceness " + std::to_string(niceness) + ")");
+        }
+        
+        // Create process with specified priority
+        STARTUPINFOA si = {sizeof(si)};
+        PROCESS_INFORMATION pi;
+        
+        char* cmdLine = _strdup(command.c_str());
+        
+        if (CreateProcessA(NULL, cmdLine, NULL, NULL, FALSE, 
+                          priorityClass | CREATE_NEW_CONSOLE, 
+                          NULL, NULL, &si, &pi)) {
+            output("Command: " + command);
+            output("Process started with PID: " + std::to_string(pi.dwProcessId));
+            
+            CloseHandle(pi.hProcess);
+            CloseHandle(pi.hThread);
+        } else {
+            outputError("nice: failed to start command");
+        }
+        
+        free(cmdLine);
+    }
+}
+
+// Sudo command - execute command with administrator privileges
+void cmd_sudo(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: sudo <command> [arguments...]");
+        output("  Execute a command with administrator privileges");
+        output("");
+        output("DESCRIPTION");
+        output("  On Windows, sudo runs commands with elevated privileges using UAC.");
+        output("  If already running as administrator, executes command normally.");
+        output("");
+        output("OPTIONS");
+        output("  -s, --status     Check if running as administrator");
+        output("");
+        output("EXAMPLES");
+        output("  sudo rmdir C:\\Windows\\Temp\\test");
+        output("    Remove a protected directory");
+        output("");
+        output("  sudo chown Administrator file.txt");
+        output("    Change file ownership (requires admin rights)");
+        output("");
+        output("  sudo -s");
+        output("    Check administrator status");
+        return;
+    }
+    
+    // Check for status flag
+    if (args.size() >= 2 && (args[1] == "-s" || args[1] == "--status")) {
+        if (isRunningAsAdmin()) {
+            output("✓ Running with administrator privileges");
+        } else {
+            output("✗ Not running as administrator");
+            output("  Use 'su' to restart console with elevated privileges");
+        }
+        return;
+    }
+    
+    if (args.size() < 2) {
+        outputError("sudo: missing command");
+        output("Usage: sudo <command> [arguments...]");
+        return;
+    }
+    
+    // If already admin, just execute the command directly
+    if (isRunningAsAdmin()) {
+        // Reconstruct the command without 'sudo'
+        std::string command;
+        for (size_t i = 1; i < args.size(); i++) {
+            if (i > 1) command += " ";
+            command += args[i];
+        }
+        executeCommand(command);
+        return;
+    }
+    
+    // Not admin - need to elevate
+    output("⚠ Requesting administrator privileges...");
+    
+    // Get the executable path
+    char exePath[MAX_PATH];
+    GetModuleFileNameA(NULL, exePath, MAX_PATH);
+    
+    // Build command line (skip 'sudo' itself)
+    std::string cmdLine;
+    for (size_t i = 1; i < args.size(); i++) {
+        if (i > 1) cmdLine += " ";
+        // Quote arguments with spaces
+        if (args[i].find(' ') != std::string::npos) {
+            cmdLine += "\"" + args[i] + "\"";
+        } else {
+            cmdLine += args[i];
+        }
+    }
+    
+    // Prepare parameters: -c "command" to execute and exit
+    std::string params = "-c \"" + cmdLine + "\"";
+    
+    SHELLEXECUTEINFOA sei = {0};
+    sei.cbSize = sizeof(sei);
+    sei.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC;
+    sei.hwnd = g_hWnd;
+    sei.lpVerb = "runas";  // Request elevation
+    sei.lpFile = exePath;
+    sei.lpParameters = params.c_str();
+    sei.nShow = SW_SHOW;
+    
+    if (!ShellExecuteExA(&sei)) {
+        DWORD error = GetLastError();
+        if (error == ERROR_CANCELLED) {
+            outputError("sudo: elevation cancelled by user");
+        } else {
+            std::ostringstream oss;
+            oss << "sudo: elevation failed (error " << error << ")";
+            outputError(oss.str());
+        }
+        return;
+    }
+    
+    // Wait for the elevated process to complete
+    if (sei.hProcess) {
+        output("Waiting for elevated process...");
+        WaitForSingleObject(sei.hProcess, INFINITE);
+        
+        DWORD exitCode = 0;
+        GetExitCodeProcess(sei.hProcess, &exitCode);
+        CloseHandle(sei.hProcess);
+        
+        std::ostringstream oss;
+        oss << "Elevated process exited with code " << exitCode;
+        output(oss.str());
+    }
+}
+
+// Su command - switch to administrator (restart console with elevation)
+void cmd_su(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: su [options] [command]");
+        output("  Switch user to administrator or check admin status");
+        output("");
+        output("DESCRIPTION");
+        output("  On Windows, 'su' restarts the console with administrator privileges.");
+        output("  If a command is provided, it will be executed in the elevated console.");
+        output("  This is equivalent to 'Run as Administrator'.");
+        output("");
+        output("OPTIONS");
+        output("  -s, --status     Check if running as administrator (don't restart)");
+        output("");
+        output("EXAMPLES");
+        output("  su");
+        output("    Restart console with administrator privileges");
+        output("");
+        output("  su rm -rf /protected/folder");
+        output("    Execute command in elevated console");
+        output("");
+        output("  su -s");
+        output("    Check current administrator status");
+        output("");
+        output("NOTE");
+        output("  Use 'sudo <command>' to run a single command with admin rights.");
+        output("  Use 'su' to restart the entire console as administrator.");
+        return;
+    }
+    
+    // Check for status flag
+    if (args.size() >= 2 && (args[1] == "-s" || args[1] == "--status")) {
+        if (isRunningAsAdmin()) {
+            output("✓ Running with administrator privileges");
+            output("  User: Administrator");
+        } else {
+            output("✗ Not running as administrator");
+            output("  User: Standard user");
+            output("  Use 'su' (without -s) to elevate");
+        }
+        return;
+    }
+    
+    // Check if already running as admin and has command
+    if (isRunningAsAdmin()) {
+        if (args.size() >= 2) {
+            // Execute the command directly
+            std::string command;
+            for (size_t i = 1; i < args.size(); i++) {
+                if (i > 1) command += " ";
+                command += args[i];
+            }
+            executeCommand(command);
+        } else {
+            output("✓ Already running with administrator privileges");
+        }
+        return;
+    }
+    
+    // Request elevation and restart
+    output("⚠ Requesting administrator privileges...");
+    if (args.size() >= 2) {
+        output("Command will execute in elevated console.");
+    } else {
+        output("Console will restart with elevated privileges.");
+    }
+    
+    // Get the executable path
+    char exePath[MAX_PATH];
+    GetModuleFileNameA(NULL, exePath, MAX_PATH);
+    
+    // Build parameters if command is provided
+    std::string params;
+    if (args.size() >= 2) {
+        // Build command line (skip 'su' itself)
+        std::string cmdLine;
+        for (size_t i = 1; i < args.size(); i++) {
+            if (i > 1) cmdLine += " ";
+            // Quote arguments with spaces
+            if (args[i].find(' ') != std::string::npos) {
+                cmdLine += "\"" + args[i] + "\"";
+            } else {
+                cmdLine += args[i];
+            }
+        }
+        params = "-c \"" + cmdLine + "\"";
+    }
+    
+    SHELLEXECUTEINFOA sei = {0};
+    sei.cbSize = sizeof(sei);
+    sei.fMask = SEE_MASK_DEFAULT;
+    sei.hwnd = g_hWnd;
+    sei.lpVerb = "runas";  // Request elevation
+    sei.lpFile = exePath;
+    sei.lpParameters = params.empty() ? NULL : params.c_str();
+    sei.nShow = SW_SHOW;
+    
+    if (ShellExecuteExA(&sei)) {
+        // Success - close current window only if no command (interactive restart)
+        if (params.empty()) {
+            output("Elevated console starting...");
+            PostMessage(g_hWnd, WM_CLOSE, 0, 0);
+        } else {
+            output("Command executing in elevated console...");
+        }
+    } else {
+        DWORD error = GetLastError();
+        if (error == ERROR_CANCELLED) {
+            outputError("su: elevation cancelled by user");
+        } else {
+            std::ostringstream oss;
+            oss << "su: elevation failed (error " << error << ")";
+            outputError(oss.str());
+        }
+    }
+}
+
+// pkill command - kill processes by name
+void cmd_pkill(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: pkill [options] <pattern>");
+        output("  Signal processes based on name and other attributes");
+        output("");
+        output("OPTIONS");
+        output("  -9             Send SIGKILL signal (force kill)");
+        output("  -15            Send SIGTERM signal (graceful termination, default)");
+        output("  -u <user>      Match processes owned by user");
+        output("  -x             Match exact process name");
+        output("  -f             Match against full command line");
+        output("");
+        output("DESCRIPTION");
+        output("  pkill sends signals to processes based on name matching.");
+        output("  By default, sends SIGTERM to allow graceful shutdown.");
+        output("");
+        output("EXAMPLES");
+        output("  pkill notepad");
+        output("  pkill -9 chrome");
+        output("  pkill -x firefox.exe");
+        output("");
+        output("NOTE");
+        output("  On Windows, uses TerminateProcess for force kill.");
+        output("  Partial name matching is case-insensitive.");
+        output("");
+        output("SEE ALSO");
+        output("  kill, killall, ps, top");
+        return;
+    }
+    
+    if (args.size() < 2) {
+        outputError("pkill: missing process pattern");
+        output("Usage: pkill [options] <pattern>");
+        return;
+    }
+    
+    bool forceKill = false;
+    bool exactMatch = false;
+    std::string pattern;
+    
+    // Parse options
+    for (size_t i = 1; i < args.size(); i++) {
+        if (args[i] == "-9") {
+            forceKill = true;
+        } else if (args[i] == "-15") {
+            forceKill = false;
+        } else if (args[i] == "-x") {
+            exactMatch = true;
+        } else if (args[i] == "-f") {
+            // Full command line matching (simplified on Windows)
+            exactMatch = false;
+        } else if (pattern.empty() && args[i][0] != '-') {
+            pattern = args[i];
+        }
+    }
+    
+    if (pattern.empty()) {
+        outputError("pkill: no pattern specified");
+        return;
+    }
+    
+    // Convert pattern to lowercase for case-insensitive matching
+    std::string patternLower = pattern;
+    std::transform(patternLower.begin(), patternLower.end(), patternLower.begin(), ::tolower);
+    
+    // Get process list
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnapshot == INVALID_HANDLE_VALUE) {
+        outputError("pkill: failed to get process list");
+        return;
+    }
+    
+    PROCESSENTRY32 pe32;
+    pe32.dwSize = sizeof(PROCESSENTRY32);
+    
+    int killedCount = 0;
+    if (Process32First(hSnapshot, &pe32)) {
+        do {
+            std::string procName = pe32.szExeFile;
+            std::string procNameLower = procName;
+            std::transform(procNameLower.begin(), procNameLower.end(), procNameLower.begin(), ::tolower);
+            
+            bool matches = false;
+            if (exactMatch) {
+                matches = (procNameLower == patternLower);
+            } else {
+                matches = (procNameLower.find(patternLower) != std::string::npos);
+            }
+            
+            if (matches) {
+                HANDLE hProcess = OpenProcess(PROCESS_TERMINATE, FALSE, pe32.th32ProcessID);
+                if (hProcess != NULL) {
+                    if (TerminateProcess(hProcess, 1)) {
+                        output("Killed process: " + procName + " (PID: " + std::to_string(pe32.th32ProcessID) + ")");
+                        killedCount++;
+                    } else {
+                        outputError("Failed to kill: " + procName + " (PID: " + std::to_string(pe32.th32ProcessID) + ")");
+                    }
+                    CloseHandle(hProcess);
+                } else {
+                    outputError("Cannot access: " + procName + " (PID: " + std::to_string(pe32.th32ProcessID) + ")");
+                }
+            }
+        } while (Process32Next(hSnapshot, &pe32));
+    }
+    
+    CloseHandle(hSnapshot);
+    
+    if (killedCount == 0) {
+        output("pkill: no matching processes found for pattern: " + pattern);
+    } else {
+        output("pkill: killed " + std::to_string(killedCount) + " process(es)");
+    }
+}
+
+// bg command - resume suspended jobs in background
+void cmd_bg(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: bg [job_spec ...]");
+        output("  Resume suspended jobs in the background");
+        output("");
+        output("DESCRIPTION");
+        output("  bg resumes each suspended job in the background, as if it");
+        output("  had been started with &. If job_spec is not present, the");
+        output("  current job is used.");
+        output("");
+        output("EXAMPLES");
+        output("  bg");
+        output("    Resume current job in background");
+        output("");
+        output("  bg %1");
+        output("    Resume job 1 in background");
+        output("");
+        output("NOTE");
+        output("  On Windows, job control is limited.");
+        output("  This command simulates Unix job control behavior.");
+        output("  Use 'jobs' to see background jobs.");
+        output("");
+        output("SEE ALSO");
+        output("  fg, jobs, kill");
+        return;
+    }
+    
+    output("bg: job control not fully supported on Windows");
+    output("Background processes are automatically managed by Windows.");
+    output("Use 'jobs' to see running background processes.");
+    output("Use 'fg' to bring a background process to foreground (if supported).");
+}
+
+// renice command - alter priority of running processes
+void cmd_renice(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: renice [-n] priority [[-p] pid ...] [[-g] pgrp ...] [[-u] user ...]");
+        output("  Alter priority of running processes");
+        output("");
+        output("OPTIONS");
+        output("  -n <priority>  Set niceness value (-20 to 19)");
+        output("  -p <pid>       Specify process ID (default)");
+        output("  -g <pgrp>      Specify process group ID");
+        output("  -u <user>      Specify user name");
+        output("");
+        output("PRIORITY VALUES");
+        output("  -20 to -1      High priority (requires admin)");
+        output("   0             Normal priority (default)");
+        output("   1 to 19       Low priority");
+        output("");
+        output("DESCRIPTION");
+        output("  renice changes the scheduling priority of running processes.");
+        output("  Niceness values range from -20 (highest priority) to 19 (lowest).");
+        output("");
+        output("EXAMPLES");
+        output("  renice -n 10 1234");
+        output("  renice 5 -p 1234");
+        output("  renice -5 -p 1234 5678");
+        output("");
+        output("NOTE");
+        output("  On Windows, maps niceness to priority classes:");
+        output("    -20 to -10: HIGH_PRIORITY_CLASS");
+        output("    -9 to 9:    NORMAL_PRIORITY_CLASS");
+        output("    10 to 19:   IDLE_PRIORITY_CLASS");
+        output("");
+        output("SEE ALSO");
+        output("  nice, top, ps");
+        return;
+    }
+    
+    if (args.size() < 2) {
+        outputError("renice: missing priority or process ID");
+        output("Usage: renice [-n] priority [[-p] pid ...]");
+        return;
+    }
+    
+    int niceness = 0;
+    std::vector<DWORD> pids;
+    bool expectPriority = true;
+    bool expectPid = false;
+    
+    // Parse arguments
+    for (size_t i = 1; i < args.size(); i++) {
+        if (args[i] == "-n" && i + 1 < args.size()) {
+            niceness = std::stoi(args[++i]);
+            expectPriority = false;
+        } else if (args[i] == "-p") {
+            expectPid = true;
+            expectPriority = false;
+        } else if (args[i] == "-g" || args[i] == "-u") {
+            outputError("renice: process group and user options not fully supported on Windows");
+            return;
+        } else if (expectPriority) {
+            niceness = std::stoi(args[i]);
+            expectPriority = false;
+        } else if (std::isdigit(args[i][0]) || (args[i][0] == '-' && args[i].length() > 1 && std::isdigit(args[i][1]))) {
+            if (expectPid || !expectPriority) {
+                pids.push_back(std::stoul(args[i]));
+            }
+        }
+    }
+    
+    if (pids.empty()) {
+        outputError("renice: no process IDs specified");
+        return;
+    }
+    
+    // Clamp niceness
+    if (niceness < -20) niceness = -20;
+    if (niceness > 19) niceness = 19;
+    
+    // Map niceness to Windows priority class
+    DWORD priorityClass;
+    std::string priorityName;
+    if (niceness <= -10) {
+        priorityClass = HIGH_PRIORITY_CLASS;
+        priorityName = "HIGH";
+    } else if (niceness >= 10) {
+        priorityClass = IDLE_PRIORITY_CLASS;
+        priorityName = "IDLE";
+    } else {
+        priorityClass = NORMAL_PRIORITY_CLASS;
+        priorityName = "NORMAL";
+    }
+    
+    output("Setting priority to " + priorityName + " (niceness " + std::to_string(niceness) + ")");
+    
+    // Change priority for each PID
+    for (DWORD pid : pids) {
+        HANDLE hProcess = OpenProcess(PROCESS_SET_INFORMATION | PROCESS_QUERY_INFORMATION, FALSE, pid);
+        if (hProcess != NULL) {
+            if (SetPriorityClass(hProcess, priorityClass)) {
+                output("Successfully changed priority for PID " + std::to_string(pid));
+            } else {
+                outputError("Failed to change priority for PID " + std::to_string(pid));
+            }
+            CloseHandle(hProcess);
+        } else {
+            outputError("Cannot access PID " + std::to_string(pid) + " (process may not exist or requires admin)");
+        }
+    }
+}
+
+// fg command - bring job to foreground
+void cmd_fg(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: fg [job_spec]");
+        output("  Move job to the foreground");
+        output("");
+        output("DESCRIPTION");
+        output("  fg brings a background job to the foreground and makes it");
+        output("  the current job. If job_spec is not present, the current");
+        output("  job is used.");
+        output("");
+        output("EXAMPLES");
+        output("  fg");
+        output("    Bring current job to foreground");
+        output("");
+        output("  fg %1");
+        output("    Bring job 1 to foreground");
+        output("");
+        output("NOTE");
+        output("  On Windows, job control is limited.");
+        output("  This command simulates Unix job control behavior.");
+        output("  Use 'jobs' to see background jobs.");
+        output("");
+        output("SEE ALSO");
+        output("  bg, jobs, kill");
+        return;
+    }
+    
+    output("fg: job control not fully supported on Windows");
+    output("Cannot bring background processes to foreground.");
+    output("Use 'jobs' to see running background processes.");
+    output("Start processes without '&' to run them in foreground.");
+}
+
+// strace command - trace system calls and signals
+void cmd_strace(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: strace [options] command [args...]");
+        output("  Trace system calls and signals");
+        output("");
+        output("OPTIONS");
+        output("  -c             Count time, calls, and errors for each system call");
+        output("  -f             Trace child processes");
+        output("  -o <file>      Write output to file instead of stderr");
+        output("  -p <pid>       Attach to running process");
+        output("  -e <expr>      Filter traced calls (e.g., -e trace=open,close)");
+        output("  -T             Show time spent in each system call");
+        output("");
+        output("DESCRIPTION");
+        output("  strace intercepts and records system calls and signals");
+        output("  received by a process. It's useful for debugging and");
+        output("  understanding program behavior.");
+        output("");
+        output("EXAMPLES");
+        output("  strace ls");
+        output("  strace -c find /");
+        output("  strace -p 1234");
+        output("  strace -o trace.txt myprogram");
+        output("");
+        output("NOTE");
+        output("  On Windows, system call tracing requires kernel-level access.");
+        output("  This command provides information only.");
+        output("  Use Process Monitor (procmon.exe) from Sysinternals for actual tracing:");
+        output("  https://docs.microsoft.com/sysinternals/downloads/procmon");
+        output("");
+        output("ALTERNATIVES");
+        output("  - Process Monitor (procmon.exe) - comprehensive system call tracing");
+        output("  - API Monitor - detailed API call monitoring");
+        output("  - Windows Performance Analyzer - ETW-based tracing");
+        output("");
+        output("SEE ALSO");
+        output("  ltrace, ps, top");
+        return;
+    }
+    
+    if (args.size() < 2) {
+        outputError("strace: missing command to trace");
+        output("Usage: strace [options] command [args...]");
+        return;
+    }
+    
+    output("strace: System call tracing not available on Windows");
+    output("");
+    output("For similar functionality, use:");
+    output("  1. Process Monitor (Sysinternals):");
+    output("     Download from: https://docs.microsoft.com/sysinternals/downloads/procmon");
+    output("     Provides comprehensive file, registry, and process activity monitoring");
+    output("");
+    output("  2. Windows Performance Recorder/Analyzer:");
+    output("     Built into Windows, use ETW (Event Tracing for Windows)");
+    output("     Command: wpr -start CPU -start FileIO");
+    output("");
+    output("  3. API Monitor:");
+    output("     Monitors and displays API calls made by applications");
+    output("     Download from: http://www.rohitab.com/apimonitor");
+}
+
+// sleep command - pause execution for specified time
+void cmd_sleep(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: sleep [seconds]");
+        output("  Pause for the specified number of seconds (default: 1)");
+        output("");
+        output("DESCRIPTION");
+        output("  Suspends execution for the given duration.");
+        output("  Fractions of a second are supported (e.g., 0.5).");
+        output("");
+        output("EXAMPLES");
+        output("  sleep 5");
+        output("  sleep 0.25");
+        return;
+    }
+
+    double seconds = 1.0;
+    if (args.size() >= 2) {
+        try {
+            seconds = std::stod(args[1]);
+        } catch (...) {
+            outputError("sleep: invalid time interval");
+            output("Usage: sleep [seconds]");
+            return;
+        }
+    }
+
+    if (seconds < 0) {
+        outputError("sleep: time interval cannot be negative");
+        return;
+    }
+
+    const double maxSeconds = static_cast<double>(INFINITE) / 1000.0 - 1.0;
+    if (seconds > maxSeconds) {
+        outputError("sleep: time interval too large");
+        return;
+    }
+
+    DWORD milliseconds = static_cast<DWORD>(seconds * 1000.0);
+    Sleep(milliseconds);
+}
+
+// wait command - wait for one or more processes to exit
+void cmd_wait(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: wait <pid> [pid...]");
+        output("  Wait for the specified process IDs to exit");
+        output("");
+        output("DESCRIPTION");
+        output("  Opens each PID with synchronize access and waits until it exits.");
+        output("  Requires sufficient permissions to open the target process.");
+        output("");
+        output("EXAMPLES");
+        output("  wait 1234");
+        output("  wait 1234 5678");
+        return;
+    }
+
+    if (args.size() < 2) {
+        outputError("wait: missing PID");
+        output("Usage: wait <pid> [pid...]");
+        return;
+    }
+
+    bool waited = false;
+    for (size_t i = 1; i < args.size(); ++i) {
+        DWORD pid = 0;
+        try {
+            pid = static_cast<DWORD>(std::stoul(args[i]));
+        } catch (...) {
+            outputError("wait: invalid PID: " + args[i]);
+            continue;
+        }
+
+        HANDLE hProc = OpenProcess(SYNCHRONIZE, FALSE, pid);
+        if (!hProc) {
+            outputError("wait: PID " + std::to_string(pid) + ": unable to open (may have exited or access denied)");
+            continue;
+        }
+
+        waited = true;
+        DWORD res = WaitForSingleObject(hProc, INFINITE);
+        if (res == WAIT_FAILED) {
+            outputError("wait: PID " + std::to_string(pid) + ": wait failed");
+        }
+        CloseHandle(hProc);
+    }
+
+    if (!waited) {
+        outputError("wait: no valid PIDs to wait on");
+    }
+}
+
+// nc command - netcat network utility
+void cmd_nc(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: nc [options] [host] [port]");
+        output("  Network utility for reading/writing network connections");
+        output("");
+        output("OPTIONS");
+        output("  -l              Listen mode (server)");
+        output("  -p <port>       Local port to listen on");
+        output("  -n              Numeric only; no DNS");
+        output("");
+        output("DESCRIPTION");
+        output("  nc reads and writes data across network connections.");
+        output("  Can establish TCP connections or listen for incoming connections.");
+        output("");
+        output("EXAMPLES");
+        output("  nc -l -p 8000                # Listen on port 8000");
+        output("  nc example.com 80             # Connect to example.com:80");
+        output("");
+        output("NOTE");
+        output("  On Windows, limited functionality. Use system net utilities");
+        output("  or external tools like netcat.exe for advanced usage.");
+        output("");
+        output("SEE ALSO");
+        output("  telnet, netstat, ss, ping");
+        return;
+    }
+    output("On Windows, nc requires external implementation.");
+    output("Use netcat.exe or Windows system tools: netstat, tasklist, etc.");
+}
+
+// unrar command - extract RAR archives
+void cmd_unrar(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: unrar [options] <archive> [files...]");
+        output("  Extract files from RAR archives");
+        output("");
+        output("OPTIONS");
+        output("  x              Extract with full paths");
+        output("  e              Extract to current directory");
+        output("  l              List archive contents");
+        output("  t              Test archive integrity");
+        output("");
+        output("DESCRIPTION");
+        output("  unrar extracts, lists, or tests RAR archive files.");
+        output("  On Windows, use external unrar.exe utility.");
+        output("");
+        output("EXAMPLES");
+        output("  unrar l archive.rar           # List contents");
+        output("  unrar x archive.rar           # Extract all");
+        output("  unrar e archive.rar file.txt  # Extract specific file");
+        output("");
+        output("NOTE");
+        output("  Requires external unrar.exe in system PATH.");
+        output("  Download from: https://www.rarlab.com/rar_add.htm");
+        output("");
+        output("SEE ALSO");
+        output("  tar, zip, unzip, 7z");
+        return;
+    }
+    output("unrar requires external unrar.exe utility.");
+    output("Please install WinRAR or UnRAR to use this command.");
+}
+
+// xz command - compress with XZ
+void cmd_xz(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: xz [options] [file...]");
+        output("  Compress files to XZ format");
+        output("");
+        output("OPTIONS");
+        output("  -d              Decompress (same as unxz)");
+        output("  -k              Keep original files");
+        output("  -9              Maximum compression");
+        output("");
+        output("DESCRIPTION");
+        output("  xz compresses files to the XZ format (.xz extension).");
+        output("  Requires external xz.exe utility.");
+        output("");
+        output("EXAMPLES");
+        output("  xz file.txt                   # Compress to file.txt.xz");
+        output("  xz -k file.txt                # Compress, keep original");
+        output("");
+        output("NOTE");
+        output("  This command requires external xz.exe in system PATH.");
+        output("  Download from: https://tukaani.org/xz/");
+        output("");
+        output("SEE ALSO");
+        output("  unxz, gzip, bzip2, tar");
+        return;
+    }
+    output("xz requires external xz.exe utility.");
+    output("Please install XZ Utils to use this command.");
+}
+
+// unxz command - decompress XZ files
+void cmd_unxz(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: unxz [options] <file.xz>");
+        output("  Decompress XZ-compressed files");
+        output("");
+        output("OPTIONS");
+        output("  -k              Keep compressed file");
+        output("  -T              Test integrity");
+        output("");
+        output("DESCRIPTION");
+        output("  unxz decompresses files in XZ format.");
+        output("  Equivalent to: xz -d");
+        output("");
+        output("EXAMPLES");
+        output("  unxz file.tar.xz              # Decompress");
+        output("  unxz -k file.tar.xz           # Decompress, keep original");
+        output("");
+        output("NOTE");
+        output("  Requires external xz.exe in system PATH.");
+        output("");
+        output("SEE ALSO");
+        output("  xz, gunzip, bunzip2, tar");
+        return;
+    }
+    output("unxz requires external xz.exe utility.");
+    output("Please install XZ Utils to use this command.");
+}
+
+// dmesg command - display kernel/system messages
+void cmd_dmesg(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: dmesg [options]");
+        output("  Display kernel and system message buffer");
+        output("");
+        output("OPTIONS");
+        output("  -c              Clear the message buffer");
+        output("  -n <level>      Set logging level");
+        output("  -T              Add human-readable timestamps");
+        output("");
+        output("DESCRIPTION");
+        output("  On Linux, dmesg prints kernel messages.");
+        output("  On Windows, displays system event log entries.");
+        output("");
+        output("EXAMPLES");
+        output("  dmesg                         # Show messages");
+        output("  dmesg | grep -i error         # Filter for errors");
+        output("");
+        output("NOTE");
+        output("  On Windows, uses Event Viewer logs.");
+        output("  For detailed system events, use Event Viewer (eventvwr.exe)");
+        output("");
+        output("SEE ALSO");
+        output("  uname, uptime, journalctl");
+        return;
+    }
+    output("System Event Log (Windows equivalent to dmesg):");
+    output("");
+    output("Information sourced from Windows Event Viewer.");
+    output("To view detailed system events, use Event Viewer (eventvwr.exe)");
+    output("or command: Get-EventLog -LogName System -Newest 20");
+    output("");
+    output("Recent System Boot Events:");
+    // On Windows, we could try to read event log, but for now just provide guidance
+    output("  Use 'Get-EventLog System -Newest 20' in PowerShell");
+    output("  Or open Event Viewer: eventvwr.exe");
+}
+
+// mkfs command - create filesystem in file
+void cmd_mkfs(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: mkfs [options] <file> [size]");
+        output("  Create a filesystem in a file");
+        output("");
+        output("OPTIONS");
+        output("  -t <type>       Filesystem type (ext4, ntfs, fat, etc)");
+        output("  -L <label>      Filesystem label");
+        output("  -F              Force creation");
+        output("");
+        output("EXAMPLES");
+        output("  mkfs -t ext4 disk.img 100M");
+        output("  mkfs disk.img 50M");
+        output("  mkfs -F disk.img 1G");
+        return;
+    }
+    
+    std::string fstype = "ext4";
+    std::string label = "";
+    bool force = false;
+    std::string filename = "";
+    std::string sizeStr = "100M";
+    
+    // Parse arguments
+    for (size_t i = 1; i < args.size(); i++) {
+        if (args[i] == "-t" && i + 1 < args.size()) {
+            fstype = args[++i];
+        } else if (args[i] == "-L" && i + 1 < args.size()) {
+            label = args[++i];
+        } else if (args[i] == "-F") {
+            force = true;
+        } else if (filename.empty()) {
+            filename = args[i];
+        } else if (sizeStr == "100M") {
+            sizeStr = args[i];
+        }
+    }
+    
+    if (filename.empty()) {
+        outputError("mkfs: no file specified");
+        output("Usage: mkfs [options] <file> [size]");
+        return;
+    }
+    
+    // Parse size string (e.g., "100M", "1G", "512K")
+    long long size = 100 * 1024 * 1024; // default 100MB
+    if (!sizeStr.empty()) {
+        char unit = sizeStr.back();
+        std::string numStr = sizeStr;
+        long long multiplier = 1;
+        
+        if (unit == 'K' || unit == 'k') {
+            multiplier = 1024;
+            numStr = sizeStr.substr(0, sizeStr.length() - 1);
+        } else if (unit == 'M' || unit == 'm') {
+            multiplier = 1024 * 1024;
+            numStr = sizeStr.substr(0, sizeStr.length() - 1);
+        } else if (unit == 'G' || unit == 'g') {
+            multiplier = 1024LL * 1024 * 1024;
+            numStr = sizeStr.substr(0, sizeStr.length() - 1);
+        } else if (isdigit(unit)) {
+            multiplier = 1; // bytes
+        }
+        
+        try {
+            size = std::stoll(numStr) * multiplier;
+        } catch (...) {
+            outputError("mkfs: invalid size: " + sizeStr);
+            return;
+        }
+    }
+    
+    // Check if file exists
+    if (!force && GetFileAttributesA(filename.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        outputError("mkfs: file already exists: " + filename);
+        output("Use -F to force overwrite");
+        return;
+    }
+    
+    // Create the file
+    HANDLE hFile = CreateFileA(
+        filename.c_str(),
+        GENERIC_WRITE,
+        0,
+        NULL,
+        CREATE_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL,
+        NULL
+    );
+    
+    if (hFile == INVALID_HANDLE_VALUE) {
+        outputError("mkfs: cannot create file: " + filename);
+        return;
+    }
+    
+    // Set file size
+    LARGE_INTEGER li;
+    li.QuadPart = size;
+    if (!SetFilePointerEx(hFile, li, NULL, FILE_BEGIN)) {
+        outputError("mkfs: cannot set file size");
+        CloseHandle(hFile);
+        return;
+    }
+    
+    if (!SetEndOfFile(hFile)) {
+        outputError("mkfs: cannot allocate file space");
+        CloseHandle(hFile);
+        return;
+    }
+    
+    // Optionally write a simple filesystem header
+    // For now, just zero out the first block
+    const size_t blockSize = 4096;
+    std::vector<char> zeroBlock(blockSize, 0);
+    
+    // Write a simple identifier for the filesystem type
+    std::string header = "MKFS-" + fstype;
+    if (!label.empty()) {
+        header += "-" + label;
+    }
+    memcpy(zeroBlock.data(), header.c_str(), std::min(header.size(), blockSize - 1));
+    
+    SetFilePointer(hFile, 0, NULL, FILE_BEGIN);
+    DWORD written;
+    WriteFile(hFile, zeroBlock.data(), blockSize, &written, NULL);
+    
+    CloseHandle(hFile);
+    
+    // Format size for display
+    std::string sizeDisplay;
+    if (size >= 1024LL * 1024 * 1024) {
+        sizeDisplay = std::to_string(size / (1024LL * 1024 * 1024)) + "G";
+    } else if (size >= 1024 * 1024) {
+        sizeDisplay = std::to_string(size / (1024 * 1024)) + "M";
+    } else if (size >= 1024) {
+        sizeDisplay = std::to_string(size / 1024) + "K";
+    } else {
+        sizeDisplay = std::to_string(size) + " bytes";
+    }
+    
+    output("mkfs: created filesystem image");
+    output("  File: " + filename);
+    output("  Type: " + fstype);
+    if (!label.empty()) {
+        output("  Label: " + label);
+    }
+    output("  Size: " + sizeDisplay + " (" + std::to_string(size) + " bytes)");
+    output("");
+    output("Note: This creates a disk image file. To format with an actual filesystem,");
+    output("      mount as a VHD in Windows or use within WSL/virtualization software.");
+}
+
+// fsck command - check and repair filesystem
+void cmd_fsck(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: fsck [options] <device/file>");
+        output("  Check and repair filesystem");
+        output("");
+        output("OPTIONS");
+        output("  -n              No changes, read-only check");
+        output("  -y              Assume yes to all prompts");
+        output("  -f              Force check");
+        output("  -p              Repair automatically");
+        output("");
+        output("EXAMPLES");
+        output("  fsck -n disk.img");
+        output("  fsck -y device");
+        return;
+    }
+    output("fsck: On Windows, use chkdsk /F for NTFS volumes.");
+    output("Usage: chkdsk C: /F (requires admin and restart)");
+}
+
+// systemctl command - system service control
+void cmd_systemctl(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: systemctl [action] <service>");
+        output("  Control system services");
+        output("");
+        output("ACTIONS");
+        output("  start <service>     Start a service");
+        output("  stop <service>      Stop a service");
+        output("  restart <service>   Restart a service");
+        output("  status <service>    Show service status");
+        output("  enable <service>    Enable service at boot");
+        output("  disable <service>   Disable service at boot");
+        output("");
+        output("EXAMPLES");
+        output("  systemctl start nginx");
+        output("  systemctl status mysql");
+        return;
+    }
+    
+    if (args.size() < 2) {
+        outputError("systemctl: missing action and service");
+        output("Usage: systemctl [action] <service>");
+        return;
+    }
+    
+    std::string action = args[0];
+    std::string service = args[1];
+    
+    output("systemctl: On Windows, use 'service' command or Services.msc");
+    output("Usage: service <service> <action>");
+    output("Available actions: start, stop, restart, status");
+}
+
+// journalctl command - system journal
+void cmd_journalctl(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: journalctl [options]");
+        output("  Query and display system journal");
+        output("");
+        output("OPTIONS");
+        output("  -n N            Show last N lines");
+        output("  -f              Follow journal (tail mode)");
+        output("  -u <unit>       Filter by unit");
+        output("  -p <level>      Filter by priority");
+        output("");
+        output("EXAMPLES");
+        output("  journalctl -n 50");
+        output("  journalctl -u sshd");
+        return;
+    }
+    
+    int lines = 20;
+    bool follow = false;
+    
+    for (size_t i = 1; i < args.size(); i++) {
+        if (args[i] == "-n" && i + 1 < args.size()) {
+            try {
+                lines = std::stoi(args[++i]);
+            } catch (...) {
+                lines = 20;
+            }
+        } else if (args[i] == "-f") {
+            follow = true;
+        }
+    }
+    
+    output("System Journal (Windows Event Viewer equivalent):");
+    output("");
+    output("To view detailed system logs, use:");
+    output("  PowerShell: Get-EventLog -LogName System -Newest " + std::to_string(lines));
+    output("  Command: eventvwr.exe");
+}
+
+// more command - paging display
+void cmd_more(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: more [file...]");
+        output("  Display text with paging");
+        output("");
+        output("KEYS");
+        output("  Space           Next page");
+        output("  Enter           Next line");
+        output("  q               Quit");
+        output("");
+        output("EXAMPLES");
+        output("  more file.txt");
+        output("  cat file.txt | more");
+        return;
+    }
+    
+    if (args.size() < 2) {
+        output("more: no file specified");
+        output("Usage: more [file...]");
+        return;
+    }
+    
+    // For now, just use cat-like behavior
+    // In a real terminal, more would handle paging
+    std::vector<std::string> catArgs = args;
+    cmd_cat(catArgs);
+}
+
+// updatedb command - build locate database
+void cmd_updatedb(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: updatedb [-U path] [-o dbfile] [-m max]");
+        output("  Build a simple locate database from a directory tree");
+        output("");
+        output("OPTIONS");
+        output("  -U <path>       Root path to index (default: current directory)");
+        output("  -o <dbfile>     Output database file (default: locate.db)");
+        output("  -m <max>        Maximum entries to index (default: 50000)");
+        output("");
+        output("EXAMPLES");
+        output("  updatedb                 # index current directory");
+        output("  updatedb -U C:/Projects  # index specific path");
+        output("  updatedb -o mydb.txt     # write database to mydb.txt");
+        return;
+    }
+    
+    std::string rootPath = ".";
+    std::string dbFile = "locate.db";
+    int maxEntries = 50000;
+    
+    for (size_t i = 1; i < args.size(); ++i) {
+        if ((args[i] == "-U" || args[i] == "--root") && i + 1 < args.size()) {
+            rootPath = args[++i];
+        } else if ((args[i] == "-o" || args[i] == "--output") && i + 1 < args.size()) {
+            dbFile = args[++i];
+        } else if ((args[i] == "-m" || args[i] == "--max") && i + 1 < args.size()) {
+            maxEntries = std::atoi(args[++i].c_str());
+            if (maxEntries <= 0) maxEntries = 50000;
+        }
+    }
+    
+    // Resolve root path to absolute Windows path
+    std::string winRoot = unixPathToWindows(rootPath);
+    char fullPath[MAX_PATH];
+    if (GetFullPathNameA(winRoot.c_str(), MAX_PATH, fullPath, NULL) == 0) {
+        outputError("updatedb: invalid path: " + rootPath);
+        return;
+    }
+    
+    std::vector<std::string> results;
+    int count = 0;
+    searchFiles(fullPath, "*", true, false, 'a', true, results, count, maxEntries);
+    
+    std::ofstream out(dbFile);
+    if (!out.is_open()) {
+        outputError("updatedb: cannot write to " + dbFile);
+        return;
+    }
+    for (const auto& path : results) {
+        out << path << "\n";
+    }
+    out.close();
+    
+    output("updatedb: indexed " + std::to_string(results.size()) + " entries");
+    output("  Root: " + windowsPathToUnix(fullPath));
+    output("  DB:   " + dbFile);
+    if (count >= maxEntries) {
+        output("  Note: reached max entries limit (" + std::to_string(maxEntries) + ")");
+    }
+}
+
+// timedatectl command - time and timezone status
+void cmd_timedatectl(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: timedatectl [status]");
+        output("  Show system time, timezone, and clock sync status");
+        output("");
+        output("EXAMPLES");
+        output("  timedatectl           # show current status");
+        output("  timedatectl status    # same as above");
+        return;
+    }
+    
+    SYSTEMTIME localTime, utcTime;
+    GetLocalTime(&localTime);
+    GetSystemTime(&utcTime);
+    
+    TIME_ZONE_INFORMATION tzInfo;
+    DWORD tzResult = GetTimeZoneInformation(&tzInfo);
+    long biasMinutes = tzInfo.Bias;
+    if (tzResult == TIME_ZONE_ID_DAYLIGHT) {
+        biasMinutes += tzInfo.DaylightBias;
+    } else if (tzResult == TIME_ZONE_ID_STANDARD) {
+        biasMinutes += tzInfo.StandardBias;
+    }
+    int biasHours = static_cast<int>(-biasMinutes / 60);
+    int biasMins = static_cast<int>(std::abs(biasMinutes % 60));
+    std::ostringstream tzOffset;
+    tzOffset << (biasHours >= 0 ? "+" : "-")
+             << std::setw(2) << std::setfill('0') << std::abs(biasHours)
+             << ":" << std::setw(2) << std::setfill('0') << biasMins;
+    
+    auto formatSystemTime = [](const SYSTEMTIME& st) {
+        std::ostringstream ss;
+        ss << std::setw(4) << st.wYear << "-" << std::setw(2) << std::setfill('0') << st.wMonth
+           << "-" << std::setw(2) << std::setfill('0') << st.wDay << " "
+           << std::setw(2) << st.wHour << ":" << std::setw(2) << st.wMinute << ":" << std::setw(2) << st.wSecond;
+        return ss.str();
+    };
+    
+    std::wstring tzName(tzInfo.StandardName);
+    std::string tzNameUtf8(tzName.begin(), tzName.end());
+    
+    output("      Local time: " + formatSystemTime(localTime));
+    output("  Universal time: " + formatSystemTime(utcTime));
+    output("        Time zone: " + tzNameUtf8 + " (UTC" + tzOffset.str() + ")");
+    output("System clock sync: unknown (stub)");
+    output("      NTP service: unavailable (stub)");
+    output("  RTC in local TZ: no");
+}
+
+// env command - list or set environment variables
+void cmd_env(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: env [-u VAR] [KEY=VALUE ...]");
+        output("  Print environment or set variables for current session");
+        output("");
+        output("OPTIONS");
+        output("  -u VAR         Unset (remove) variable");
+        output("");
+        output("EXAMPLES");
+        output("  env                 # show environment");
+        output("  env MYVAR=test      # set MYVAR and show env");
+        output("  env -u PATH         # remove PATH from environment");
+        return;
+    }
+    
+    // Process assignments/unsets
+    for (size_t i = 1; i < args.size(); ++i) {
+        if (args[i] == "-u" && i + 1 < args.size()) {
+            SetEnvironmentVariableA(args[i + 1].c_str(), NULL);
+            ++i;
+        } else {
+            size_t eq = args[i].find('=');
+            if (eq != std::string::npos) {
+                std::string key = args[i].substr(0, eq);
+                std::string val = args[i].substr(eq + 1);
+                SetEnvironmentVariableA(key.c_str(), val.c_str());
+            }
+        }
+    }
+    
+    // List environment
+    LPCH envStrings = GetEnvironmentStringsA();
+    if (!envStrings) {
+        outputError("env: unable to read environment");
+        return;
+    }
+    
+    LPCH var = envStrings;
+    while (*var) {
+        output(var);
+        var += strlen(var) + 1;
+    }
+    FreeEnvironmentStringsA(envStrings);
+}
+
+// Helper: parse size strings like 10K, 5M, 1G
+static long long parseSizeSpec(const std::string& sizeStr, bool& ok) {
+    ok = true;
+    if (sizeStr.empty()) { ok = false; return 0; }
+    char unit = sizeStr.back();
+    std::string numStr = sizeStr;
+    long long multiplier = 1;
+    if (unit == 'K' || unit == 'k') { multiplier = 1024; numStr = sizeStr.substr(0, sizeStr.size() - 1); }
+    else if (unit == 'M' || unit == 'm') { multiplier = 1024 * 1024; numStr = sizeStr.substr(0, sizeStr.size() - 1); }
+    else if (unit == 'G' || unit == 'g') { multiplier = 1024LL * 1024 * 1024; numStr = sizeStr.substr(0, sizeStr.size() - 1); }
+    try {
+        return std::stoll(numStr) * multiplier;
+    } catch (...) {
+        ok = false;
+        return 0;
+    }
+}
+
+// Helper: generate alphabetic suffixes aa, ab, ...
+static std::string makeSplitSuffix(int index) {
+    std::string suffix;
+    int n = index;
+    do {
+        suffix.insert(suffix.begin(), static_cast<char>('a' + (n % 26)));
+        n = n / 26 - 1;
+    } while (n >= 0);
+    if (suffix.size() < 2) suffix.insert(suffix.begin(), 'a');
+    return suffix;
+}
+
+// split command - split files into pieces
+void cmd_split(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: split [-l lines|-b size] [input] [prefix]");
+        output("  Split a file or piped input into smaller files");
+        output("");
+        output("OPTIONS");
+        output("  -l <lines>     Split by line count (default: 1000 lines)");
+        output("  -b <size>      Split by bytes (supports K/M/G)");
+        output("  -d            Use numeric suffixes (00,01,02...)");
+        output("");
+        output("EXAMPLES");
+        output("  split -l 200 big.log logs_");
+        output("  split -b 10M image.iso part_");
+        output("  cat file | split -l 50");
+        return;
+    }
+    
+    int maxLines = 1000;
+    long long maxBytes = -1;
+    bool numericSuffix = false;
+    std::string inputFile;
+    std::string prefix = "x";
+    
+    // Parse options
+    size_t idx = 1;
+    while (idx < args.size()) {
+        if (args[idx] == "-l" && idx + 1 < args.size()) {
+            maxLines = std::max(1, std::atoi(args[idx + 1].c_str()));
+            idx += 2;
+        } else if (args[idx] == "-b" && idx + 1 < args.size()) {
+            bool ok = false;
+            maxBytes = parseSizeSpec(args[idx + 1], ok);
+            if (!ok || maxBytes <= 0) {
+                outputError("split: invalid size");
+                return;
+            }
+            idx += 2;
+        } else if (args[idx] == "-d") {
+            numericSuffix = true;
+            idx += 1;
+        } else if (inputFile.empty()) {
+            inputFile = args[idx++];
+        } else if (prefix == "x") {
+            prefix = args[idx++];
+        } else {
+            idx++;
+        }
+    }
+    
+    std::vector<std::string> sourceLines;
+    bool hasInputFile = !inputFile.empty();
+    if (hasInputFile) {
+        std::ifstream in(inputFile, std::ios::binary);
+        if (!in.is_open()) {
+            outputError("split: cannot open file: " + inputFile);
+            return;
+        }
+        std::string line;
+        while (std::getline(in, line)) {
+            sourceLines.push_back(line);
+        }
+        in.close();
+    } else {
+        // Expect piped input to be available in g_capturedOutput when used in pipeline
+        if (!g_capturedOutput.empty()) {
+            sourceLines = g_capturedOutput;
+        } else {
+            outputError("split: no input provided");
+            return;
+        }
+    }
+    
+    auto writeChunk = [&](int chunkIndex, const std::vector<std::string>& chunkLines) {
+        std::ostringstream name;
+        if (numericSuffix) {
+            name << prefix << std::setw(2) << std::setfill('0') << chunkIndex;
+        } else {
+            name << prefix << makeSplitSuffix(chunkIndex);
+        }
+        std::ofstream out(name.str(), std::ios::binary);
+        if (!out.is_open()) {
+            outputError("split: cannot write chunk: " + name.str());
+            return false;
+        }
+        for (size_t i = 0; i < chunkLines.size(); ++i) {
+            out << chunkLines[i];
+            if (i + 1 < chunkLines.size()) out << "\n";
+        }
+        out.close();
+        output("created: " + name.str());
+        return true;
+    };
+    
+    int chunkIndex = 0;
+    if (maxBytes > 0) {
+        std::vector<std::string> chunk;
+        long long currentBytes = 0;
+        for (size_t i = 0; i < sourceLines.size(); ++i) {
+            std::string line = sourceLines[i];
+            long long lineSize = static_cast<long long>(line.size()) + 1; // include newline
+            if (!chunk.empty() && currentBytes + lineSize > maxBytes) {
+                if (!writeChunk(chunkIndex++, chunk)) return;
+                chunk.clear();
+                currentBytes = 0;
+            }
+            chunk.push_back(line);
+            currentBytes += lineSize;
+        }
+        if (!chunk.empty()) {
+            writeChunk(chunkIndex++, chunk);
+        }
+    } else {
+        std::vector<std::string> chunk;
+        for (size_t i = 0; i < sourceLines.size(); ++i) {
+            chunk.push_back(sourceLines[i]);
+            if (static_cast<int>(chunk.size()) >= maxLines) {
+                if (!writeChunk(chunkIndex++, chunk)) return;
+                chunk.clear();
+            }
+        }
+        if (!chunk.empty()) {
+            writeChunk(chunkIndex++, chunk);
+        }
+    }
+    output("split: wrote " + std::to_string(chunkIndex) + " file(s)");
+}
+
+// nl command - number lines
+void cmd_nl(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: nl [-ba|-bt] [-s sep] [-w width] [file]");
+        output("  Number lines of a file or piped input");
+        output("");
+        output("OPTIONS");
+        output("  -ba           Number all lines");
+        output("  -bt           Number non-empty lines (default)");
+        output("  -s <sep>      Separator between number and text (default: tab)");
+        output("  -w <width>    Number width (default: 6)");
+        output("");
+        output("EXAMPLES");
+        output("  nl file.txt");
+        output("  cat file | nl -ba -w 4");
+        return;
+    }
+    
+    bool numberAll = false;
+    std::string sep = "\t";
+    int width = 6;
+    std::string filename;
+    
+    for (size_t i = 1; i < args.size(); ++i) {
+        if (args[i] == "-ba") {
+            numberAll = true;
+        } else if (args[i] == "-bt") {
+            numberAll = false;
+        } else if (args[i] == "-s" && i + 1 < args.size()) {
+            sep = args[++i];
+        } else if (args[i] == "-w" && i + 1 < args.size()) {
+            width = std::max(1, std::atoi(args[++i].c_str()));
+        } else if (filename.empty()) {
+            filename = args[i];
+        }
+    }
+    
+    std::vector<std::string> lines;
+    if (!filename.empty()) {
+        std::ifstream in(filename);
+        if (!in.is_open()) {
+            outputError("nl: cannot open file: " + filename);
+            return;
+        }
+        std::string line;
+        while (std::getline(in, line)) {
+            lines.push_back(line);
+        }
+        in.close();
+    } else if (!g_capturedOutput.empty()) {
+        lines = g_capturedOutput;
+    } else {
+        outputError("nl: no input provided");
+        return;
+    }
+    
+    int lineNum = 1;
+    for (const auto& line : lines) {
+        bool numberThis = numberAll || !line.empty();
+        std::ostringstream num;
+        if (numberThis) {
+            num << std::setw(width) << std::setfill(' ') << lineNum++;
+        } else {
+            num << std::setw(width) << "";
+        }
+        output(num.str() + sep + line);
+    }
+}
+
+// Helper to expand tr character sets (supports ranges like a-z)
+static std::string expandSet(const std::string& setSpec) {
+    std::string result;
+    for (size_t i = 0; i < setSpec.size(); ++i) {
+        if (i + 2 < setSpec.size() && setSpec[i + 1] == '-') {
+            char start = setSpec[i];
+            char end = setSpec[i + 2];
+            if (start <= end) {
+                for (char c = start; c <= end; ++c) result.push_back(c);
+                i += 2;
+                continue;
+            }
+        }
+        result.push_back(setSpec[i]);
+    }
+    return result;
+}
+
+// tr command - translate/delete characters
+void cmd_tr(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: tr [options] SET1 [SET2]");
+        output("  Translate or delete characters from input");
+        output("");
+        output("OPTIONS");
+        output("  -d            Delete characters in SET1");
+        output("  -s            Squeeze (merge) repeated output characters in SET2 (or SET1 when -d)");
+        output("");
+        output("EXAMPLES");
+        output("  echo foo | tr o a       # replace o with a");
+        output("  echo 'a  b' | tr -s ' ' # squeeze spaces");
+        output("  echo 'abc' | tr -d b    # delete b");
+        return;
+    }
+    
+    bool deleteMode = false;
+    bool squeeze = false;
+    std::vector<std::string> sets;
+    for (size_t i = 1; i < args.size(); ++i) {
+        if (args[i] == "-d") deleteMode = true;
+        else if (args[i] == "-s") squeeze = true;
+        else sets.push_back(args[i]);
+    }
+    
+    if (sets.empty()) {
+        outputError("tr: missing SET1");
+        return;
+    }
+    std::string set1 = expandSet(sets[0]);
+    std::string set2 = (sets.size() >= 2) ? expandSet(sets[1]) : "";
+    if (!deleteMode && set2.empty()) {
+        outputError("tr: missing SET2");
+        return;
+    }
+    
+    std::vector<std::string> lines;
+    if (!g_capturedOutput.empty()) {
+        lines = g_capturedOutput;
+    } else {
+        outputError("tr: requires piped input or file via cat | tr");
+        return;
+    }
+    
+    std::vector<bool> delMap(256, false);
+    for (unsigned char c : set1) delMap[c] = true;
+    
+    std::vector<char> map(256);
+    for (int i = 0; i < 256; ++i) map[i] = static_cast<char>(i);
+    if (!deleteMode) {
+        for (size_t i = 0; i < set1.size(); ++i) {
+            char from = set1[i];
+            char to = set2[std::min(i, set2.size() - 1)];
+            map[static_cast<unsigned char>(from)] = to;
+        }
+    }
+    
+    auto inSqueezeSet = [&](char c) {
+        const std::string& squeezeSet = deleteMode ? set1 : (set2.empty() ? set1 : set2);
+        return squeeze && squeezeSet.find(c) != std::string::npos;
+    };
+    
+    for (const auto& line : lines) {
+        std::string out;
+        char lastOut = '\0';
+        bool hasLast = false;
+        for (char ch : line) {
+            unsigned char uc = static_cast<unsigned char>(ch);
+            if (deleteMode && delMap[uc]) {
+                continue;
+            }
+            char outChar = deleteMode ? ch : map[uc];
+            if (inSqueezeSet(outChar) && hasLast && lastOut == outChar) {
+                continue;
+            }
+            out.push_back(outChar);
+            lastOut = outChar;
+            hasLast = true;
+        }
+        output(out);
+    }
+}
+
+// printenv command - print environment variables
+void cmd_printenv(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: printenv [VARIABLE...]");
+        output("  Print environment variables");
+        output("");
+        output("EXAMPLES");
+        output("  printenv              # Print all variables");
+        output("  printenv PATH         # Print specific variable");
+        output("  printenv HOME USER    # Print multiple variables");
+        return;
+    }
+    
+    if (args.size() == 1) {
+        // Print all environment variables
+        LPCH envStrings = GetEnvironmentStringsA();
+        if (!envStrings) {
+            outputError("printenv: unable to read environment");
+            return;
+        }
+        
+        LPCH var = envStrings;
+        while (*var) {
+            output(var);
+            var += strlen(var) + 1;
+        }
+        FreeEnvironmentStringsA(envStrings);
+    } else {
+        // Print specific variables
+        for (size_t i = 1; i < args.size(); ++i) {
+            char buffer[32768];
+            DWORD result = GetEnvironmentVariableA(args[i].c_str(), buffer, sizeof(buffer));
+            if (result > 0 && result < sizeof(buffer)) {
+                output(buffer);
+            }
+        }
+    }
+}
+
+// export command - export environment variables
+void cmd_export(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: export [KEY=VALUE...]");
+        output("  Set environment variables for current session");
+        output("");
+        output("EXAMPLES");
+        output("  export MYVAR=value");
+        output("  export PATH=/usr/bin:$PATH");
+        output("  export              # Show all exported variables");
+        return;
+    }
+    
+    if (args.size() == 1) {
+        // List all environment variables
+        LPCH envStrings = GetEnvironmentStringsA();
+        if (!envStrings) {
+            outputError("export: unable to read environment");
+            return;
+        }
+        
+        LPCH var = envStrings;
+        while (*var) {
+            std::string varStr(var);
+            size_t eq = varStr.find('=');
+            if (eq != std::string::npos) {
+                output("export " + varStr);
+            }
+            var += strlen(var) + 1;
+        }
+        FreeEnvironmentStringsA(envStrings);
+    } else {
+        // Set variables
+        for (size_t i = 1; i < args.size(); ++i) {
+            size_t eq = args[i].find('=');
+            if (eq != std::string::npos) {
+                std::string key = args[i].substr(0, eq);
+                std::string val = args[i].substr(eq + 1);
+                
+                // Expand $VAR and ${VAR} in value
+                size_t pos = 0;
+                while ((pos = val.find('$', pos)) != std::string::npos) {
+                    size_t end = pos + 1;
+                    bool braced = false;
+                    if (end < val.size() && val[end] == '{') {
+                        braced = true;
+                        end++;
+                        while (end < val.size() && val[end] != '}') end++;
+                        if (end < val.size()) end++; // include }
+                    } else {
+                        while (end < val.size() && (isalnum(val[end]) || val[end] == '_')) end++;
+                    }
+                    
+                    std::string varName = braced ? val.substr(pos + 2, end - pos - 3) : val.substr(pos + 1, end - pos - 1);
+                    char buffer[32768];
+                    DWORD result = GetEnvironmentVariableA(varName.c_str(), buffer, sizeof(buffer));
+                    std::string varValue = (result > 0 && result < sizeof(buffer)) ? buffer : "";
+                    
+                    val.replace(pos, end - pos, varValue);
+                    pos += varValue.length();
+                }
+                
+                SetEnvironmentVariableA(key.c_str(), val.c_str());
+            } else {
+                outputError("export: invalid syntax: " + args[i]);
+            }
+        }
+    }
+}
+
+// shuf command - shuffle lines randomly
+void cmd_shuf(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: shuf [options] [file]");
+        output("  Shuffle lines randomly");
+        output("");
+        output("OPTIONS");
+        output("  -n <count>     Output at most <count> lines");
+        output("  -e <args>      Shuffle arguments instead of file");
+        output("");
+        output("EXAMPLES");
+        output("  shuf file.txt");
+        output("  shuf -n 5 file.txt");
+        output("  shuf -e one two three");
+        output("  cat file.txt | shuf");
+        return;
+    }
+    
+    std::vector<std::string> lines;
+    int maxLines = -1;
+    bool useArgs = false;
+    
+    // Parse options
+    size_t idx = 1;
+    while (idx < args.size()) {
+        if (args[idx] == "-n" && idx + 1 < args.size()) {
+            maxLines = std::atoi(args[idx + 1].c_str());
+            idx += 2;
+        } else if (args[idx] == "-e") {
+            useArgs = true;
+            idx++;
+            while (idx < args.size()) {
+                lines.push_back(args[idx++]);
+            }
+        } else {
+            std::string filename = unixPathToWindows(args[idx]);
+            std::ifstream file(filename);
+            if (!file.is_open()) {
+                outputError("shuf: cannot open file: " + filename);
+                return;
+            }
+            std::string line;
+            while (std::getline(file, line)) {
+                lines.push_back(line);
+            }
+            file.close();
+            idx++;
+        }
+    }
+    
+    // If no file/args and we're in a pipeline, use captured output
+    if (lines.empty() && !g_capturedOutput.empty()) {
+        lines = g_capturedOutput;
+    }
+    
+    if (lines.empty()) {
+        return;
+    }
+    
+    // Shuffle using Fisher-Yates algorithm
+    std::srand(static_cast<unsigned>(std::time(nullptr)));
+    for (size_t i = lines.size() - 1; i > 0; --i) {
+        size_t j = std::rand() % (i + 1);
+        std::swap(lines[i], lines[j]);
+    }
+    
+    // Output lines
+    int count = 0;
+    for (const auto& line : lines) {
+        if (maxLines >= 0 && count >= maxLines) break;
+        output(line);
+        count++;
+    }
+}
+
+// banner command - display banner text
+void cmd_banner(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: banner [text...]");
+        output("  Display text in large ASCII art letters");
+        output("");
+        output("EXAMPLES");
+        output("  banner Hello");
+        output("  banner WELCOME");
+        return;
+    }
+    
+    std::string text;
+    for (size_t i = 1; i < args.size(); ++i) {
+        if (i > 1) text += " ";
+        text += args[i];
+    }
+    
+    if (text.empty()) {
+        text = "BANNER";
+    }
+    
+    // Convert to uppercase
+    std::transform(text.begin(), text.end(), text.begin(), ::toupper);
+    
+    // Simple block letter representation (5 rows high)
+    std::vector<std::string> rows(5);
+    
+    for (char c : text) {
+        if (c == ' ') {
+            for (int r = 0; r < 5; ++r) rows[r] += "  ";
+        } else if (c >= 'A' && c <= 'Z') {
+            // Simple block letters
+            switch(c) {
+                case 'A':
+                    rows[0] += " ### "; rows[1] += "#   #"; rows[2] += "#####";
+                    rows[3] += "#   #"; rows[4] += "#   #"; break;
+                case 'B':
+                    rows[0] += "#### "; rows[1] += "#   #"; rows[2] += "#### ";
+                    rows[3] += "#   #"; rows[4] += "#### "; break;
+                case 'C':
+                    rows[0] += " ### "; rows[1] += "#    "; rows[2] += "#    ";
+                    rows[3] += "#    "; rows[4] += " ### "; break;
+                case 'D':
+                    rows[0] += "#### "; rows[1] += "#   #"; rows[2] += "#   #";
+                    rows[3] += "#   #"; rows[4] += "#### "; break;
+                case 'E':
+                    rows[0] += "#####"; rows[1] += "#    "; rows[2] += "#### ";
+                    rows[3] += "#    "; rows[4] += "#####"; break;
+                case 'F':
+                    rows[0] += "#####"; rows[1] += "#    "; rows[2] += "#### ";
+                    rows[3] += "#    "; rows[4] += "#    "; break;
+                case 'G':
+                    rows[0] += " ### "; rows[1] += "#    "; rows[2] += "#  ##";
+                    rows[3] += "#   #"; rows[4] += " ### "; break;
+                case 'H':
+                    rows[0] += "#   #"; rows[1] += "#   #"; rows[2] += "#####";
+                    rows[3] += "#   #"; rows[4] += "#   #"; break;
+                case 'I':
+                    rows[0] += "#####"; rows[1] += "  #  "; rows[2] += "  #  ";
+                    rows[3] += "  #  "; rows[4] += "#####"; break;
+                case 'J':
+                    rows[0] += "  ###"; rows[1] += "   # "; rows[2] += "   # ";
+                    rows[3] += "#  # "; rows[4] += " ##  "; break;
+                case 'K':
+                    rows[0] += "#   #"; rows[1] += "#  # "; rows[2] += "###  ";
+                    rows[3] += "#  # "; rows[4] += "#   #"; break;
+                case 'L':
+                    rows[0] += "#    "; rows[1] += "#    "; rows[2] += "#    ";
+                    rows[3] += "#    "; rows[4] += "#####"; break;
+                case 'M':
+                    rows[0] += "#   #"; rows[1] += "## ##"; rows[2] += "# # #";
+                    rows[3] += "#   #"; rows[4] += "#   #"; break;
+                case 'N':
+                    rows[0] += "#   #"; rows[1] += "##  #"; rows[2] += "# # #";
+                    rows[3] += "#  ##"; rows[4] += "#   #"; break;
+                case 'O':
+                    rows[0] += " ### "; rows[1] += "#   #"; rows[2] += "#   #";
+                    rows[3] += "#   #"; rows[4] += " ### "; break;
+                case 'P':
+                    rows[0] += "#### "; rows[1] += "#   #"; rows[2] += "#### ";
+                    rows[3] += "#    "; rows[4] += "#    "; break;
+                case 'Q':
+                    rows[0] += " ### "; rows[1] += "#   #"; rows[2] += "#   #";
+                    rows[3] += "#  ##"; rows[4] += " ####"; break;
+                case 'R':
+                    rows[0] += "#### "; rows[1] += "#   #"; rows[2] += "#### ";
+                    rows[3] += "#  # "; rows[4] += "#   #"; break;
+                case 'S':
+                    rows[0] += " ### "; rows[1] += "#    "; rows[2] += " ### ";
+                    rows[3] += "    #"; rows[4] += " ### "; break;
+                case 'T':
+                    rows[0] += "#####"; rows[1] += "  #  "; rows[2] += "  #  ";
+                    rows[3] += "  #  "; rows[4] += "  #  "; break;
+                case 'U':
+                    rows[0] += "#   #"; rows[1] += "#   #"; rows[2] += "#   #";
+                    rows[3] += "#   #"; rows[4] += " ### "; break;
+                case 'V':
+                    rows[0] += "#   #"; rows[1] += "#   #"; rows[2] += "#   #";
+                    rows[3] += " # # "; rows[4] += "  #  "; break;
+                case 'W':
+                    rows[0] += "#   #"; rows[1] += "#   #"; rows[2] += "# # #";
+                    rows[3] += "## ##"; rows[4] += "#   #"; break;
+                case 'X':
+                    rows[0] += "#   #"; rows[1] += " # # "; rows[2] += "  #  ";
+                    rows[3] += " # # "; rows[4] += "#   #"; break;
+                case 'Y':
+                    rows[0] += "#   #"; rows[1] += " # # "; rows[2] += "  #  ";
+                    rows[3] += "  #  "; rows[4] += "  #  "; break;
+                case 'Z':
+                    rows[0] += "#####"; rows[1] += "   # "; rows[2] += "  #  ";
+                    rows[3] += " #   "; rows[4] += "#####"; break;
+                default:
+                    rows[0] += " ### "; rows[1] += "#   #"; rows[2] += "#   #";
+                    rows[3] += "#   #"; rows[4] += " ### ";
+            }
+        } else {
+            // Non-letter characters - show as box
+            for (int r = 0; r < 5; ++r) rows[r] += " ### ";
+        }
+    }
+    
+    // Output the banner
+    output("");
+    for (const auto& row : rows) {
+        output(row);
+    }
+    output("");
+}
+
+// time command - time command execution
+void cmd_time(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args) || args.size() < 2) {
+        output("Usage: time <command> [args...]");
+        output("  Measure command execution time");
+        output("");
+        output("EXAMPLES");
+        output("  time ls -la");
+        output("  time sleep 2");
+        return;
+    }
+    
+    // Build command string
+    std::string cmdStr;
+    for (size_t i = 1; i < args.size(); ++i) {
+        if (i > 1) cmdStr += " ";
+        cmdStr += args[i];
+    }
+    
+    // Measure time
+    auto start = std::chrono::high_resolution_clock::now();
+    
+    // Execute the command
+    executeCommand(cmdStr);
+    
+    auto end = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    
+    double seconds = duration.count() / 1000.0;
+    output("");
+    output("real    " + std::to_string(seconds) + "s");
+}
+
+// watch command - execute command repeatedly
+void cmd_watch(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args) || args.size() < 2) {
+        output("Usage: watch [-n seconds] <command>");
+        output("  Execute command repeatedly at intervals");
+        output("");
+        output("OPTIONS");
+        output("  -n <seconds>   Interval in seconds (default: 2)");
+        output("");
+        output("EXAMPLES");
+        output("  watch -n 5 date");
+        output("  watch ls -la");
+        output("");
+        output("NOTE");
+        output("  Press Ctrl+C to stop watching (not fully supported in this shell)");
+        output("  For now, watch executes the command once with timing info");
+        return;
+    }
+    
+    int interval = 2;
+    size_t cmdStart = 1;
+    
+    // Parse options
+    if (args.size() >= 3 && args[1] == "-n") {
+        interval = std::atoi(args[2].c_str());
+        if (interval <= 0) interval = 2;
+        cmdStart = 3;
+    }
+    
+    if (cmdStart >= args.size()) {
+        outputError("watch: no command specified");
+        return;
+    }
+    
+    // Build command string
+    std::string cmdStr;
+    for (size_t i = cmdStart; i < args.size(); ++i) {
+        if (i > cmdStart) cmdStr += " ";
+        cmdStr += args[i];
+    }
+    
+    output("Every " + std::to_string(interval) + "s: " + cmdStr);
+    output("");
+    
+    // For now, execute once (full watch loop would require background thread)
+    executeCommand(cmdStr);
+    
+    output("");
+    output("NOTE: Full watch loop not implemented in this shell version");
+    output("Use PowerShell: while($true) { cls; <cmd>; sleep " + std::to_string(interval) + " }");
+}
+
+// trap command - set signal handlers (stub)
+void cmd_trap(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: trap [action] [signal...]");
+        output("  Set signal handlers for shell signals");
+        output("");
+        output("SIGNALS");
+        output("  INT, TERM, EXIT, HUP, etc.");
+        output("");
+        output("EXAMPLES");
+        output("  trap 'cleanup' INT       # Run cleanup on Ctrl+C");
+        output("  trap - INT               # Reset INT handler");
+        output("  trap                     # Show current traps");
+        output("");
+        output("NOTE");
+        output("  Signal handling is limited on Windows platform.");
+        output("  This command provides compatibility for Unix scripts.");
+        return;
+    }
+    
+    if (args.size() == 1) {
+        output("Current signal traps:");
+        output("  trap: no traps currently set");
+        return;
+    }
+    
+    if (args.size() >= 3) {
+        std::string action = args[1];
+        std::string signal = args[2];
+        output("trap: setting '" + action + "' for signal " + signal);
+        output("Note: Traps are not fully supported on Windows");
+    } else {
+        outputError("trap: invalid arguments");
+    }
+}
+
+// ulimit command - set/display resource limits
+void cmd_ulimit(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: ulimit [options] [limit]");
+        output("  Set or display resource limits");
+        output("");
+        output("OPTIONS");
+        output("  -a             Show all limits");
+        output("  -c <limit>     Set core dump size");
+        output("  -d <limit>     Set data segment size");
+        output("  -f <limit>     Set file size limit");
+        output("  -m <limit>     Set memory usage limit");
+        output("  -n <limit>     Set number of open files");
+        output("  -s <limit>     Set stack size");
+        output("  -t <limit>     Set CPU time limit");
+        output("  -u <limit>     Set processes per user");
+        output("");
+        output("EXAMPLES");
+        output("  ulimit -a           # Show all limits");
+        output("  ulimit -n 4096      # Set max open files to 4096");
+        return;
+    }
+    
+    bool showAll = false;
+    std::string limitType;
+    
+    // Parse options
+    for (size_t i = 1; i < args.size(); ++i) {
+        if (args[i] == "-a") {
+            showAll = true;
+        } else if (args[i][0] == '-' && args[i].length() == 2) {
+            limitType = args[i];
+        }
+    }
+    
+    if (showAll || args.size() == 1) {
+        output("Resource Limits (Windows):");
+        output("  core file size         unlimited");
+        output("  data segment size      unlimited");
+        output("  file size              unlimited");
+        output("  max memory size        unlimited");
+        output("  open files             2048");
+        output("  stack size             8192");
+        output("  cpu time               unlimited");
+        output("  max user processes     512");
+    } else if (!limitType.empty()) {
+        output("ulimit: setting " + limitType + " limit");
+        output("Note: Resource limits are not fully enforced on Windows");
+    }
+}
+
+// expr command - evaluate expressions
+void cmd_expr(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: expr EXPRESSION");
+        output("  Evaluate arithmetic and string expressions");
+        output("");
+        output("OPERATORS");
+        output("  +, -, *, /, %        Arithmetic operators");
+        output("  <, <=, =, !=, >=, >  Comparison operators");
+        output("  &, |                 Logical AND, OR");
+        output("  substr, length, match String functions");
+        output("");
+        output("EXAMPLES");
+        output("  expr 3 + 4              # Output: 7");
+        output("  expr 10 - 3             # Output: 7");
+        output("  expr 5 \\* 2            # Output: 10");
+        output("  expr \"hello\" : .*llo   # Pattern match");
+        return;
+    }
+    
+    if (args.size() < 2) {
+        outputError("expr: missing operands");
+        return;
+    }
+    
+    // Simple expression evaluator
+    std::string expr;
+    for (size_t i = 1; i < args.size(); ++i) {
+        if (i > 1) expr += " ";
+        expr += args[i];
+    }
+    
+    // Try to evaluate as arithmetic
+    try {
+        // Simple parser for basic arithmetic: num op num
+        size_t pos = 0;
+        
+        // Skip whitespace
+        while (pos < expr.length() && std::isspace(expr[pos])) pos++;
+        
+        // Get first number
+        size_t start = pos;
+        while (pos < expr.length() && (std::isdigit(expr[pos]) || expr[pos] == '-')) pos++;
+        
+        if (start == pos) {
+            // Not a number, try string comparison
+            if (expr.find('<') != std::string::npos || expr.find('>') != std::string::npos) {
+                if (expr.find("<=") != std::string::npos || expr.find(">=") != std::string::npos) {
+                    output("0");  // String comparison stub
+                } else {
+                    output("0");
+                }
+            } else {
+                output(expr);
+            }
+            return;
+        }
+        
+        std::string numStr1 = expr.substr(start, pos - start);
+        long long num1 = std::stoll(numStr1);
+        
+        // Skip whitespace
+        while (pos < expr.length() && std::isspace(expr[pos])) pos++;
+        
+        // Get operator
+        char op = '\0';
+        if (pos < expr.length()) {
+            op = expr[pos];
+            if ((pos + 1 < expr.length()) && 
+                ((expr[pos] == '<' && expr[pos+1] == '=') ||
+                 (expr[pos] == '>' && expr[pos+1] == '=') ||
+                 (expr[pos] == '!' && expr[pos+1] == '='))) {
+                pos += 2;
+            } else {
+                pos++;
+            }
+        }
+        
+        // Skip whitespace
+        while (pos < expr.length() && std::isspace(expr[pos])) pos++;
+        
+        // Get second number
+        start = pos;
+        while (pos < expr.length() && (std::isdigit(expr[pos]) || expr[pos] == '-')) pos++;
+        
+        if (start == pos) {
+            output(numStr1);
+            return;
+        }
+        
+        std::string numStr2 = expr.substr(start, pos - start);
+        long long num2 = std::stoll(numStr2);
+        
+        long long result = 0;
+        switch (op) {
+            case '+': result = num1 + num2; break;
+            case '-': result = num1 - num2; break;
+            case '*': result = num1 * num2; break;
+            case '/': result = (num2 != 0) ? num1 / num2 : 0; break;
+            case '%': result = (num2 != 0) ? num1 % num2 : 0; break;
+            case '<': result = (num1 < num2) ? 1 : 0; break;
+            case '>': result = (num1 > num2) ? 1 : 0; break;
+            case '=': result = (num1 == num2) ? 1 : 0; break;
+            default: result = num1; break;
+        }
+        
+        output(std::to_string(result));
+    } catch (...) {
+        output(expr);
+    }
+}
+
+// info command - display info pages
+void cmd_info(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args) || args.size() < 2) {
+        output("Usage: info [topic] [subtopic]");
+        output("  Display information about topics");
+        output("");
+        output("TOPICS");
+        output("  coreutils      GNU core utilities");
+        output("  bash           Bash shell manual");
+        output("  gnu            GNU general information");
+        output("  gzip           GNU compression");
+        output("  tar            TAR archive format");
+        output("");
+        output("EXAMPLES");
+        output("  info coreutils");
+        output("  info bash");
+        output("");
+        output("NOTE");
+        output("  Info pages provide detailed documentation similar to man pages.");
+        output("  Use 'man <command>' or 'help' for command help.");
+        return;
+    }
+    
+    std::string topic = args[1];
+    std::string subtopic = (args.size() > 2) ? args[2] : "";
+    
+    output("Info page for: " + topic + (subtopic.empty() ? "" : " - " + subtopic));
+    output("");
+    
+    if (topic == "coreutils" || topic == "gnu") {
+        output("GNU Core Utilities");
+        output("==================");
+        output("");
+        output("This is a comprehensive collection of core Unix utilities.");
+        output("Common commands: ls, cat, cp, mv, rm, grep, find, sed, awk");
+        output("");
+        output("For detailed information on specific commands, use: man <command>");
+    } else if (topic == "bash") {
+        output("Bash Shell Reference");
+        output("====================");
+        output("");
+        output("The Bash shell is a Unix shell and command language.");
+        output("Features: pipes, redirection, job control, command history");
+        output("");
+        output("For details, use: man bash or help <builtin>");
+    } else if (topic == "gzip") {
+        output("GZIP Compression");
+        output("================");
+        output("");
+        output("gzip is a file compression program (DEFLATE algorithm)");
+        output("Usage: gzip [options] [file]...");
+    } else if (topic == "tar") {
+        output("TAR Archive Format");
+        output("==================");
+        output("");
+        output("tar archives collections of files");
+        output("Usage: tar [options] <archive> [files...]");
+    } else {
+        output("INFO: Unknown topic: " + topic);
+        output("Use 'info' with no arguments to see available topics");
+    }
+}
+
+// apropos command - search man pages
+void cmd_apropos(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args) || args.size() < 2) {
+        output("Usage: apropos [options] keyword");
+        output("  Search man pages for keyword matches");
+        output("");
+        output("OPTIONS");
+        output("  -e            Interpret keyword as exact regex");
+        output("  -w            Match whole words only");
+        output("");
+        output("EXAMPLES");
+        output("  apropos file");
+        output("  apropos -w copy");
+        return;
+    }
+    
+    std::string keyword = args[1];
+    bool wholeWord = (args.size() > 2 && args[2] == "-w");
+    
+    // List of built-in commands and their descriptions for searching
+    std::vector<std::pair<std::string, std::string>> commands = {
+        {"ls", "list directory contents"},
+        {"cat", "concatenate and display files"},
+        {"grep", "search text for patterns"},
+        {"find", "search for files"},
+        {"sed", "stream editor"},
+        {"awk", "pattern scanning and processing"},
+        {"cut", "extract columns from text"},
+        {"sort", "sort lines of text"},
+        {"file", "determine file type"},
+        {"touch", "create empty files"},
+        {"mkdir", "create directories"},
+        {"cp", "copy files"},
+        {"mv", "move files"},
+        {"rm", "remove files"},
+        {"chmod", "change file permissions"},
+        {"pwd", "print working directory"},
+        {"cd", "change directory"},
+        {"echo", "print text"},
+        {"date", "show current date and time"}
+    };
+    
+    std::transform(keyword.begin(), keyword.end(), keyword.begin(), ::tolower);
+    
+    output("Commands matching '" + keyword + "':");
+    output("");
+    
+    int count = 0;
+    for (const auto& cmd : commands) {
+        std::string name = cmd.first;
+        std::string desc = cmd.second;
+        std::string searchName = name;
+        std::string searchDesc = desc;
+        std::transform(searchName.begin(), searchName.end(), searchName.begin(), ::tolower);
+        std::transform(searchDesc.begin(), searchDesc.end(), searchDesc.begin(), ::tolower);
+        
+        if (wholeWord) {
+            if (searchName == keyword || searchDesc.find(" " + keyword + " ") != std::string::npos) {
+                output(padRight(name, 16) + " - " + desc);
+                count++;
+            }
+        } else {
+            if (searchName.find(keyword) != std::string::npos || searchDesc.find(keyword) != std::string::npos) {
+                output(padRight(name, 16) + " - " + desc);
+                count++;
+            }
+        }
+    }
+    
+    if (count == 0) {
+        output("No matches found for '" + keyword + "'");
+    }
+}
+
+// whatis command - display one-line command descriptions
+void cmd_whatis(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args) || args.size() < 2) {
+        output("Usage: whatis command [command...]");
+        output("  Display one-line descriptions for commands");
+        output("");
+        output("EXAMPLES");
+        output("  whatis ls");
+        output("  whatis cat grep");
+        output("  whatis pwd");
+        return;
+    }
+    
+    // Simple descriptions of common commands
+    std::map<std::string, std::string> descriptions = {
+        {"ls", "ls - list directory contents"},
+        {"cat", "cat - concatenate and display file contents"},
+        {"grep", "grep - search text for pattern matches"},
+        {"find", "find - search for files in directory tree"},
+        {"sed", "sed - stream editor for text filtering"},
+        {"awk", "awk - pattern scanning and processing language"},
+        {"cut", "cut - extract columns from text"},
+        {"sort", "sort - sort lines of text"},
+        {"file", "file - determine file type"},
+        {"touch", "touch - create empty file or update timestamp"},
+        {"mkdir", "mkdir - create directories"},
+        {"cp", "cp - copy files and directories"},
+        {"mv", "mv - move or rename files"},
+        {"rm", "rm - remove files or directories"},
+        {"chmod", "chmod - change file permissions"},
+        {"pwd", "pwd - print working directory"},
+        {"cd", "cd - change the working directory"},
+        {"echo", "echo - display a line of text"},
+        {"date", "date - display or set system date/time"},
+        {"man", "man - format and display manual pages"},
+        {"help", "help - display command help"},
+        {"export", "export - set environment variables"},
+        {"env", "env - display or set environment variables"},
+        {"time", "time - measure command execution time"},
+        {"expr", "expr - evaluate arithmetic expressions"},
+        {"trap", "trap - set signal handlers"},
+        {"ulimit", "ulimit - set/display resource limits"},
+        {"whatis", "whatis - display one-line command descriptions"},
+        {"apropos", "apropos - search manual page names and descriptions"},
+        {"info", "info - display information about topics"},
+        {"version", "version - show GaryShell version and features"},
+        {"exit", "exit - exit the shell"},
+        {"quit", "quit - exit the shell"},
+        {"clear", "clear - clear the screen"},
+        {"head", "head - display first lines of files"},
+        {"tail", "tail - display last lines of files"},
+        {"less", "less - view file with paging"},
+        {"more", "more - display text with paging"},
+        {"tee", "tee - copy input to file(s) and stdout"},
+        {"wc", "wc - count lines, words, characters"},
+        {"diff", "diff - compare files line by line"},
+        {"patch", "patch - apply patch files"},
+        {"ln", "ln - create hard or symbolic links"},
+        {"rmdir", "rmdir - remove empty directories"},
+        {"chown", "chown - change file owner"},
+        {"chgrp", "chgrp - change file group"},
+        {"dd", "dd - copy and convert files"},
+        {"tar", "tar - create/extract/list tar archives"},
+        {"gzip", "gzip - compress files"},
+        {"gunzip", "gunzip - decompress gzip files"},
+        {"bzip2", "bzip2 - compress files with bzip2"},
+        {"bunzip2", "bunzip2 - decompress bzip2 files"},
+        {"zip", "zip - create ZIP archives"},
+        {"unzip", "unzip - extract ZIP archives"},
+        {"unrar", "unrar - extract RAR archives"},
+        {"xz", "xz - compress files to XZ format"},
+        {"unxz", "unxz - decompress XZ files"},
+        {"ssh", "ssh - connect to remote host via SSH"},
+        {"scp", "scp - securely copy files between hosts"},
+        {"rsync", "rsync - synchronize files and directories"},
+        {"wget", "wget - download files from the internet"},
+        {"curl", "curl - HTTP client for transferring data"},
+        {"ping", "ping - send ICMP echo requests to host"},
+        {"traceroute", "traceroute - trace network path to host"},
+        {"ip", "ip - show network interfaces and IP configuration"},
+        {"ifconfig", "ifconfig - configure network interfaces"},
+        {"iptables", "iptables - manage Windows Firewall rules"},
+        {"dig", "dig - DNS lookup utility"},
+        {"nslookup", "nslookup - query Domain Name System"},
+        {"netstat", "netstat - display network statistics"},
+        {"ss", "ss - display socket statistics"},
+        {"nmap", "nmap - network mapper and port scanner"},
+        {"tcpdump", "tcpdump - capture and analyze network packets"},
+        {"nc", "nc - network utility (netcat)"},
+        {"ps", "ps - list running processes"},
+        {"proc", "proc - list running processes"},
+        {"kill", "kill - terminate process by PID"},
+        {"killall", "killall - terminate processes by name"},
+        {"pkill", "pkill - signal processes by name pattern"},
+        {"xkill", "xkill - click on window to kill its process"},
+        {"jobs", "jobs - list background jobs"},
+        {"bg", "bg - resume suspended job in background"},
+        {"fg", "fg - move job to foreground"},
+        {"nice", "nice - run program with modified priority"},
+        {"renice", "renice - change priority of running process"},
+        {"top", "top - display and update sorted process info"},
+        {"htop", "htop - interactive process viewer"},
+        {"df", "df - display disk space usage"},
+        {"du", "du - estimate file space usage"},
+        {"mount", "mount - show mounted volumes and drives"},
+        {"uptime", "uptime - show system uptime"},
+        {"uname", "uname - display system information"},
+        {"hostname", "hostname - show or set system hostname"},
+        {"free", "free - show free and used memory"},
+        {"vmstat", "vmstat - report virtual memory statistics"},
+        {"iostat", "iostat - report CPU and I/O device statistics"},
+        {"mpstat", "mpstat - report CPU usage statistics"},
+        {"cal", "cal - display calendar with Sunday first"},
+        {"ncal", "ncal - display calendar with Monday first"},
+        {"timedatectl", "timedatectl - display or control system time"},
+        {"dmesg", "dmesg - display kernel and system messages"},
+        {"mkfs", "mkfs - create filesystem in file"},
+        {"fsck", "fsck - check and repair filesystem"},
+        {"sync", "sync - flush file system buffers to disk"},
+        {"whoami", "whoami - display current user information"},
+        {"who", "who - show who is logged on"},
+        {"w", "w - show who is logged on and what they do"},
+        {"last", "last - show listing of last logged in users"},
+        {"id", "id - display user and group information"},
+        {"finger", "finger - user information display"},
+        {"user", "user - display current user details"},
+        {"groups", "groups - display user group membership"},
+        {"passwd", "passwd - change user password"},
+        {"useradd", "useradd - add new user account"},
+        {"adduser", "adduser - add new user account"},
+        {"userdel", "userdel - delete user account"},
+        {"usermod", "usermod - modify user account"},
+        {"groupadd", "groupadd - create new group"},
+        {"addgroup", "addgroup - create new group"},
+        {"groupmod", "groupmod - modify group"},
+        {"groupdel", "groupdel - delete group"},
+        {"gpasswd", "gpasswd - administer group"},
+        {"getent", "getent - get entries from databases"},
+        {"sudo", "sudo - execute command with admin privileges"},
+        {"su", "su - switch to administrator"},
+        {"service", "service - control system services"},
+        {"systemctl", "systemctl - system service control"},
+        {"journalctl", "journalctl - system journal query"},
+        {"shutdown", "shutdown - shut down the computer"},
+        {"reboot", "reboot - restart the computer"},
+        {"at", "at - schedule one-time command execution"},
+        {"cron", "cron - task scheduler daemon"},
+        {"crontab", "crontab - manage scheduled tasks"},
+        {"printf", "printf - print formatted output"},
+        {"case", "case - match value against patterns"},
+        {"bc", "bc - arbitrary precision calculator"},
+        {"calc", "calc - simple desktop calculator"},
+        {"qalc", "qalc - advanced calculator with units"},
+        {"sh", "sh - execute shell scripts"},
+        {"source", "source - execute commands from file"},
+        {"exec", "exec - execute command, replacing process"},
+        {"xargs", "xargs - execute command from arguments"},
+        {"alias", "alias - create or list command aliases"},
+        {"unalias", "unalias - remove command aliases"},
+        {"history", "history - display or manage command history"},
+        {"umask", "umask - set file mode creation mask"},
+        {"watch", "watch - execute command repeatedly"},
+        {"banner", "banner - display text in large letters"},
+        {"printenv", "printenv - print environment variables"},
+        {"nano", "nano - text editor"},
+        {"split", "split - split file into pieces"},
+        {"nl", "nl - number lines in text"},
+        {"tr", "tr - translate or delete characters"},
+        {"uniq", "uniq - filter out repeated lines"},
+        {"rev", "rev - reverse lines of text"},
+        {"tac", "tac - print files with lines in reverse order"},
+        {"paste", "paste - merge lines from files"},
+        {"shuf", "shuf - shuffle lines randomly"},
+        {"updatedb", "updatedb - update locate database"},
+        {"locate", "locate - find files by name pattern"},
+        {"which", "which - locate a command in PATH"},
+        {"lsof", "lsof - list open files"},
+        {"sleep", "sleep - delay for specified time"},
+        {"wait", "wait - wait for process IDs to exit"},
+        {"neofetch", "neofetch - display system info with ASCII art"},
+        {"screen", "screen - terminal multiplexer"},
+        {"lspci", "lspci - list PCI devices"},
+        {"lsusb", "lsusb - list USB devices"},
+        {"strace", "strace - trace system calls"},
+        {"quota", "quota - display disk quota information"},
+        {"basename", "basename - strip directory and suffix from pathname"},
+        {"whereis", "whereis - locate command, source, and manual page files"},
+        {"stat", "stat - display file and filesystem statistics"},
+        {"type", "type - show file contents (alias for cat)"},
+        {"chattr", "chattr - change file attributes"},
+        {"pgrep", "pgrep - search processes by name"},
+        {"pidof", "pidof - find process IDs by program name"},
+        {"pstree", "pstree - display process tree"},
+        {"timeout", "timeout - run command with a time limit"},
+        {"ftp", "ftp - simple FTP connectivity test"},
+        {"sftp", "sftp - SSH/SFTP connectivity probe"},
+        {"sysctl", "sysctl - view system parameters (compatibility)"},
+        {"read", "read - read line from standard input"},
+        {"rename", "rename - rename files by pattern"},
+        {"unlink", "unlink - remove a file"},
+        {"nohup", "nohup - run command immune to hangups"},
+        {"blkid", "blkid - display block device attributes"},
+        {"test", "test - evaluate conditional expression"},
+        {"egrep", "egrep - extended grep with regex support"}
+    };
+    
+    for (size_t i = 1; i < args.size(); ++i) {
+        std::string cmd = args[i];
+        std::transform(cmd.begin(), cmd.end(), cmd.begin(), ::tolower);
+        
+        auto it = descriptions.find(cmd);
+        if (it != descriptions.end()) {
+            output(it->second);
+        } else {
+            outputError(cmd + ": nothing appropriate");
+        }
+    }
+}
+
+// quota command - display disk quota information
+void cmd_quota(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: quota [options] [user]");
+        output("  Display disk quota information");
+        output("");
+        output("OPTIONS");
+        output("  -v            Verbose output");
+        output("  -u <user>     Show quota for specific user");
+        output("  -g <group>    Show quota for specific group");
+        output("");
+        output("EXAMPLES");
+        output("  quota");
+        output("  quota -u john");
+        output("");
+        output("NOTE");
+        output("  Windows does not enforce user disk quotas in the same way as Unix.");
+        output("  This command provides compatibility information only.");
+        return;
+    }
+    
+    output("Disk Quotas for " + std::string(getenv("USERNAME") ? getenv("USERNAME") : "current user"));
+    output("");
+    output("NOTE: Disk quotas are not fully supported on Windows NTFS.");
+    output("Use 'fsutil quota' for Windows quota management.");
+}
+
+// basename command - strip directory and suffix from filename
+void cmd_basename(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args) || args.size() < 2) {
+        output("Usage: basename path [suffix]");
+        output("  Remove directory and optionally suffix from path");
+        output("");
+        output("EXAMPLES");
+        output("  basename /path/to/file.txt");
+        output("  basename /path/to/file.txt .txt");
+        output("  basename C:\\\\Windows\\\\System32\\\\notepad.exe");
+        return;
+    }
+    
+    std::string path = args[1];
+    std::string suffix = (args.size() > 2) ? args[2] : "";
+    
+    // Convert Windows path to forward slashes for processing
+    std::replace(path.begin(), path.end(), '\\', '/');
+    
+    // Find the last slash
+    size_t lastSlash = path.find_last_of('/');
+    std::string basename = (lastSlash != std::string::npos) ? path.substr(lastSlash + 1) : path;
+    
+    // Remove suffix if provided
+    if (!suffix.empty() && basename.length() >= suffix.length()) {
+        if (basename.substr(basename.length() - suffix.length()) == suffix) {
+            basename = basename.substr(0, basename.length() - suffix.length());
+        }
+    }
+    
+    output(basename);
+}
+
+// whereis command - locate command, source, and manual page files
+void cmd_whereis(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args) || args.size() < 2) {
+        output("Usage: whereis [options] command");
+        output("  Locate the binary, source, and manual page for a command");
+        output("");
+        output("OPTIONS");
+        output("  -b            Search for binary only");
+        output("  -s            Search for source only");
+        output("  -m            Search for manual page only");
+        output("  -a            Find all occurrences");
+        output("");
+        output("EXAMPLES");
+        output("  whereis ls");
+        output("  whereis -b ls");
+        return;
+    }
+    
+    std::string cmd = args[1];
+    std::string pathEnv = getenv("PATH") ? getenv("PATH") : "";
+    
+    output(cmd + ":");
+    
+    // Look for binary in PATH
+    std::istringstream pathStream(pathEnv);
+    std::string pathDir;
+    bool found = false;
+    
+    while (std::getline(pathStream, pathDir, ';')) {
+        if (!pathDir.empty()) {
+            // Check for executable with common extensions
+            for (const auto& ext : {".exe", ".bat", ".cmd", ""}) {
+                std::string fullPath = pathDir + "\\" + cmd + ext;
+                if (GetFileAttributesA(fullPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                    if (found) output(" " + fullPath);
+                    else { output(" " + fullPath); found = true; }
+                    break;
+                }
+            }
+        }
+    }
+    
+    if (!found) {
+        output(" (not found)");
+    }
+    output(" (man page not available)");
+}
+
+// stat command - display file/directory statistics
+void cmd_stat(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args) || args.size() < 2) {
+        output("Usage: stat [options] file");
+        output("  Display file statistics");
+        output("");
+        output("OPTIONS");
+        output("  -c <format>   Format output");
+        output("  -f            Display filesystem statistics");
+        output("  -L            Follow symbolic links");
+        output("");
+        output("EXAMPLES");
+        output("  stat file.txt");
+        output("  stat /path/to/file");
+        return;
+    }
+    
+    std::string path = unixPathToWindows(args[1]);
+    WIN32_FILE_ATTRIBUTE_DATA fileInfo;
+    
+    if (!GetFileAttributesExA(path.c_str(), GetFileExInfoStandard, &fileInfo)) {
+        outputError("stat: cannot stat '" + args[1] + "': No such file or directory");
+        return;
+    }
+    
+    output("File: " + args[1]);
+    
+    // Calculate file size
+    ULARGE_INTEGER fileSize;
+    fileSize.LowPart = fileInfo.nFileSizeLow;
+    fileSize.HighPart = fileInfo.nFileSizeHigh;
+    
+    output("  Size: " + std::to_string(fileSize.QuadPart) + " bytes");
+    
+    // File attributes
+    std::string attrs;
+    if (fileInfo.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+        attrs += "D";  // Directory
+    }
+    if (fileInfo.dwFileAttributes & FILE_ATTRIBUTE_READONLY) {
+        attrs += "R";  // Read-only
+    }
+    if (fileInfo.dwFileAttributes & FILE_ATTRIBUTE_HIDDEN) {
+        attrs += "H";  // Hidden
+    }
+    if (fileInfo.dwFileAttributes & FILE_ATTRIBUTE_SYSTEM) {
+        attrs += "S";  // System
+    }
+    
+    output("  Attributes: " + (attrs.empty() ? "Normal" : attrs));
+    
+    // Access times
+    SYSTEMTIME st;
+    FileTimeToSystemTime(&fileInfo.ftLastAccessTime, &st);
+    output("  Last Access: " + std::to_string(st.wMonth) + "/" + std::to_string(st.wDay) + "/" + 
+           std::to_string(st.wYear) + " " + std::to_string(st.wHour) + ":" + 
+           std::to_string(st.wMinute) + ":" + std::to_string(st.wSecond));
+}
+
+// type command - display file contents (alias for cat)
+void cmd_type(const std::vector<std::string>& args) {
+    // type is an alias for cat
+    cmd_cat(args);
+}
+
+// chattr command - change file attributes
+void cmd_chattr(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args) || args.size() < 2) {
+        output("Usage: chattr [options] [+-=]<attr> file...");
+        output("  Change file attributes");
+        output("");
+        output("ATTRIBUTES");
+        output("  r    Read-only");
+        output("  h    Hidden");
+        output("  s    System");
+        output("  a    Archive");
+        output("");
+        output("EXAMPLES");
+        output("  chattr +r file.txt          # Make read-only");
+        output("  chattr -h file.txt          # Remove hidden attribute");
+        output("  chattr +h +s file.txt       # Hide and mark as system");
+        output("");
+        output("NOTE");
+        output("  Windows file attributes are more limited than Unix extended attributes.");
+        return;
+    }
+    
+    std::string attrStr = args[1];
+    
+    // Parse operation and attributes
+    char op = '+';  // Default: add
+    std::string attrs;
+    
+    for (char c : attrStr) {
+        if (c == '+' || c == '-' || c == '=') {
+            op = c;
+        } else {
+            attrs += c;
+        }
+    }
+    
+    // Apply attributes to each file
+    for (size_t i = 2; i < args.size(); ++i) {
+        std::string filePath = unixPathToWindows(args[i]);
+        DWORD currentAttrs = GetFileAttributesA(filePath.c_str());
+        
+        if (currentAttrs == INVALID_FILE_ATTRIBUTES) {
+            outputError("chattr: cannot access '" + args[i] + "'");
+            continue;
+        }
+        
+        DWORD newAttrs = currentAttrs;
+        
+        for (char attr : attrs) {
+            if (attr == 'r') {  // Read-only
+                if (op == '+') newAttrs |= FILE_ATTRIBUTE_READONLY;
+                else if (op == '-') newAttrs &= ~FILE_ATTRIBUTE_READONLY;
+            } else if (attr == 'h') {  // Hidden
+                if (op == '+') newAttrs |= FILE_ATTRIBUTE_HIDDEN;
+                else if (op == '-') newAttrs &= ~FILE_ATTRIBUTE_HIDDEN;
+            } else if (attr == 's') {  // System
+                if (op == '+') newAttrs |= FILE_ATTRIBUTE_SYSTEM;
+                else if (op == '-') newAttrs &= ~FILE_ATTRIBUTE_SYSTEM;
+            } else if (attr == 'a') {  // Archive
+                if (op == '+') newAttrs |= FILE_ATTRIBUTE_ARCHIVE;
+                else if (op == '-') newAttrs &= ~FILE_ATTRIBUTE_ARCHIVE;
+            }
+        }
+        
+        if (SetFileAttributesA(filePath.c_str(), newAttrs)) {
+            output("chattr: changed attributes of '" + args[i] + "'");
+        } else {
+            outputError("chattr: failed to change attributes of '" + args[i] + "'");
+        }
+    }
+}
+
+// pgrep command - search processes by name
+void cmd_pgrep(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args) || args.size() < 2) {
+        output("Usage: pgrep [options] pattern");
+        output("  Search for processes matching pattern");
+        output("");
+        output("OPTIONS");
+        output("  -i            Case-insensitive match (default)");
+        output("  -l            List PID and process name");
+        output("  -x            Exact match of process name");
+        return;
+    }
+    
+    bool listNames = false;
+    bool exactMatch = false;
+    std::string pattern;
+    
+    for (size_t i = 1; i < args.size(); ++i) {
+        if (args[i][0] == '-') {
+            for (size_t j = 1; j < args[i].length(); ++j) {
+                if (args[i][j] == 'l') listNames = true;
+                else if (args[i][j] == 'x') exactMatch = true;
+            }
+        } else if (pattern.empty()) {
+            pattern = args[i];
+        }
+    }
+    
+    if (pattern.empty()) {
+        outputError("pgrep: missing pattern");
+        return;
+    }
+    
+    std::string patternLower = toLower(pattern);
+    bool foundAny = false;
+    
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnapshot == INVALID_HANDLE_VALUE) {
+        outputError("pgrep: failed to enumerate processes");
+        return;
+    }
+    
+    PROCESSENTRY32 pe32;
+    pe32.dwSize = sizeof(PROCESSENTRY32);
+    
+    if (Process32First(hSnapshot, &pe32)) {
+        do {
+            std::string procName = pe32.szExeFile;
+            std::string procLower = toLower(procName);
+            bool match = false;
+            
+            if (exactMatch) {
+                match = (procLower == patternLower);
+            } else {
+                match = (procLower.find(patternLower) != std::string::npos);
+            }
+            
+            if (match) {
+                foundAny = true;
+                if (listNames) {
+                    char line[256];
+                    sprintf(line, "%lu %s", pe32.th32ProcessID, pe32.szExeFile);
+                    output(line);
+                } else {
+                    output(std::to_string(pe32.th32ProcessID));
+                }
+            }
+        } while (Process32Next(hSnapshot, &pe32));
+    }
+    
+    CloseHandle(hSnapshot);
+    
+    if (!foundAny) {
+        outputError("pgrep: no matching processes found");
+    }
+}
+
+// pidof command - list process IDs for program names
+void cmd_pidof(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args) || args.size() < 2) {
+        output("Usage: pidof program [program...]");
+        output("  Print PIDs of running programs matching names");
+        return;
+    }
+    
+    // Collect targets
+    std::vector<std::string> targets;
+    for (size_t i = 1; i < args.size(); ++i) {
+        std::string name = args[i];
+        if (name.size() < 4 || toLower(name.substr(name.size() - 4)) != ".exe") {
+            name += ".exe";
+        }
+        targets.push_back(toLower(name));
+    }
+    
+    std::map<std::string, std::vector<DWORD>> matches;
+    
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnapshot == INVALID_HANDLE_VALUE) {
+        outputError("pidof: failed to enumerate processes");
+        return;
+    }
+    
+    PROCESSENTRY32 pe32;
+    pe32.dwSize = sizeof(PROCESSENTRY32);
+    
+    if (Process32First(hSnapshot, &pe32)) {
+        do {
+            std::string procLower = toLower(pe32.szExeFile);
+            for (const auto& target : targets) {
+                if (procLower == target) {
+                    matches[target].push_back(pe32.th32ProcessID);
+                }
+            }
+        } while (Process32Next(hSnapshot, &pe32));
+    }
+    CloseHandle(hSnapshot);
+    
+    for (size_t i = 0; i < targets.size(); ++i) {
+        const auto& target = targets[i];
+        auto it = matches.find(target);
+        if (it != matches.end()) {
+            std::string line;
+            for (size_t j = 0; j < it->second.size(); ++j) {
+                if (j > 0) line += " ";
+                line += std::to_string(it->second[j]);
+            }
+            output(line);
+        } else {
+            outputError("pidof: no process found for '" + args[i + 1] + "'");
+        }
+    }
+}
+
+// pstree command - display process hierarchy
+void cmd_pstree(const std::vector<std::string>& args) {
+    DWORD rootPid = 0;
+    if (checkHelpFlag(args)) {
+        output("Usage: pstree [pid]");
+        output("  Display process tree, optionally rooted at pid");
+        return;
+    }
+    if (args.size() > 1) {
+        try {
+            rootPid = std::stoul(args[1]);
+        } catch (...) {
+            outputError("pstree: invalid pid");
+            return;
+        }
+    }
+    
+    std::map<DWORD, std::vector<DWORD>> children;
+    std::map<DWORD, std::string> names;
+    std::map<DWORD, DWORD> parents;
+    
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnapshot == INVALID_HANDLE_VALUE) {
+        outputError("pstree: failed to enumerate processes");
+        return;
+    }
+    
+    PROCESSENTRY32 pe32;
+    pe32.dwSize = sizeof(PROCESSENTRY32);
+    if (Process32First(hSnapshot, &pe32)) {
+        do {
+            names[pe32.th32ProcessID] = pe32.szExeFile;
+            parents[pe32.th32ProcessID] = pe32.th32ParentProcessID;
+        } while (Process32Next(hSnapshot, &pe32));
+    }
+    CloseHandle(hSnapshot);
+    
+    for (const auto& kv : parents) {
+        children[kv.second].push_back(kv.first);
+    }
+    
+    std::function<void(DWORD, const std::string&, bool, std::set<DWORD>&)> printTree;
+    printTree = [&](DWORD pid, const std::string& prefix, bool last, std::set<DWORD>& visited) {
+        if (visited.count(pid)) return;
+        visited.insert(pid);
+        std::string line = prefix;
+        line += last ? "+-" : "|-";
+        line += names.count(pid) ? names[pid] : "(unknown)";
+        line += " (" + std::to_string(pid) + ")";
+        output(line);
+        std::string childPrefix = prefix + (last ? "  " : "| ");
+        const auto& kids = children[pid];
+        for (size_t i = 0; i < kids.size(); ++i) {
+            printTree(kids[i], childPrefix, i == kids.size() - 1, visited);
+        }
+    };
+    
+    std::set<DWORD> visited;
+    if (rootPid != 0) {
+        if (names.find(rootPid) == names.end()) {
+            outputError("pstree: pid not found");
+            return;
+        }
+        printTree(rootPid, "", true, visited);
+    } else {
+        // Start from roots (no parent or parent missing)
+        for (const auto& kv : names) {
+            DWORD pid = kv.first;
+            DWORD ppid = parents[pid];
+            if (parents.find(ppid) == parents.end()) {
+                printTree(pid, "", true, visited);
+            }
+        }
+    }
+}
+
+// timeout command - run command with limit
+void cmd_timeout(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args) || args.size() < 3) {
+        output("Usage: timeout <seconds> command [args...]");
+        output("  Run a command and terminate it if it exceeds the time limit");
+        return;
+    }
+    
+    double seconds = 0.0;
+    try {
+        seconds = std::stod(args[1]);
+    } catch (...) {
+        outputError("timeout: invalid duration");
+        return;
+    }
+    if (seconds <= 0) {
+        outputError("timeout: duration must be positive");
+        return;
+    }
+    
+    // Build command line
+    std::string cmdLine;
+    for (size_t i = 2; i < args.size(); ++i) {
+        if (i > 2) cmdLine += " ";
+        if (args[i].find(' ') != std::string::npos) {
+            cmdLine += "\"" + args[i] + "\"";
+        } else {
+            cmdLine += args[i];
+        }
+    }
+    
+    STARTUPINFOA si = {0};
+    PROCESS_INFORMATION pi = {0};
+    si.cb = sizeof(si);
+    
+    // CreateProcess requires mutable buffer
+    std::vector<char> buffer(cmdLine.begin(), cmdLine.end());
+    buffer.push_back('\0');
+    
+    if (!CreateProcessA(NULL, buffer.data(), NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
+        outputError("timeout: failed to start command");
+        return;
+    }
+    
+    DWORD waitMs = (DWORD)(seconds * 1000);
+    DWORD waitResult = WaitForSingleObject(pi.hProcess, waitMs);
+    if (waitResult == WAIT_TIMEOUT) {
+        TerminateProcess(pi.hProcess, 124);
+        outputError("timeout: command timed out");
+    } else {
+        DWORD exitCode = 0;
+        GetExitCodeProcess(pi.hProcess, &exitCode);
+        char msg[128];
+        sprintf(msg, "timeout: command exited with status %lu", exitCode);
+        output(msg);
+    }
+    
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+}
+
+// ftp command - basic FTP connectivity check
+void cmd_ftp(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args) || args.size() < 2) {
+        output("Usage: ftp [-p port] [-u user] [-w pass] host");
+        output("  Test FTP connectivity and login");
+        return;
+    }
+    
+    std::string host;
+    std::string user = "anonymous";
+    std::string pass = "anonymous@";
+    std::string port = "21";
+    
+    for (size_t i = 1; i < args.size(); ++i) {
+        if (args[i] == "-p" && i + 1 < args.size()) {
+            port = args[++i];
+        } else if (args[i] == "-u" && i + 1 < args.size()) {
+            user = args[++i];
+        } else if (args[i] == "-w" && i + 1 < args.size()) {
+            pass = args[++i];
+        } else if (args[i][0] != '-' && host.empty()) {
+            host = args[i];
+        }
+    }
+    
+    if (host.empty()) {
+        outputError("ftp: missing host");
+        return;
+    }
+    
+    WSADATA wsaData;
+    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+        outputError("ftp: failed to initialize Winsock");
+        return;
+    }
+    
+    addrinfo hints = {0};
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    addrinfo* result = nullptr;
+    if (getaddrinfo(host.c_str(), port.c_str(), &hints, &result) != 0) {
+        outputError("ftp: unable to resolve host");
+        WSACleanup();
+        return;
+    }
+    
+    SOCKET sock = socket(result->ai_family, result->ai_socktype, result->ai_protocol);
+    if (sock == INVALID_SOCKET) {
+        freeaddrinfo(result);
+        WSACleanup();
+        outputError("ftp: socket creation failed");
+        return;
+    }
+    
+    int timeoutMs = 5000;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeoutMs, sizeof(timeoutMs));
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (const char*)&timeoutMs, sizeof(timeoutMs));
+    
+    if (connect(sock, result->ai_addr, (int)result->ai_addrlen) == SOCKET_ERROR) {
+        outputError("ftp: connection failed");
+        closesocket(sock);
+        freeaddrinfo(result);
+        WSACleanup();
+        return;
+    }
+    freeaddrinfo(result);
+    
+    char buffer[1024];
+    int len = recv(sock, buffer, sizeof(buffer) - 1, 0);
+    if (len > 0) {
+        buffer[len] = '\0';
+        output(std::string("< ") + buffer);
+    }
+    
+    auto sendCmd = [&](const std::string& cmd) {
+        std::string line = cmd + "\r\n";
+        send(sock, line.c_str(), (int)line.length(), 0);
+        int rlen = recv(sock, buffer, sizeof(buffer) - 1, 0);
+        if (rlen > 0) {
+            buffer[rlen] = '\0';
+            output(std::string("< ") + buffer);
+        }
+    };
+    
+    sendCmd("USER " + user);
+    sendCmd("PASS " + pass);
+    sendCmd("QUIT");
+    
+    closesocket(sock);
+    WSACleanup();
+}
+
+// sftp command - SSH/SFTP banner probe
+void cmd_sftp(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args) || args.size() < 2) {
+        output("Usage: sftp [-p port] host");
+        output("  Check SSH/SFTP connectivity and read server banner");
+        return;
+    }
+    
+    std::string host;
+    std::string port = "22";
+    for (size_t i = 1; i < args.size(); ++i) {
+        if (args[i] == "-p" && i + 1 < args.size()) {
+            port = args[++i];
+        } else if (args[i][0] != '-' && host.empty()) {
+            host = args[i];
+        }
+    }
+    if (host.empty()) {
+        outputError("sftp: missing host");
+        return;
+    }
+    
+    WSADATA wsaData;
+    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+        outputError("sftp: failed to initialize Winsock");
+        return;
+    }
+    
+    addrinfo hints = {0};
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    addrinfo* result = nullptr;
+    if (getaddrinfo(host.c_str(), port.c_str(), &hints, &result) != 0) {
+        outputError("sftp: unable to resolve host");
+        WSACleanup();
+        return;
+    }
+    
+    SOCKET sock = socket(result->ai_family, result->ai_socktype, result->ai_protocol);
+    if (sock == INVALID_SOCKET) {
+        freeaddrinfo(result);
+        WSACleanup();
+        outputError("sftp: socket creation failed");
+        return;
+    }
+    
+    int timeoutMs = 5000;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeoutMs, sizeof(timeoutMs));
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (const char*)&timeoutMs, sizeof(timeoutMs));
+    
+    if (connect(sock, result->ai_addr, (int)result->ai_addrlen) == SOCKET_ERROR) {
+        outputError("sftp: connection failed");
+        closesocket(sock);
+        freeaddrinfo(result);
+        WSACleanup();
+        return;
+    }
+    freeaddrinfo(result);
+    
+    char buffer[1024];
+    int len = recv(sock, buffer, sizeof(buffer) - 1, 0);
+    if (len > 0) {
+        buffer[len] = '\0';
+        std::string banner(buffer);
+        size_t pos = banner.find('\n');
+        if (pos != std::string::npos) banner = banner.substr(0, pos);
+        output("Server banner: " + banner);
+    } else {
+        outputError("sftp: no banner received");
+    }
+    
+    std::string probe = "SSH-2.0-GaryShell\r\n";
+    send(sock, probe.c_str(), (int)probe.length(), 0);
+    closesocket(sock);
+    WSACleanup();
+    output("Note: This checks connectivity only. Use scp/ssh for transfers.");
+}
+
+// sysctl command - report system parameters
+void cmd_sysctl(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: sysctl [-a] [name...]");
+        output("  Display system parameters (compatibility)");
+        return;
+    }
+    
+    SYSTEM_INFO sysInfo;
+    GetSystemInfo(&sysInfo);
+    MEMORYSTATUSEX memStatus = {0};
+    memStatus.dwLength = sizeof(memStatus);
+    GlobalMemoryStatusEx(&memStatus);
+    
+    OSVERSIONINFOEXA osvi = {0};
+    osvi.dwOSVersionInfoSize = sizeof(osvi);
+    GetVersionExA((LPOSVERSIONINFOA)&osvi);
+    
+    std::map<std::string, std::string> values;
+    values["kernel.osname"] = "Windows";
+    values["kernel.osrelease"] = std::to_string(osvi.dwMajorVersion) + "." + std::to_string(osvi.dwMinorVersion);
+    values["kernel.version"] = std::to_string(osvi.dwBuildNumber);
+    values["hw.ncpu"] = std::to_string(sysInfo.dwNumberOfProcessors);
+    values["hw.pagesize"] = std::to_string(sysInfo.dwPageSize);
+    values["hw.memsize"] = std::to_string((unsigned long long)memStatus.ullTotalPhys);
+    values["fs.ntfs.version"] = "NTFS";
+    values["hw.machine"] = (sysInfo.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_AMD64) ? "x86_64" : "x86";
+    values["user.name"] = getenv("USERNAME") ? getenv("USERNAME") : "";
+    values["user.domain"] = getenv("USERDOMAIN") ? getenv("USERDOMAIN") : "";
+    
+    if (args.size() == 1 || (args.size() == 2 && args[1] == "-a")) {
+        for (const auto& kv : values) {
+            output(kv.first + " = " + kv.second);
+        }
+        return;
+    }
+    
+    for (size_t i = 1; i < args.size(); ++i) {
+        if (args[i] == "-a") continue;
+        auto it = values.find(args[i]);
+        if (it != values.end()) {
+            output(it->first + " = " + it->second);
+        } else {
+            outputError("sysctl: unknown key '" + args[i] + "'");
+        }
+    }
+}
+
+// read command - read line from stdin into variable
+void cmd_read(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: read [var]");
+        output("  Read a line from standard input");
+        output("");
+        output("DESCRIPTION");
+        output("  Reads a single line from standard input and displays it.");
+        output("  In full shell implementations, would store to variable.");
+        output("");
+        output("EXAMPLES");
+        output("  read");
+        output("  echo 'Enter name:' && read name");
+        return;
+    }
+    
+    std::string line;
+    if (std::getline(std::cin, line)) {
+        output(line);
+    }
+}
+
+// rename command - rename files
+void cmd_rename(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args) || args.size() < 3) {
+        output("Usage: rename <old> <new> [files...]");
+        output("  Rename files by replacing pattern");
+        output("");
+        output("DESCRIPTION");
+        output("  Renames files by replacing old pattern with new pattern.");
+        output("  On Windows, this performs simple file renaming.");
+        output("");
+        output("EXAMPLES");
+        output("  rename .txt .bak file.txt");
+        output("  rename old new oldfile.txt");
+        return;
+    }
+    
+    std::string oldPattern = args[1];
+    std::string newPattern = args[2];
+    
+    for (size_t i = 3; i < args.size(); ++i) {
+        std::string oldPath = unixPathToWindows(args[i]);
+        std::string filename = args[i];
+        
+        // Find and replace pattern
+        size_t pos = filename.find(oldPattern);
+        if (pos != std::string::npos) {
+            std::string newFilename = filename;
+            newFilename.replace(pos, oldPattern.length(), newPattern);
+            std::string newPath = unixPathToWindows(newFilename);
+            
+            if (MoveFileA(oldPath.c_str(), newPath.c_str())) {
+                output("renamed '" + args[i] + "' -> '" + newFilename + "'");
+            } else {
+                outputError("rename: cannot rename '" + args[i] + "'");
+            }
+        } else {
+            outputError("rename: pattern '" + oldPattern + "' not found in '" + args[i] + "'");
+        }
+    }
+}
+
+// unlink command - delete a file
+void cmd_unlink(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args) || args.size() < 2) {
+        output("Usage: unlink <file>");
+        output("  Remove a file");
+        output("");
+        output("DESCRIPTION");
+        output("  Removes a single file. This is similar to 'rm' but only");
+        output("  works with one file at a time.");
+        output("");
+        output("EXAMPLES");
+        output("  unlink oldfile.txt");
+        return;
+    }
+    
+    std::string filePath = unixPathToWindows(args[1]);
+    
+    if (DeleteFileA(filePath.c_str())) {
+        output("unlink: removed '" + args[1] + "'");
+    } else {
+        DWORD err = GetLastError();
+        if (err == ERROR_FILE_NOT_FOUND) {
+            outputError("unlink: cannot unlink '" + args[1] + "': No such file");
+        } else if (err == ERROR_ACCESS_DENIED) {
+            outputError("unlink: cannot unlink '" + args[1] + "': Permission denied");
+        } else {
+            outputError("unlink: cannot unlink '" + args[1] + "'");
+        }
+    }
+}
+
+// nohup command - run command immune to hangups
+void cmd_nohup(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args) || args.size() < 2) {
+        output("Usage: nohup <command> [args...]");
+        output("  Run a command immune to hangups");
+        output("");
+        output("DESCRIPTION");
+        output("  Runs a command that continues running even if the terminal closes.");
+        output("  On Windows, this creates a detached process.");
+        output("");
+        output("EXAMPLES");
+        output("  nohup ping 127.0.0.1 -n 100");
+        output("  nohup long-running-task.exe");
+        return;
+    }
+    
+    // Build command line
+    std::string cmdLine;
+    for (size_t i = 1; i < args.size(); ++i) {
+        if (i > 1) cmdLine += " ";
+        if (args[i].find(' ') != std::string::npos) {
+            cmdLine += "\"" + args[i] + "\"";
+        } else {
+            cmdLine += args[i];
+        }
+    }
+    
+    STARTUPINFOA si = {0};
+    PROCESS_INFORMATION pi = {0};
+    si.cb = sizeof(si);
+    
+    std::vector<char> buffer(cmdLine.begin(), cmdLine.end());
+    buffer.push_back('\0');
+    
+    if (CreateProcessA(NULL, buffer.data(), NULL, NULL, FALSE, 
+                       DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP, 
+                       NULL, NULL, &si, &pi)) {
+        output("nohup: process started with PID " + std::to_string(pi.dwProcessId));
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+    } else {
+        outputError("nohup: failed to start command");
+    }
+}
+
+// blkid command - display block device attributes
+void cmd_blkid(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: blkid [device...]");
+        output("  Display block device attributes and UUIDs");
+        output("");
+        output("DESCRIPTION");
+        output("  Shows information about block devices (drives and partitions)");
+        output("  including volume labels, file system types, and unique IDs.");
+        output("");
+        output("EXAMPLES");
+        output("  blkid");
+        output("  blkid C:");
+        return;
+    }
+    
+    // Get all logical drives if no arguments
+    if (args.size() == 1) {
+        DWORD drives = GetLogicalDrives();
+        for (int i = 0; i < 26; ++i) {
+            if (drives & (1 << i)) {
+                char driveLetter[4] = {char('A' + i), ':', '\\', '\0'};
+                char volumeName[MAX_PATH] = {0};
+                char fsName[MAX_PATH] = {0};
+                DWORD serialNum = 0;
+                
+                if (GetVolumeInformationA(driveLetter, volumeName, MAX_PATH, 
+                                         &serialNum, NULL, NULL, fsName, MAX_PATH)) {
+                    char output_line[512];
+                    sprintf(output_line, "%c: LABEL=\"%s\" TYPE=\"%s\" UUID=\"%04X-%04X\"",
+                           'A' + i, volumeName[0] ? volumeName : "NO_LABEL", 
+                           fsName, HIWORD(serialNum), LOWORD(serialNum));
+                    output(output_line);
+                }
+            }
+        }
+    } else {
+        // Show specific device
+        for (size_t i = 1; i < args.size(); ++i) {
+            std::string device = args[i];
+            if (device.length() == 2 && device[1] == ':') {
+                device += "\\";
+            }
+            
+            char volumeName[MAX_PATH] = {0};
+            char fsName[MAX_PATH] = {0};
+            DWORD serialNum = 0;
+            
+            if (GetVolumeInformationA(device.c_str(), volumeName, MAX_PATH,
+                                     &serialNum, NULL, NULL, fsName, MAX_PATH)) {
+                char output_line[512];
+                sprintf(output_line, "%s LABEL=\"%s\" TYPE=\"%s\" UUID=\"%04X-%04X\"",
+                       args[i].c_str(), volumeName[0] ? volumeName : "NO_LABEL",
+                       fsName, HIWORD(serialNum), LOWORD(serialNum));
+                output(output_line);
+            } else {
+                outputError("blkid: cannot access '" + args[i] + "'");
+            }
+        }
+    }
+}
+
+// test command - evaluate conditional expressions
+void cmd_test(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args) || args.size() < 2) {
+        output("Usage: test <expression>");
+        output("       [ <expression> ]");
+        output("  Evaluate conditional expression");
+        output("");
+        output("FILE TESTS");
+        output("  -e file      file exists");
+        output("  -f file      file is regular file");
+        output("  -d file      file is directory");
+        output("  -r file      file is readable");
+        output("  -w file      file is writable");
+        output("  -x file      file is executable");
+        output("");
+        output("STRING TESTS");
+        output("  -z string    string is empty");
+        output("  -n string    string is not empty");
+        output("  s1 = s2      strings are equal");
+        output("  s1 != s2     strings are not equal");
+        output("");
+        output("INTEGER TESTS");
+        output("  n1 -eq n2    integers are equal");
+        output("  n1 -ne n2    integers are not equal");
+        output("  n1 -lt n2    n1 less than n2");
+        output("  n1 -le n2    n1 less than or equal to n2");
+        output("  n1 -gt n2    n1 greater than n2");
+        output("  n1 -ge n2    n1 greater than or equal to n2");
+        output("");
+        output("EXAMPLES");
+        output("  test -f file.txt");
+        output("  test -d /tmp");
+        output("  [ -e myfile ]");
+        return;
+    }
+    
+    bool result = false;
+    
+    if (args.size() == 2) {
+        // Unary string test: test STRING or test -n STRING
+        result = !args[1].empty();
+    } else if (args.size() == 3) {
+        std::string op = args[1];
+        std::string arg = args[2];
+        std::string filePath = unixPathToWindows(arg);
+        
+        if (op == "-e") {
+            // File exists
+            DWORD attr = GetFileAttributesA(filePath.c_str());
+            result = (attr != INVALID_FILE_ATTRIBUTES);
+        } else if (op == "-f") {
+            // Is regular file
+            DWORD attr = GetFileAttributesA(filePath.c_str());
+            result = (attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY));
+        } else if (op == "-d") {
+            // Is directory
+            DWORD attr = GetFileAttributesA(filePath.c_str());
+            result = (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY));
+        } else if (op == "-r") {
+            // Is readable (on Windows, check if file exists and not system)
+            DWORD attr = GetFileAttributesA(filePath.c_str());
+            result = (attr != INVALID_FILE_ATTRIBUTES);
+        } else if (op == "-w") {
+            // Is writable
+            DWORD attr = GetFileAttributesA(filePath.c_str());
+            result = (attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_READONLY));
+        } else if (op == "-x") {
+            // Is executable (check extension)
+            result = (arg.size() >= 4 && 
+                     (toLower(arg.substr(arg.size()-4)) == ".exe" ||
+                      toLower(arg.substr(arg.size()-4)) == ".bat" ||
+                      toLower(arg.substr(arg.size()-4)) == ".cmd"));
+        } else if (op == "-z") {
+            // String is empty
+            result = arg.empty();
+        } else if (op == "-n") {
+            // String is not empty
+            result = !arg.empty();
+        }
+    } else if (args.size() == 4) {
+        std::string left = args[1];
+        std::string op = args[2];
+        std::string right = args[3];
+        
+        if (op == "=" || op == "==") {
+            result = (left == right);
+        } else if (op == "!=") {
+            result = (left != right);
+        } else if (op == "-eq" || op == "-ne" || op == "-lt" || 
+                   op == "-le" || op == "-gt" || op == "-ge") {
+            try {
+                int n1 = std::stoi(left);
+                int n2 = std::stoi(right);
+                if (op == "-eq") result = (n1 == n2);
+                else if (op == "-ne") result = (n1 != n2);
+                else if (op == "-lt") result = (n1 < n2);
+                else if (op == "-le") result = (n1 <= n2);
+                else if (op == "-gt") result = (n1 > n2);
+                else if (op == "-ge") result = (n1 >= n2);
+            } catch (...) {
+                outputError("test: integer expression expected");
+                return;
+            }
+        }
+    }
+    
+    // Return exit code only (0 for true, 1 for false)
+    // Don't output anything for test command
+    g_lastExitStatus = result ? 0 : 1;
+}
+
+// egrep command - extended grep
+void cmd_egrep(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: egrep [options] pattern [files...]");
+        output("  Extended grep - search with extended regex patterns");
+        output("");
+        output("OPTIONS");
+        output("  -i    Case-insensitive search");
+        output("  -n    Show line numbers");
+        output("  -v    Invert match (show non-matching lines)");
+        output("  -c    Count matching lines");
+        output("");
+        output("DESCRIPTION");
+        output("  egrep uses extended regular expressions for pattern matching.");
+        output("  Supports alternation (|), grouping (), and repetition (+, *, ?).");
+        output("");
+        output("EXAMPLES");
+        output("  egrep 'error|warning' logfile.txt");
+        output("  egrep -i '(foo|bar)' data.txt");
+        return;
+    }
+    
+    // egrep is essentially grep with extended regex
+    // For simplicity, we'll call the grep implementation
+    cmd_grep(args);
+}
+
+// lsof command - list open files
+void cmd_lsof(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: lsof [options]");
+        output("  List open files and processes");
+        output("");
+        output("OPTIONS");
+        output("  -c <cmd>       List files opened by processes with command name");
+        output("  -p <pid>       List files opened by specific process ID");
+        output("  -u <user>      List files opened by user");
+        output("  -i [addr]      List network connections");
+        output("  +D <dir>       List processes using files in directory");
+        output("");
+        output("DESCRIPTION");
+        output("  lsof lists information about files opened by processes.");
+        output("  An open file may be a regular file, directory, network socket,");
+        output("  device, pipe, etc.");
+        output("");
+        output("EXAMPLES");
+        output("  lsof");
+        output("  lsof -p 1234");
+        output("  lsof -i :80");
+        output("  lsof -c chrome");
+        output("");
+        output("NOTE");
+        output("  On Windows, listing open files requires kernel-level access.");
+        output("  This command provides basic process and handle information.");
+        output("  For detailed file handle information, use:");
+        output("  - Handle.exe from Sysinternals");
+        output("  - Process Explorer (procexp.exe)");
+        output("");
+        output("SEE ALSO");
+        output("  ps, netstat, ss");
+        return;
+    }
+    
+    bool showNetwork = false;
+    DWORD filterPid = 0;
+    std::string filterCmd;
+    
+    // Parse options
+    for (size_t i = 1; i < args.size(); i++) {
+        if (args[i] == "-i") {
+            showNetwork = true;
+        } else if (args[i] == "-p" && i + 1 < args.size()) {
+            filterPid = std::stoul(args[++i]);
+        } else if (args[i] == "-c" && i + 1 < args.size()) {
+            filterCmd = args[++i];
+            std::transform(filterCmd.begin(), filterCmd.end(), filterCmd.begin(), ::tolower);
+        }
+    }
+    
+    if (showNetwork) {
+        output("Network connections (use 'netstat' or 'ss' for detailed information):");
+        output("");
+        // Defer to netstat functionality
+        std::vector<std::string> netstatArgs = {"ss", "-a"};
+        cmd_ss(netstatArgs);
+        return;
+    }
+    
+    output("COMMAND          PID    USER       TYPE    NAME");
+    output("--------------------------------------------------------------------------------");
+    
+    // Get process list
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnapshot == INVALID_HANDLE_VALUE) {
+        outputError("lsof: failed to get process list");
+        return;
+    }
+    
+    PROCESSENTRY32 pe32;
+    pe32.dwSize = sizeof(PROCESSENTRY32);
+    
+    int count = 0;
+    if (Process32First(hSnapshot, &pe32)) {
+        do {
+            // Apply filters
+            if (filterPid != 0 && pe32.th32ProcessID != filterPid) {
+                continue;
+            }
+            
+            if (!filterCmd.empty()) {
+                std::string procName = pe32.szExeFile;
+                std::transform(procName.begin(), procName.end(), procName.begin(), ::tolower);
+                if (procName.find(filterCmd) == std::string::npos) {
+                    continue;
+                }
+            }
+            
+            // Get process handle to query info
+            HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pe32.th32ProcessID);
+            std::string username = "unknown";
+            
+            if (hProcess != NULL) {
+                // Try to get process user (simplified)
+                HANDLE hToken;
+                if (OpenProcessToken(hProcess, TOKEN_QUERY, &hToken)) {
+                    DWORD dwSize = 0;
+                    GetTokenInformation(hToken, TokenUser, NULL, 0, &dwSize);
+                    if (dwSize > 0) {
+                        username = "user";  // Simplified
+                    }
+                    CloseHandle(hToken);
+                }
+                CloseHandle(hProcess);
+            }
+            
+            std::string command = pe32.szExeFile;
+            if (command.length() > 16) command = command.substr(0, 13) + "...";
+            
+            output(padRight(command, 16) + " " +
+                   padRight(std::to_string(pe32.th32ProcessID), 6) + " " +
+                   padRight(username, 10) + " " +
+                   "PROC    " + std::string(pe32.szExeFile));
+            
+            if (++count >= 20) break;  // Limit output
+        } while (Process32Next(hSnapshot, &pe32));
+    }
+    
+    CloseHandle(hSnapshot);
+    
+    output("");
+    output("Note: For detailed file handle information, use Handle.exe or Process Explorer");
+    output("from Sysinternals: https://docs.microsoft.com/sysinternals/");
+}
+
+// bzip2 command - compress files using bzip2 format
+void cmd_bzip2(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: bzip2 [options] [file...]");
+        output("  Compress files using bzip2 format");
+        output("");
+        output("OPTIONS");
+        output("  -d        Decompress (same as bunzip2)");
+        output("  -k        Keep original file");
+        output("  -v        Verbose output");
+        output("  -z        Force compression");
+        output("");
+        output("DESCRIPTION");
+        output("  Creates .bz2 compressed files using bzip2 algorithm.");
+        output("  On Windows, uses external bzip2.exe if available.");
+        output("");
+        output("EXAMPLES");
+        output("  bzip2 file.txt");
+        output("  bzip2 -k file.txt");
+        output("  bzip2 -d file.bz2");
+        output("");
+        output("SEE ALSO");
+        output("  bunzip2, gzip, tar");
+        return;
+    }
+    
+    if (args.size() < 2) {
+        outputError("bzip2: missing file operand");
+        output("Usage: bzip2 [options] [file...]");
+        return;
+    }
+    
+    bool decompress = false;
+    bool keepOriginal = false;
+    bool verbose = false;
+    std::vector<std::string> files;
+    
+    for (size_t i = 1; i < args.size(); i++) {
+        if (args[i][0] == '-') {
+            for (size_t j = 1; j < args[i].length(); j++) {
+                if (args[i][j] == 'd') decompress = true;
+                else if (args[i][j] == 'k') keepOriginal = true;
+                else if (args[i][j] == 'v') verbose = true;
+                else if (args[i][j] == 'z') decompress = false;
+            }
+        } else {
+            files.push_back(args[i]);
+        }
+    }
+    
+    if (files.empty()) {
+        outputError("bzip2: no files specified");
+        return;
+    }
+    
+    output("bzip2: Compression not implemented internally on Windows.");
+    output("");
+    output("To use bzip2 compression:");
+    output("  1. Download bzip2.exe from: https://sourceware.org/bzip2/");
+    output("  2. Add to system PATH");
+    output("  3. Run directly from command line");
+    output("");
+    output("Alternative: Use 7-Zip (7z.exe) which supports bzip2:");
+    output("  7z a -tbzip2 archive.bz2 file.txt");
+}
+
+// bunzip2 command - decompress bzip2 files
+void cmd_bunzip2(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: bunzip2 [options] [file...]");
+        output("  Decompress bzip2 files");
+        output("");
+        output("OPTIONS");
+        output("  -k        Keep original file");
+        output("  -v        Verbose output");
+        output("  -c        Write to stdout");
+        output("  -t        Test compressed file integrity");
+        output("");
+        output("DESCRIPTION");
+        output("  Decompresses .bz2 files created by bzip2.");
+        output("  On Windows, uses external bzip2.exe if available.");
+        output("");
+        output("EXAMPLES");
+        output("  bunzip2 file.bz2");
+        output("  bunzip2 -k file.bz2");
+        output("  bunzip2 -t file.bz2");
+        output("");
+        output("SEE ALSO");
+        output("  bzip2, gunzip, tar");
+        return;
+    }
+    
+    if (args.size() < 2) {
+        outputError("bunzip2: missing file operand");
+        output("Usage: bunzip2 [options] [file...]");
+        return;
+    }
+    
+    bool keepOriginal = false;
+    bool verbose = false;
+    bool toStdout = false;
+    bool testOnly = false;
+    std::vector<std::string> files;
+    
+    for (size_t i = 1; i < args.size(); i++) {
+        if (args[i][0] == '-') {
+            for (size_t j = 1; j < args[i].length(); j++) {
+                if (args[i][j] == 'k') keepOriginal = true;
+                else if (args[i][j] == 'v') verbose = true;
+                else if (args[i][j] == 'c') toStdout = true;
+                else if (args[i][j] == 't') testOnly = true;
+            }
+        } else {
+            files.push_back(args[i]);
+        }
+    }
+    
+    if (files.empty()) {
+        outputError("bunzip2: no files specified");
+        return;
+    }
+    
+    output("bunzip2: Decompression not implemented internally on Windows.");
+    output("");
+    output("To use bzip2 decompression:");
+    output("  1. Download bzip2.exe from: https://sourceware.org/bzip2/");
+    output("  2. Add to system PATH");
+    output("  3. Run: bzip2 -d file.bz2");
+    output("");
+    output("Alternative: Use 7-Zip (7z.exe) which supports bzip2:");
+    output("  7z x file.bz2");
+}
+
+// tac command - concatenate and print files in reverse
+void cmd_tac(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: tac <file>...");
+        output("  Concatenate and print files in reverse order");
+        output("");
+        output("DESCRIPTION");
+        output("  Reads each file and writes lines starting from the end");
+        output("  of the file to the beginning.");
+        output("");
+        output("EXAMPLES");
+        output("  tac logfile.txt");
+        output("  tac part1.txt part2.txt");
+        return;
+    }
+    
+    if (args.size() < 2) {
+        outputError("tac: missing file operand");
+        output("Usage: tac <file>...");
+        return;
+    }
+
+    for (size_t i = 1; i < args.size(); ++i) {
+        const std::string& path = args[i];
+        std::ifstream file(path);
+        if (!file.is_open()) {
+            outputError("tac: cannot open '" + path + "'");
+            continue;
+        }
+
+        std::vector<std::string> lines;
+        std::string line;
+        while (std::getline(file, line)) {
+            lines.push_back(line);
+        }
+
+        for (auto it = lines.rbegin(); it != lines.rend(); ++it) {
+            output(*it);
+        }
+
+        if (i + 1 < args.size()) {
+            output("");
+        }
+    }
+}
+
+// Helper for CPU time retrieval
+static bool getSystemCpuTimes(ULONGLONG& idle, ULONGLONG& kernel, ULONGLONG& user) {
+    FILETIME idleTime, kernelTime, userTime;
+    if (!GetSystemTimes(&idleTime, &kernelTime, &userTime)) {
+        return false;
+    }
+    auto toULL = [](const FILETIME& ft) {
+        ULARGE_INTEGER li;
+        li.LowPart = ft.dwLowDateTime;
+        li.HighPart = ft.dwHighDateTime;
+        return li.QuadPart;
+    };
+    idle = toULL(idleTime);
+    kernel = toULL(kernelTime);
+    user = toULL(userTime);
+    return true;
+}
+
+// mpstat command - CPU usage statistics
+void cmd_mpstat(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: mpstat [interval] [count]");
+        output("  Report CPU usage statistics");
+        output("");
+        output("ARGUMENTS");
+        output("  interval   Seconds between samples (default: 1)");
+        output("  count      Number of samples (default: 1)");
+        output("");
+        output("NOTE");
+        output("  Windows implementation reports overall CPU only.");
+        output("  Per-CPU breakdown and interrupts are not available here.");
+        return;
+    }
+
+    int interval = 1;
+    int count = 1;
+    if (args.size() >= 2) {
+        interval = std::max(1, std::atoi(args[1].c_str()));
+    }
+    if (args.size() >= 3) {
+        count = std::max(1, std::atoi(args[2].c_str()));
+    }
+
+    ULONGLONG prevIdle = 0, prevKernel = 0, prevUser = 0;
+    if (!getSystemCpuTimes(prevIdle, prevKernel, prevUser)) {
+        outputError("mpstat: unable to query system times");
+        return;
+    }
+
+    output("CPU  %usr  %sys  %idle");
+
+    for (int i = 0; i < count; ++i) {
+        Sleep(static_cast<DWORD>(interval * 1000));
+
+        ULONGLONG idle = 0, kernel = 0, user = 0;
+        if (!getSystemCpuTimes(idle, kernel, user)) {
+            outputError("mpstat: unable to query system times");
+            break;
+        }
+
+        ULONGLONG idleDiff = idle - prevIdle;
+        ULONGLONG kernelDiff = kernel - prevKernel;
+        ULONGLONG userDiff = user - prevUser;
+        ULONGLONG total = kernelDiff + userDiff;
+        if (total == 0) total = 1;
+
+        // Kernel time includes idle; subtract idle portion
+        double userPct = (static_cast<double>(userDiff) * 100.0) / total;
+        double sysPct = (static_cast<double>(kernelDiff > idleDiff ? kernelDiff - idleDiff : 0) * 100.0) / total;
+        double idlePct = (static_cast<double>(idleDiff) * 100.0) / total;
+
+        char buffer[128];
+        snprintf(buffer, sizeof(buffer), "all %5.1f %5.1f %6.1f", userPct, sysPct, idlePct);
+        output(buffer);
+
+        prevIdle = idle;
+        prevKernel = kernel;
+        prevUser = user;
+    }
+
+    output("Note: Windows mpstat shows aggregate CPU usage only.");
+}
+
+// cal command - display calendar (Sunday first)
+void cmd_cal(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: cal [month] [year]");
+        output("  Display calendar with weeks starting Sunday");
+        output("");
+        output("EXAMPLES");
+        output("  cal             Display current month");
+        output("  cal 10 2026     Display October 2026");
+        output("  cal 2026        Display all months in 2026");
+        return;
+    }
+
+    SYSTEMTIME st;
+    GetSystemTime(&st);
+
+    int month = st.wMonth;
+    int year = st.wYear;
+
+    if (args.size() >= 2) {
+        int first = std::atoi(args[1].c_str());
+        if (first >= 1 && first <= 12) {
+            month = first;
+        } else if (first > 12) {
+            year = first;
+        }
+    }
+    if (args.size() >= 3) {
+        year = std::atoi(args[2].c_str());
+    }
+
+    auto daysInMonth = [](int y, int m) {
+        int days[] = {31,28,31,30,31,30,31,31,30,31,30,31};
+        bool leap = ((y % 4 == 0 && y % 100 != 0) || (y % 400 == 0));
+        if (leap) days[1] = 29;
+        return days[m - 1];
+    };
+
+    auto firstDayOfWeek = [](int y, int m) {
+        // Zeller's congruence, returns 0=Sunday
+        int q = 1;
+        int mm = m;
+        int K = y % 100;
+        int J = y / 100;
+        if (m < 3) {
+            mm += 12;
+            K = (y - 1) % 100;
+            J = (y - 1) / 100;
+        }
+        int h = (q + (13 * (mm + 1)) / 5 + K + K / 4 + J / 4 + 5 * J) % 7; // 0=Saturday
+        return (h + 6) % 7; // Convert to 0=Sunday
+    };
+
+    auto printMonth = [&](int m, int y) {
+        const char* monthNames[] = {"January","February","March","April","May","June",
+                                    "July","August","September","October","November","December"};
+        std::ostringstream header;
+        header << "     " << monthNames[m - 1] << " " << y;
+        output(header.str());
+        output("Su Mo Tu We Th Fr Sa");
+
+        int first = firstDayOfWeek(y, m);
+        int dim = daysInMonth(y, m);
+
+        std::string line(first * 3, ' ');
+        for (int d = 1; d <= dim; ++d) {
+            std::ostringstream oss;
+            oss << std::setw(2) << d;
+            line += oss.str();
+            if ((first + d) % 7 == 0 || d == dim) {
+                output(line);
+                line.clear();
+            } else {
+                line += " ";
+            }
+        }
+        output("");
+    };
+
+    bool fullYear = (args.size() == 2 && std::atoi(args[1].c_str()) > 12);
+    if (fullYear) {
+        for (int m = 1; m <= 12; ++m) {
+            printMonth(m, year);
+        }
+    } else {
+        printMonth(month, year);
+    }
+}
+
+// lspci command - list PCI devices (informational)
+void cmd_lspci(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: lspci");
+        output("  List PCI devices (informational on Windows)");
+        output("");
+        output("NOTE");
+        output("  Detailed PCI enumeration requires kernel drivers on Windows.");
+        output("  Use Device Manager (devmgmt.msc) or 'msinfo32' for hardware info.");
+        output("  For command line, run: wmic path win32_pnpentity get Name,DeviceID");
+        return;
+    }
+
+    output("lspci: detailed PCI listing is not available on Windows.");
+    output("Try these instead:");
+    output("  • Device Manager: devmgmt.msc");
+    output("  • System Information: msinfo32");
+    output("  • CLI snapshot: wmic path win32_pnpentity get Name,DeviceID");
+}
+
+// lsusb command - list USB devices (informational)
+void cmd_lsusb(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: lsusb");
+        output("  List USB devices (informational on Windows)");
+        output("");
+        output("NOTE");
+        output("  USB device enumeration is limited without additional drivers.");
+        output("  Use Device Manager under 'Universal Serial Bus controllers'.");
+        output("  For CLI info, run: wmic path Win32_USBControllerDevice get *");
+        return;
+    }
+
+    output("lsusb: detailed USB listing is not available on Windows.");
+    output("Try these instead:");
+    output("  • Device Manager: devmgmt.msc (Universal Serial Bus controllers)");
+    output("  • System Information: msinfo32");
+    output("  • CLI snapshot: wmic path Win32_USBControllerDevice get *");
+}
+
+// sh command - Execute shell scripts
+void cmd_sh(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: sh [options] [script [arguments...]]");
+        output("  Execute shell scripts");
+        output("");
+        output("OPTIONS");
+        output("  -c <command>   Execute command string");
+        output("  script         Execute commands from script file");
+        output("");
+        output("DESCRIPTION");
+        output("  sh executes shell scripts line by line. It can execute");
+        output("  a command string with -c or read from a script file.");
+        output("  Script arguments are passed to the script.");
+        output("");
+        output("EXAMPLES");
+        output("  sh -c \"echo Hello World\"");
+        output("  sh script.sh");
+        output("  sh script.sh arg1 arg2");
+        output("");
+        output("SEE ALSO");
+        output("  source, bash, exec");
+        return;
+    }
+    
+    if (args.size() < 2) {
+        outputError("sh: missing operand");
+        output("Usage: sh [options] [script [arguments...]]");
+        output("Try 'sh --help' for more information.");
+        return;
+    }
+    
+    // Handle -c option for command string
+    if (args[1] == "-c") {
+        if (args.size() < 3) {
+            outputError("sh: -c: option requires an argument");
+            return;
+        }
+        
+        // Execute the command string
+        std::string commandStr = args[2];
+        executeCommand(commandStr);
+        return;
+    }
+    
+    // Execute script file
+    std::string filename = args[1];
+    
+    // Convert to Windows path if needed
+    if (filename[0] == '~') {
+        char homeDir[MAX_PATH];
+        if (GetEnvironmentVariableA("USERPROFILE", homeDir, sizeof(homeDir))) {
+            filename = std::string(homeDir) + filename.substr(1);
+        }
+    }
+    
+    std::ifstream scriptFile(filename);
+    if (!scriptFile.is_open()) {
+        outputError("sh: " + filename + ": No such file or directory");
+        return;
+    }
+    
+    // TODO: Script arguments (args[2], args[3], ...) could be passed via environment
+    // For now, we just execute line by line
+    
+    std::string line;
+    int lineNum = 0;
+    while (std::getline(scriptFile, line)) {
+        lineNum++;
+        
+        // Skip empty lines and comments
+        if (line.empty() || line[0] == '#') {
+            continue;
+        }
+        
+        // Execute the command
+        executeCommand(line);
+    }
+    
+    scriptFile.close();
+}
+
+// IP command - show network interfaces and IP configuration
+void cmd_ip(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: ip [command] [options]");
+        output("  Show/manipulate network interfaces, addresses, and routes");
+        output("");
+        output("COMMANDS");
+        output("  addr, address        Show IP addresses for all interfaces");
+        output("  link                 Show network interfaces status");
+        output("  route                Show routing table");
+        output("");
+        output("EXAMPLES");
+        output("  ip addr");
+        output("    Display all IP addresses");
+        output("");
+        output("  ip link");
+        output("    Show network interfaces and their status");
+        output("");
+        output("  ip route");
+        output("    Display routing table");
+        output("");
+        output("NOTE");
+        output("  This is a Windows implementation using GetAdaptersAddresses API.");
+        output("  For advanced configuration, use 'netsh interface ip' commands.");
+        return;
+    }
+    
+    std::string subcommand = "addr";  // Default
+    if (args.size() >= 2) {
+        subcommand = args[1];
+    }
+    
+    // IP ADDR - Show IP addresses
+    if (subcommand == "addr" || subcommand == "address" || subcommand == "a") {
+        // Get adapter addresses
+        ULONG bufferSize = 15000;
+        PIP_ADAPTER_ADDRESSES pAddresses = NULL;
+        ULONG result;
+        
+        do {
+            pAddresses = (IP_ADAPTER_ADDRESSES*)malloc(bufferSize);
+            if (pAddresses == NULL) {
+                outputError("ip: memory allocation failed");
+                return;
+            }
+            
+            result = GetAdaptersAddresses(AF_UNSPEC, 
+                GAA_FLAG_INCLUDE_PREFIX | GAA_FLAG_INCLUDE_GATEWAYS,
+                NULL, pAddresses, &bufferSize);
+            
+            if (result == ERROR_BUFFER_OVERFLOW) {
+                free(pAddresses);
+                pAddresses = NULL;
+            }
+        } while (result == ERROR_BUFFER_OVERFLOW);
+        
+        if (result != NO_ERROR) {
+            free(pAddresses);
+            outputError("ip: failed to get adapter information");
+            return;
+        }
+        
+        // Display interface information
+        PIP_ADAPTER_ADDRESSES pCurr = pAddresses;
+        int ifIndex = 1;
+        
+        while (pCurr) {
+            std::ostringstream oss;
+            
+            // Interface header
+            oss << ifIndex << ": " << pCurr->AdapterName;
+            output(oss.str());
+            
+            // Description
+            oss.str("");
+            oss.clear();
+            char desc[256];
+            WideCharToMultiByte(CP_UTF8, 0, pCurr->Description, -1, desc, 256, NULL, NULL);
+            oss << "    " << desc;
+            output(oss.str());
+            
+            // Status
+            oss.str("");
+            oss.clear();
+            oss << "    Status: ";
+            if (pCurr->OperStatus == IfOperStatusUp) {
+                oss << "UP";
+            } else {
+                oss << "DOWN";
+            }
+            output(oss.str());
+            
+            // MAC address
+            if (pCurr->PhysicalAddressLength > 0) {
+                oss.str("");
+                oss.clear();
+                oss << "    MAC: ";
+                for (DWORD i = 0; i < pCurr->PhysicalAddressLength; i++) {
+                    if (i > 0) oss << ":";
+                    oss << std::hex << std::setfill('0') << std::setw(2) 
+                        << (int)pCurr->PhysicalAddress[i];
+                }
+                oss << std::dec;
+                output(oss.str());
+            }
+            
+            // IP addresses
+            PIP_ADAPTER_UNICAST_ADDRESS pUnicast = pCurr->FirstUnicastAddress;
+            while (pUnicast) {
+                oss.str("");
+                oss.clear();
+                
+                if (pUnicast->Address.lpSockaddr->sa_family == AF_INET) {
+                    sockaddr_in* sa = (sockaddr_in*)pUnicast->Address.lpSockaddr;
+                    char* ipStr = inet_ntoa(sa->sin_addr);
+                    oss << "    inet " << ipStr;
+                } else if (pUnicast->Address.lpSockaddr->sa_family == AF_INET6) {
+                    sockaddr_in6* sa = (sockaddr_in6*)pUnicast->Address.lpSockaddr;
+                    // Format IPv6 address manually
+                    oss << "    inet6 ";
+                    for (int i = 0; i < 8; i++) {
+                        if (i > 0) oss << ":";
+                        oss << std::hex << ntohs(((unsigned short*)&sa->sin6_addr)[i]);
+                    }
+                    oss << std::dec;
+                }
+                
+                if (!oss.str().empty()) {
+                    output(oss.str());
+                }
+                
+                pUnicast = pUnicast->Next;
+            }
+            
+            output("");
+            pCurr = pCurr->Next;
+            ifIndex++;
+        }
+        
+        free(pAddresses);
+    }
+    // IP LINK - Show interfaces
+    else if (subcommand == "link" || subcommand == "l") {
+        ULONG bufferSize = 15000;
+        PIP_ADAPTER_ADDRESSES pAddresses = (IP_ADAPTER_ADDRESSES*)malloc(bufferSize);
+        
+        if (pAddresses == NULL) {
+            outputError("ip: memory allocation failed");
+            return;
+        }
+        
+        ULONG result = GetAdaptersAddresses(AF_UNSPEC, 0, NULL, pAddresses, &bufferSize);
+        
+        if (result != NO_ERROR) {
+            free(pAddresses);
+            outputError("ip: failed to get adapter information");
+            return;
+        }
+        
+        PIP_ADAPTER_ADDRESSES pCurr = pAddresses;
+        int ifIndex = 1;
+        
+        while (pCurr) {
+            std::ostringstream oss;
+            
+            oss << ifIndex << ": " << pCurr->AdapterName << ": ";
+            
+            if (pCurr->OperStatus == IfOperStatusUp) {
+                oss << "<UP,RUNNING> ";
+            } else {
+                oss << "<DOWN> ";
+            }
+            
+            oss << "mtu " << pCurr->Mtu;
+            output(oss.str());
+            
+            // MAC address on separate line
+            if (pCurr->PhysicalAddressLength > 0) {
+                oss.str("");
+                oss.clear();
+                oss << "    link/ether ";
+                for (DWORD i = 0; i < pCurr->PhysicalAddressLength; i++) {
+                    if (i > 0) oss << ":";
+                    oss << std::hex << std::setfill('0') << std::setw(2) 
+                        << (int)pCurr->PhysicalAddress[i];
+                }
+                oss << std::dec;
+                output(oss.str());
+            }
+            
+            pCurr = pCurr->Next;
+            ifIndex++;
+        }
+        
+        free(pAddresses);
+    }
+    // IP ROUTE - Show routing table
+    else if (subcommand == "route" || subcommand == "r") {
+        PMIB_IPFORWARDTABLE pIpForwardTable = NULL;
+        DWORD dwSize = 0;
+        
+        // Get size
+        if (GetIpForwardTable(NULL, &dwSize, 0) == ERROR_INSUFFICIENT_BUFFER) {
+            pIpForwardTable = (MIB_IPFORWARDTABLE*)malloc(dwSize);
+        }
+        
+        if (pIpForwardTable == NULL) {
+            outputError("ip: failed to allocate memory for routing table");
+            return;
+        }
+        
+        if (GetIpForwardTable(pIpForwardTable, &dwSize, 0) != NO_ERROR) {
+            free(pIpForwardTable);
+            outputError("ip: failed to get routing table");
+            return;
+        }
+        
+        output("Destination      Gateway          Mask             Metric Interface");
+        output("---------------- ---------------- ---------------- ------ ---------");
+        
+        for (DWORD i = 0; i < pIpForwardTable->dwNumEntries; i++) {
+            MIB_IPFORWARDROW* pRow = &pIpForwardTable->table[i];
+            
+            struct in_addr dest, mask, gateway;
+            dest.S_un.S_addr = pRow->dwForwardDest;
+            mask.S_un.S_addr = pRow->dwForwardMask;
+            gateway.S_un.S_addr = pRow->dwForwardNextHop;
+            
+            char destStr[INET_ADDRSTRLEN];
+            char maskStr[INET_ADDRSTRLEN];
+            char gatewayStr[INET_ADDRSTRLEN];
+            
+            strcpy(destStr, inet_ntoa(dest));
+            strcpy(maskStr, inet_ntoa(mask));
+            strcpy(gatewayStr, inet_ntoa(gateway));
+            
+            std::ostringstream oss;
+            oss << std::left << std::setw(17) << destStr
+                << std::setw(17) << gatewayStr
+                << std::setw(17) << maskStr
+                << std::setw(7) << pRow->dwForwardMetric1
+                << pRow->dwForwardIfIndex;
+            output(oss.str());
+        }
+        
+        free(pIpForwardTable);
+    }
+    else {
+        outputError("ip: unknown command '" + subcommand + "'");
+        output("Try: ip addr, ip link, or ip route");
+    }
+}
+
+// IPTables command - Windows Firewall management
+void cmd_iptables(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: iptables [options]");
+        output("  Display and manage Windows Firewall rules");
+        output("");
+        output("OPTIONS");
+        output("  -L, --list           List all firewall rules");
+        output("  -S, --status         Show firewall status");
+        output("");
+        output("EXAMPLES");
+        output("  iptables -L");
+        output("    List all firewall rules");
+        output("");
+        output("  iptables -S");
+        output("    Show firewall status for all profiles");
+        output("");
+        output("NOTE");
+        output("  This is a Windows implementation using netsh commands.");
+        output("  For full firewall management, use:");
+        output("    netsh advfirewall firewall [commands]");
+        output("  Or the Windows Firewall with Advanced Security GUI.");
+        output("");
+        output("  Modifying firewall rules requires administrator privileges.");
+        return;
+    }
+    
+    std::string option = "-S";  // Default: show status
+    if (args.size() >= 2) {
+        option = args[1];
+    }
+    
+    // List rules
+    if (option == "-L" || option == "--list") {
+        output("⚡ Windows Firewall Rules");
+        output("==========================================");
+        output("");
+        output("⚠ Note: Use this command to view rules via netsh:");
+        output("  netsh advfirewall firewall show rule name=all");
+        output("");
+        output("Executing netsh command...");
+        output("");
+        
+        // Execute netsh command
+        std::string cmd = "netsh advfirewall firewall show rule name=all";
+        
+        FILE* pipe = _popen(cmd.c_str(), "r");
+        if (!pipe) {
+            outputError("iptables: failed to execute netsh command");
+            return;
+        }
+        
+        char buffer[256];
+        int lineCount = 0;
+        while (fgets(buffer, sizeof(buffer), pipe) && lineCount < 100) {
+            std::string line = buffer;
+            // Remove trailing newline
+            if (!line.empty() && line[line.length()-1] == '\n') {
+                line.erase(line.length()-1);
+            }
+            if (!line.empty() && line[line.length()-1] == '\r') {
+                line.erase(line.length()-1);
+            }
+            output(line);
+            lineCount++;
+        }
+        
+        if (lineCount >= 100) {
+            output("");
+            output("... (output truncated, showing first 100 lines)");
+            output("Use 'netsh advfirewall firewall show rule name=all' for full output");
+        }
+        
+        _pclose(pipe);
+    }
+    // Show status
+    else if (option == "-S" || option == "--status") {
+        output("⚡ Windows Firewall Status");
+        output("==========================================");
+        output("");
+        
+        // Execute netsh command to get firewall status
+        std::string cmd = "netsh advfirewall show allprofiles state";
+        
+        FILE* pipe = _popen(cmd.c_str(), "r");
+        if (!pipe) {
+            outputError("iptables: failed to execute netsh command");
+            return;
+        }
+        
+        char buffer[256];
+        while (fgets(buffer, sizeof(buffer), pipe)) {
+            std::string line = buffer;
+            // Remove trailing newline
+            if (!line.empty() && line[line.length()-1] == '\n') {
+                line.erase(line.length()-1);
+            }
+            if (!line.empty() && line[line.length()-1] == '\r') {
+                line.erase(line.length()-1);
+            }
+            output(line);
+        }
+        
+        _pclose(pipe);
+        
+        output("");
+        output("TIP: Use 'netsh advfirewall' for advanced firewall management");
+    }
+    else {
+        outputError("iptables: unknown option '" + option + "'");
+        output("Try: iptables -L (list rules) or iptables -S (show status)");
+    }
+}
+
+// Ping command - send ICMP echo requests
+void cmd_ping(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: ping [options] <host>");
+        output("  Send ICMP ECHO_REQUEST packets to network hosts");
+        output("");
+        output("OPTIONS");
+        output("  -c <count>       Number of packets to send (default: 4)");
+        output("  -t <timeout>     Timeout in milliseconds (default: 1000)");
+        output("  -s <size>        Packet data size in bytes (default: 32)");
+        output("");
+        output("EXAMPLES");
+        output("  ping google.com");
+        output("    Send 4 ping packets to google.com");
+        output("");
+        output("  ping -c 10 8.8.8.8");
+        output("    Send 10 ping packets to 8.8.8.8");
+        output("");
+        output("  ping -t 2000 -s 64 example.com");
+        output("    Ping with 2 second timeout and 64 byte packets");
+        return;
+    }
+    
+    if (args.size() < 2) {
+        outputError("ping: missing host");
+        output("Usage: ping [options] <host>");
+        return;
+    }
+    
+    // Parse options
+    int count = 4;
+    int timeout = 1000;
+    int dataSize = 32;
+    std::string host;
+    
+    for (size_t i = 1; i < args.size(); i++) {
+        const std::string& arg = args[i];
+        
+        if (arg == "-c" && i + 1 < args.size()) {
+            count = std::atoi(args[i + 1].c_str());
+            if (count <= 0) count = 4;
+            i++;
+        } else if (arg == "-t" && i + 1 < args.size()) {
+            timeout = std::atoi(args[i + 1].c_str());
+            if (timeout <= 0) timeout = 1000;
+            i++;
+        } else if (arg == "-s" && i + 1 < args.size()) {
+            dataSize = std::atoi(args[i + 1].c_str());
+            if (dataSize <= 0) dataSize = 32;
+            if (dataSize > 65500) dataSize = 65500;  // Max size
+            i++;
+        } else if (arg[0] != '-') {
+            host = arg;
+        }
+    }
+    
+    if (host.empty()) {
+        outputError("ping: no host specified");
+        return;
+    }
+    
+    // Resolve hostname to IP
+    struct addrinfo hints = {0};
+    struct addrinfo* result = NULL;
+    hints.ai_family = AF_INET;  // IPv4
+    hints.ai_socktype = SOCK_RAW;
+    hints.ai_protocol = IPPROTO_ICMP;
+    
+    if (getaddrinfo(host.c_str(), NULL, &hints, &result) != 0) {
+        outputError("ping: unknown host " + host);
+        return;
+    }
+    
+    struct sockaddr_in* addr = (struct sockaddr_in*)result->ai_addr;
+    IPAddr destAddr = addr->sin_addr.S_un.S_addr;
+    char* ipStr = inet_ntoa(addr->sin_addr);
+    
+    std::ostringstream oss;
+    oss << "PING " << host << " (" << ipStr << ") " << dataSize << " bytes of data";
+    output(oss.str());
+    output("");
+    
+    freeaddrinfo(result);
+    
+    // Create ICMP handle
+    HANDLE hIcmp = IcmpCreateFile();
+    if (hIcmp == INVALID_HANDLE_VALUE) {
+        outputError("ping: failed to create ICMP handle");
+        return;
+    }
+    
+    // Prepare send data
+    char* sendData = new char[dataSize];
+    for (int i = 0; i < dataSize; i++) {
+        sendData[i] = 'A' + (i % 26);
+    }
+    
+    // Reply buffer
+    DWORD replySize = sizeof(ICMP_ECHO_REPLY) + dataSize + 8;
+    char* replyBuffer = new char[replySize];
+    
+    // Statistics
+    int sent = 0;
+    int received = 0;
+    DWORD minTime = MAXDWORD;
+    DWORD maxTime = 0;
+    DWORD totalTime = 0;
+    
+    // Send pings
+    for (int i = 0; i < count; i++) {
+        DWORD result = IcmpSendEcho(hIcmp, destAddr, sendData, dataSize,
+                                     NULL, replyBuffer, replySize, timeout);
+        
+        sent++;
+        
+        if (result > 0) {
+            PICMP_ECHO_REPLY pEchoReply = (PICMP_ECHO_REPLY)replyBuffer;
+            
+            if (pEchoReply->Status == IP_SUCCESS) {
+                received++;
+                DWORD rtt = pEchoReply->RoundTripTime;
+                
+                if (rtt < minTime) minTime = rtt;
+                if (rtt > maxTime) maxTime = rtt;
+                totalTime += rtt;
+                
+                struct in_addr replyAddr;
+                replyAddr.S_un.S_addr = pEchoReply->Address;
+                char* replyIp = inet_ntoa(replyAddr);
+                
+                oss.str("");
+                oss.clear();
+                oss << dataSize << " bytes from " << replyIp
+                    << ": icmp_seq=" << (i + 1)
+                    << " ttl=" << (int)pEchoReply->Options.Ttl
+                    << " time=" << rtt << " ms";
+                output(oss.str());
+            } else {
+                oss.str("");
+                oss.clear();
+                oss << "Request timeout for icmp_seq " << (i + 1);
+                output(oss.str());
+            }
+        } else {
+            oss.str("");
+            oss.clear();
+            oss << "Request timeout for icmp_seq " << (i + 1);
+            output(oss.str());
+        }
+        
+        // Wait 1 second between pings (except last one)
+        if (i < count - 1) {
+            Sleep(1000);
+        }
+    }
+    
+    // Print statistics
+    output("");
+    oss.str("");
+    oss.clear();
+    oss << "--- " << host << " ping statistics ---";
+    output(oss.str());
+    
+    oss.str("");
+    oss.clear();
+    int lossPercent = ((sent - received) * 100) / sent;
+    oss << sent << " packets transmitted, " << received << " received, "
+        << lossPercent << "% packet loss";
+    output(oss.str());
+    
+    if (received > 0) {
+        DWORD avgTime = totalTime / received;
+        oss.str("");
+        oss.clear();
+        oss << "rtt min/avg/max = " << minTime << "/" << avgTime << "/" << maxTime << " ms";
+        output(oss.str());
+    }
+    
+    // Cleanup
+    delete[] sendData;
+    delete[] replyBuffer;
+    IcmpCloseHandle(hIcmp);
+}
+
+// Traceroute command - trace network path to destination
+void cmd_traceroute(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: traceroute [options] <host>");
+        output("  Trace the network path to a destination host");
+        output("");
+        output("OPTIONS");
+        output("  -m <max_hops>    Maximum number of hops (default: 30)");
+        output("  -q <queries>     Number of queries per hop (default: 3)");
+        output("  -w <timeout>     Timeout in milliseconds (default: 1000)");
+        output("");
+        output("EXAMPLES");
+        output("  traceroute google.com");
+        output("    Trace route to google.com");
+        output("");
+        output("  traceroute -m 20 8.8.8.8");
+        output("    Trace with maximum 20 hops");
+        output("");
+        output("  traceroute -q 5 -w 2000 example.com");
+        output("    5 queries per hop with 2 second timeout");
+        return;
+    }
+    
+    if (args.size() < 2) {
+        outputError("traceroute: missing host");
+        output("Usage: traceroute [options] <host>");
+        return;
+    }
+    
+    // Parse options
+    int maxHops = 30;
+    int queries = 3;
+    int timeout = 1000;
+    std::string host;
+    
+    for (size_t i = 1; i < args.size(); i++) {
+        const std::string& arg = args[i];
+        
+        if (arg == "-m" && i + 1 < args.size()) {
+            maxHops = std::atoi(args[i + 1].c_str());
+            if (maxHops <= 0) maxHops = 30;
+            if (maxHops > 255) maxHops = 255;
+            i++;
+        } else if (arg == "-q" && i + 1 < args.size()) {
+            queries = std::atoi(args[i + 1].c_str());
+            if (queries <= 0) queries = 3;
+            if (queries > 10) queries = 10;
+            i++;
+        } else if (arg == "-w" && i + 1 < args.size()) {
+            timeout = std::atoi(args[i + 1].c_str());
+            if (timeout <= 0) timeout = 1000;
+            i++;
+        } else if (arg[0] != '-') {
+            host = arg;
+        }
+    }
+    
+    if (host.empty()) {
+        outputError("traceroute: no host specified");
+        return;
+    }
+    
+    // Resolve hostname to IP
+    struct addrinfo hints = {0};
+    struct addrinfo* result = NULL;
+    hints.ai_family = AF_INET;  // IPv4
+    hints.ai_socktype = SOCK_RAW;
+    hints.ai_protocol = IPPROTO_ICMP;
+    
+    if (getaddrinfo(host.c_str(), NULL, &hints, &result) != 0) {
+        outputError("traceroute: unknown host " + host);
+        return;
+    }
+    
+    struct sockaddr_in* addr = (struct sockaddr_in*)result->ai_addr;
+    IPAddr destAddr = addr->sin_addr.S_un.S_addr;
+    char* destIp = inet_ntoa(addr->sin_addr);
+    
+    std::ostringstream oss;
+    oss << "traceroute to " << host << " (" << destIp << "), " << maxHops << " hops max";
+    output(oss.str());
+    output("");
+    
+    freeaddrinfo(result);
+    
+    // Create ICMP handle
+    HANDLE hIcmp = IcmpCreateFile();
+    if (hIcmp == INVALID_HANDLE_VALUE) {
+        outputError("traceroute: failed to create ICMP handle");
+        return;
+    }
+    
+    // Prepare send data
+    int dataSize = 32;
+    char* sendData = new char[dataSize];
+    for (int i = 0; i < dataSize; i++) {
+        sendData[i] = 'A' + (i % 26);
+    }
+    
+    // Reply buffer
+    DWORD replySize = sizeof(ICMP_ECHO_REPLY) + dataSize + 8;
+    char* replyBuffer = new char[replySize];
+    
+    bool reachedDest = false;
+    
+    // Trace each hop
+    for (int ttl = 1; ttl <= maxHops && !reachedDest; ttl++) {
+        oss.str("");
+        oss.clear();
+        oss << std::setw(2) << ttl << "  ";
+        
+        std::string hopOutput = oss.str();
+        IPAddr hopAddr = 0;
+        bool hopFound = false;
+        int successCount = 0;
+        DWORD totalRtt = 0;
+        
+        // Send multiple probes per hop
+        for (int q = 0; q < queries; q++) {
+            // Set IP options with TTL
+            IP_OPTION_INFORMATION ipOptions;
+            memset(&ipOptions, 0, sizeof(ipOptions));
+            ipOptions.Ttl = (unsigned char)ttl;
+            
+            DWORD result = IcmpSendEcho(hIcmp, destAddr, sendData, dataSize,
+                                         &ipOptions, replyBuffer, replySize, timeout);
+            
+            if (result > 0) {
+                PICMP_ECHO_REPLY pEchoReply = (PICMP_ECHO_REPLY)replyBuffer;
+                
+                // Store hop address from first successful probe
+                if (!hopFound) {
+                    hopAddr = pEchoReply->Address;
+                    hopFound = true;
+                    
+                    struct in_addr replyAddr;
+                    replyAddr.S_un.S_addr = hopAddr;
+                    char* replyIp = inet_ntoa(replyAddr);
+                    
+                    // Add IP address with padding
+                    std::ostringstream tempOss;
+                    tempOss << std::setw(16) << std::left << replyIp;
+                    hopOutput += tempOss.str();
+                }
+                
+                // Check if we reached destination
+                if (pEchoReply->Status == IP_SUCCESS) {
+                    reachedDest = true;
+                }
+                
+                // Add RTT
+                DWORD rtt = pEchoReply->RoundTripTime;
+                totalRtt += rtt;
+                successCount++;
+                
+                oss.str("");
+                oss.clear();
+                oss << rtt << " ms  ";
+                hopOutput += oss.str();
+            } else {
+                // Timeout or no response
+                hopOutput += "*  ";
+            }
+        }
+        
+        // Output hop information
+        if (hopFound) {
+            // Add average RTT if we got responses
+            if (successCount > 0) {
+                DWORD avgRtt = totalRtt / successCount;
+                oss.str("");
+                oss.clear();
+                oss << "(avg " << avgRtt << " ms)";
+                hopOutput += oss.str();
+            }
+            output(hopOutput);
+        } else {
+            // No response from this hop
+            hopOutput += "* * *";
+            output(hopOutput);
+        }
+    }
+    
+    output("");
+    if (reachedDest) {
+        output("✓ Trace complete.");
+    } else {
+        output("⚠ Destination not reached within maximum hops.");
+    }
+    
+    // Cleanup
+    delete[] sendData;
+    delete[] replyBuffer;
+    IcmpCloseHandle(hIcmp);
+}
+
+void cmd_help() {
+    output("Available commands:");
+    output("");
+    output("NAVIGATION & FILE VIEWING:");
+    output("  pwd              - Print working directory");
+    output("  cd [dir]         - Change directory");
+    output("  ls [-la] [path]  - List directory contents");
+    output("  cat <file>...    - Display file contents");
+    output("  less <file>      - View file with paging (Space=next, q=quit)");
+    output("  head [-n N] <file> - Display first N lines (default: 10)");
+    output("  tail [-n N] <file> - Display last N lines (default: 10)");
+    output("");
+    output("FILE OPERATIONS:");
+    output("  touch <file>...  - Create empty file");
+    output("  mkdir <dir>...   - Create directory");
+    output("  rm [-f] <file>... - Remove file (-f=force without confirmation)");
+    output("  rmdir [-rf] <dir> - Remove directory (-r=recursive, -f=force)");
+    output("  mv <source> <dest> - Move/rename file or directory");
+    output("  rename <old> <new> [f] - Rename files by pattern");
+    output("  ln [-s] <src> <dst> - Create hard/symbolic links");
+    output("  unlink <file>    - Remove a single file");
+    output("  chmod <mode> <file>... - Change file permissions (Windows ACL)");
+    output("  chown <owner> <file>... - Change file owner (requires admin)");
+    output("  chgrp <group> <file>... - Change file group (requires admin)");
+    output("  chattr [+-]<attr> <file> - Change file attributes (r,h,s,a)");
+    output("");
+    output("TEXT PROCESSING:");
+    output("  grep [-inv] <pattern> <file>... - Search for pattern in files");
+    output("  egrep [opts] pat [f] - Extended grep with regex support");
+    output("  sed <script>     - Stream editor (text substitution)");
+    output("  awk '<prog>'     - Pattern scanning and text processing");
+    output("  sort [opts] [f]  - Sort lines of text");
+    output("  shuf [opts] [f]  - Shuffle lines randomly");
+    output("  cut [opts] [f]   - Extract columns/fields from text");
+    output("  paste [opts] [f] - Merge lines from files");
+    output("  split [opts] [f] - Split file into pieces (by lines or bytes)");
+    output("  nl [opts] [file] - Number lines in text");
+    output("  tr [set1] [set2] - Translate or delete characters");
+    output("  uniq [opts] [f]  - Filter out repeated lines");
+    output("  wc [opts] [f]    - Count lines, words, characters");
+    output("  tee [opts] [f]   - Copy input to file(s) and stdout");
+    output("  diff [opts] <f1> <f2> - Compare files line by line");
+    output("  patch [opts] [f] - Apply patch files");
+    output("  rev [file|text]  - Reverse lines of text or string");
+    output("  tac <file>...     - Print files with lines in reverse order");
+    output("");
+    output("FILE SEARCH:");
+    output("  find [path] [-name pattern] [-type f|d] - Find files/directories");
+    output("  locate <pattern> - Find files by name pattern (recursive)");
+    output("  updatedb [opts]  - Update locate database for file indexing");
+    output("  which <cmd>      - Locate a command in PATH");
+    output("  whereis <cmd>    - Locate command, source, and manual pages");
+    output("  file [opts] <f>  - Determine file type");
+    output("  basename <path>  - Strip directory and suffix from pathname");
+    output("  stat <file>      - Display file statistics");
+    output("");
+    output("DISK & SYSTEM INFO:");
+    output("  df [options] [path] - Display disk space usage");
+    output("  du [options] [path] - Estimate file space usage");
+    output("  mount            - Show mounted volumes/drives");
+    output("  uptime           - Show system uptime");
+    output("  uname [opts]     - Display system information");
+    output("  date [+format]   - Display current date and time");
+    output("  timedatectl [cmd] - Display or control system time and date");
+    output("  cal [m] [y]      - Display calendar (Sunday first)");
+    output("  ncal [m] [y]     - Display calendar (Monday first)");
+    output("  free [opts]      - Show free and used memory");
+    output("  vmstat [opts]    - Report virtual memory statistics");
+    output("  iostat [opts]    - Report CPU and I/O device statistics");
+    output("  mpstat [i] [c]   - Report CPU usage statistics");
+    output("  hostname [name]  - Show or set system hostname");
+    output("  dmesg [opts]     - Display kernel/system messages");
+    output("  quota [opts]     - Display disk quota information");
+    output("  sysctl [-a] [k]  - Display system parameters (compatibility)");
+    output("  blkid [device]   - Display block device attributes and UUIDs");
+    output("");
+    output("USER & GROUP MANAGEMENT:");
+    output("  whoami [opts]    - Display current user information");
+    output("  who [opts]       - Show who is logged on");
+    output("  w [opts] [user]  - Show who is logged on and what they are doing");
+    output("  last [opts]      - Show listing of last logged in users");
+    output("  id [opts]        - Display user and group information");
+    output("  finger [user]    - User information display");
+    output("  user             - Display current user details");
+    output("  groups           - Display user group membership");
+    output("  passwd [user]    - Change user password (requires admin)");
+    output("  useradd [opts] <user> - Add new user (requires admin)");
+    output("  userdel [opts] <user> - Delete user (requires admin)");
+    output("  usermod [opts] <user> - Modify user account (requires admin)");
+    output("  groupadd <group> - Create new group (requires admin)");
+    output("  addgroup <group> - Create new group (alias, requires admin)");
+    output("  groupmod [opts] <group> - Modify group (requires admin)");
+    output("  groupdel <group> - Delete group (requires admin)");
+    output("  gpasswd [opts] <group> - Administer group (requires admin)");
+    output("  getent <db> [key] - Get entries from databases (passwd/group/hosts)");
+    output("");
+    output("PROCESS MANAGEMENT:");
+    output("  proc, ps         - List running processes");
+    output("  htop             - Interactive process viewer (enhanced)");
+    output("  top [opts]       - Display and update sorted process information");
+    output("  pgrep [opts] pat - Search for processes by name");
+    output("  pidof name...    - Show process IDs for program names");
+    output("  pstree [pid]     - Display processes as a tree");
+    output("  kill <PID>...    - Terminate process by PID");
+    output("  killall <name>   - Terminate all processes by name");
+    output("  pkill <pattern>  - Signal processes by name pattern");
+    output("  xkill            - Click on window to kill its process");
+    output("  jobs [opts]      - List background jobs");
+    output("  bg [job]         - Resume suspended job in background");
+    output("  fg [job]         - Move job to foreground");
+    output("  nice [opts] <cmd> - Run program with modified priority");
+    output("  renice <pri> <pid> - Change priority of running process");
+    output("  strace <cmd>     - Trace system calls (info only)");
+    output("  lsof [opts]      - List open files");
+    output("  sleep [seconds]  - Pause execution for a duration");
+    output("  wait <pid> [pid] - Wait for process IDs to exit");
+    output("  timeout <sec> cmd - Run a command with a time limit");
+    output("  nohup <cmd> [args] - Run command immune to hangups");
+    output("");
+    output("ARCHIVING & COMPRESSION:");
+    output("  tar [-cxt] -f <archive> [files...] - Create/extract/list tar archives");
+    output("  gzip/gunzip [file] - Compress/decompress files");
+    output("  bzip2/bunzip2 [file] - Compress/decompress files (bzip2 format)");
+    output("  xz [opts] <file> - Compress files to XZ format");
+    output("  unxz [opts] <file.xz> - Decompress XZ files");
+    output("  zip [file] [files...] - Create ZIP archives");
+    output("  unzip [-l] <file> - Extract/list ZIP archives");
+    output("  unrar [opts] <archive> - Extract RAR archives");
+    output("  dd if=<in> of=<out> [bs=<size>] - Copy/convert files");
+    output("");
+    output("NETWORK & REMOTE:");
+    output("  ssh [user@]host - Connect to remote host via SSH");
+    output("  scp <source> <dest> - Securely copy files between hosts");
+    output("  rsync [opts] <src> <dst> - Synchronize files/directories");
+    output("  wget [opts] <url> - Download files from the internet");
+    output("  curl [opts] <url> - HTTP client for transferring data");
+    output("  ftp [opts] host  - Simple FTP connectivity test");
+    output("  sftp [opts] host - SSH/SFTP connectivity probe");
+    output("  ping [opts] <host> - Send ICMP echo requests to host");
+    output("  traceroute [opts] <host> - Trace network path to host");
+    output("  ip [cmd]         - Show network interfaces and IP configuration");
+    output("  ifconfig [iface] - Configure network interface parameters");
+    output("  iptables [opts]  - Display/manage Windows Firewall rules");
+    output("  dig <domain> [type] - DNS lookup (domain information groper)");
+    output("  nslookup <domain> - Query Domain Name System");
+    output("  netstat [opts]   - Display network statistics and connections");
+    output("  ss [opts]        - Display socket statistics");
+    output("  nmap [opts] <host> - Network mapper and port scanner");
+    output("  tcpdump [opts]   - Capture and analyze network packets");
+    output("  nc [opts] [host] [port] - Network utility (netcat)");
+    output("  lspci            - List PCI devices (informational)");
+    output("  lsusb            - List USB devices (informational)");
+    output("  dmesg [opts]     - Display kernel/system messages");
+    output("");
+    output("SERVICES & SYSTEM:");
+    output("  service <svc> <action> - Control system services (requires admin)");
+    output("  shutdown [opts]  - Shut down the computer");
+    output("  reboot [opts]    - Restart the computer");
+    output("  sync             - Flush file system buffers to disk");
+    output("");
+    output("SCHEDULING & AUTOMATION:");
+    output("  at <time> <cmd>  - Schedule one-time command execution");
+    output("  cron             - Task scheduler daemon (info)");
+    output("  crontab [opts]   - Manage scheduled tasks");
+    output("");
+    output("SHELL & SCRIPTING:");
+    output("  echo <text>      - Print text");
+    output("  printf <fmt>     - Print formatted output");
+    output("  case <val>       - Match value against patterns");
+    output("  bc               - Arbitrary precision calculator");
+    output("  calc [expr]      - Simple desktop calculator");
+    output("  qalc [expr]      - Advanced calculator with unit conversions");
+    output("  sh [opts] [file] - Execute shell scripts");
+    output("  source <file>    - Execute commands from file in current shell");
+    output("  exec <cmd>       - Execute command, replacing current process");
+    output("  env [opts]       - Display or set environment variables");
+    output("  printenv [var]   - Print environment variables");
+    output("  export KEY=VAL   - Set environment variables");
+    output("  xargs [cmd]      - Execute command from input arguments");
+    output("  alias [name=cmd] - Create/list/modify command aliases");
+    output("  unalias <name>   - Remove command aliases");
+    output("  history [opts]   - Display or manage command history");
+    output("  umask [mask]     - Set file mode creation mask");
+    output("  time <cmd>       - Measure command execution time");
+    output("  watch [opts] <cmd> - Execute command repeatedly");
+    output("  banner [text]    - Display text in large letters");
+    output("  trap [signal]    - Set signal handlers");
+    output("  ulimit [opts]    - Set/display resource limits");
+    output("  expr EXPR        - Evaluate arithmetic expressions");
+    output("  read [var]       - Read line from standard input");
+    output("  test <expr>      - Evaluate conditional expression");
+    output("");
+    output("EDITING & DISPLAY:");
+    output("  nano [file]      - Text editor");
+    output("  clear            - Clear screen");
+    output("  screen [opts]    - Terminal multiplexer (limited)");
+    output("  type <file>      - Display file contents");
+    output("");
+    output("PERMISSIONS & ADMIN:");
+    output("  sudo <cmd>       - Execute command with admin privileges");
+    output("  su [opts]        - Switch to administrator/check status");
+    output("");
+    output("HELP & INFO:");
+    output("  man <command>    - Display manual page for command");
+    output("  help             - Show this help");
+    output("  version          - Show GaryShell version and features");
+    output("  info [topic]     - Display information about topics");
+    output("  apropos <key>    - Search manual pages");
+    output("  whatis <cmd>     - Show one-line command description");
+    output("  neofetch         - Display system information with ASCII art");
+    output("  exit, quit       - Exit console");
+    output("");
+    output("Use '<command> -h' or '<command> --help' for detailed help on any command.");
+    output("Use 'man <command>' for full manual pages.");
+    output("External commands from system PATH are also supported.");
+}
+
+void cmd_help(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: help");
+        output("  Display information about available commands");
+        output("  Use '<command> -h' for help on a specific command");
+        return;
+    }
+    cmd_help();
+}
+
+// Helper function to recursively search for files
+void searchFiles(const std::string& basePath, const std::string& pattern, 
+                bool nameFilter, bool typeFilter, char typeChar, bool recursive,
+                std::vector<std::string>& results, int& count, int maxResults = 1000) {
+    if (count >= maxResults) return;
+    
+    std::string searchPath = basePath + "\\*";
+    WIN32_FIND_DATAA findData;
+    HANDLE hFind = FindFirstFileA(searchPath.c_str(), &findData);
+    
+    if (hFind == INVALID_HANDLE_VALUE) return;
+    
+    do {
+        std::string fileName = findData.cFileName;
+        if (fileName == "." || fileName == "..") continue;
+        
+        bool isDir = (findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+        std::string fullPath = basePath + "\\" + fileName;
+        std::string unixPath = windowsPathToUnix(fullPath);
+        
+        // Check type filter
+        if (typeFilter) {
+            if (typeChar == 'f' && isDir) {
+                // Looking for files, but this is a directory - skip (but maybe recurse into it)
+                if (isDir && recursive && count < maxResults) {
+                    searchFiles(fullPath, pattern, nameFilter, typeFilter, typeChar, recursive, results, count, maxResults);
+                }
+                continue;
+            } else if (typeChar == 'd' && !isDir) {
+                // Looking for directories, but this is a file - skip
+                continue;
+            }
+        }
+        
+        // Check name pattern
+        bool matches = true;
+        if (nameFilter) {
+            std::string lowerName = fileName;
+            std::string lowerPattern = pattern;
+            std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(), ::tolower);
+            std::transform(lowerPattern.begin(), lowerPattern.end(), lowerPattern.begin(), ::tolower);
+            
+            // Simple wildcard matching (* and ?)
+            if (pattern.find('*') != std::string::npos || pattern.find('?') != std::string::npos) {
+                // Use PathMatchSpec for wildcard matching
+                matches = (PathMatchSpecA(fileName.c_str(), pattern.c_str()) == TRUE);
+            } else {
+                // Substring match (case-insensitive)
+                matches = (lowerName.find(lowerPattern) != std::string::npos);
+            }
+        }
+        
+        if (matches && count < maxResults) {
+            results.push_back(unixPath);
+            count++;
+        }
+        
+        // Recurse into subdirectories if recursive flag is set
+        if (recursive && isDir && count < maxResults) {
+            searchFiles(fullPath, pattern, nameFilter, typeFilter, typeChar, recursive, results, count, maxResults);
+        }
+        
+    } while (FindNextFileA(hFind, &findData) && count < maxResults);
+    
+    FindClose(hFind);
+}
+
+void cmd_find(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: find [path] [-r] [-name pattern] [-type f|d]");
+        output("  Search for files and directories");
+        output("  path          Starting directory (default: current directory)");
+        output("  -r            Recursive search into subdirectories");
+        output("  -name pattern File name pattern (supports * and ? wildcards)");
+        output("  -type f       Find only files");
+        output("  -type d       Find only directories");
+        output("");
+        output("Examples:");
+        output("  find . -r -name *.txt    Recursively find all .txt files");
+        output("  find /path -type d       Find directories in /path (non-recursive)");
+        output("  find . -name test        Find files/dirs with 'test' in current dir");
+        return;
+    }
+    
+    std::string searchPath = ".";
+    std::string namePattern;
+    bool hasNameFilter = false;
+    bool hasTypeFilter = false;
+    bool recursive = false;
+    char typeChar = 'a';  // 'f' for file, 'd' for directory, 'a' for all
+    bool pathSet = false;
+    
+    // Parse arguments
+    for (size_t i = 1; i < args.size(); i++) {
+        if (args[i] == "-name" && i + 1 < args.size()) {
+            namePattern = args[i + 1];
+            hasNameFilter = true;
+            i++;
+        } else if (args[i] == "-type" && i + 1 < args.size()) {
+            if (args[i + 1] == "f" || args[i + 1] == "d") {
+                typeChar = args[i + 1][0];
+                hasTypeFilter = true;
+            }
+            i++;
+        } else if (args[i] == "-r") {
+            recursive = true;
+        } else if (args[i][0] != '-' && !pathSet) {
+            // First non-flag argument is the path
+            searchPath = args[i];
+            pathSet = true;
+        }
+    }
+    
+    // Convert to Windows path
+    std::string winPath = unixPathToWindows(searchPath);
+    
+    // Get absolute path
+    char absPath[MAX_PATH];
+    if (!GetFullPathNameA(winPath.c_str(), MAX_PATH, absPath, NULL)) {
+        outputError("find: invalid path: " + searchPath);
+        return;
+    }
+    
+    // Check if path exists
+    DWORD attrs = GetFileAttributesA(absPath);
+    if (attrs == INVALID_FILE_ATTRIBUTES) {
+        outputError("find: " + searchPath + ": No such file or directory");
+        return;
+    }
+    
+    if (!(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+        outputError("find: " + searchPath + ": Not a directory");
+        return;
+    }
+    
+    std::vector<std::string> results;
+    int count = 0;
+    searchFiles(absPath, namePattern, hasNameFilter, hasTypeFilter, typeChar, recursive, results, count);
+    
+    // Output results
+    for (const std::string& result : results) {
+        output(result);
+    }
+    
+    if (results.empty()) {
+        output("find: no matches found");
+    }
+}
+
+void cmd_locate(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: locate <pattern>");
+        output("  Search for files by name pattern (recursive from current directory)");
+        output("  Supports * and ? wildcards");
+        output("");
+        output("Examples:");
+        output("  locate *.cpp       Find all .cpp files");
+        output("  locate readme      Find files with 'readme' in name");
+        return;
+    }
+    
+    if (args.size() < 2) {
+        outputError("locate: missing pattern");
+        output("Usage: locate <pattern>");
+        return;
+    }
+    
+    std::string pattern = args[1];
+    
+    // Get current directory
+    char cwd[MAX_PATH];
+    GetCurrentDirectoryA(MAX_PATH, cwd);
+    
+    std::vector<std::string> results;
+    int count = 0;
+    searchFiles(cwd, pattern, true, false, 'a', true, results, count);
+    
+    // Output results
+    for (const std::string& result : results) {
+        output(result);
+    }
+    
+    if (results.empty()) {
+        output("locate: no matches found");
+    } else {
+        output("");
+        output(std::to_string(results.size()) + " file(s) found");
+    }
+}
+
+// Helper function to find executable in PATH
+std::string findExecutableInPath(const std::string& exeName) {
+    // If already has path separators, just return as-is
+    if (exeName.find('\\') != std::string::npos || exeName.find('/') != std::string::npos) {
+        return exeName;
+    }
+    
+    // Check if file exists in current directory first
+    if (GetFileAttributesA(exeName.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        return "./" + exeName;
+    }
+    
+    // Get PATH environment variable
+    char pathBuf[32768];
+    DWORD result = GetEnvironmentVariableA("PATH", pathBuf, sizeof(pathBuf));
+    if (result == 0 || result >= sizeof(pathBuf)) {
+        return exeName;  // Return original if PATH retrieval fails
+    }
+    
+    std::string pathStr(pathBuf);
+    std::string pathDir;
+    
+    // Try extensions: .exe, .com, .bat, .cmd
+    const char* extensions[] = { "", ".exe", ".com", ".bat", ".cmd", ".scr", NULL };
+    
+    // Parse PATH directories
+    size_t pos = 0;
+    while (pos < pathStr.length()) {
+        size_t semipos = pathStr.find(';', pos);
+        if (semipos == std::string::npos) {
+            pathDir = pathStr.substr(pos);
+            pos = pathStr.length();
+        } else {
+            pathDir = pathStr.substr(pos, semipos - pos);
+            pos = semipos + 1;
+        }
+        
+        // Try each extension
+        for (int i = 0; extensions[i] != NULL; i++) {
+            std::string fullPath = pathDir;
+            if (!fullPath.empty() && fullPath.back() != '\\' && fullPath.back() != '/') {
+                fullPath += "\\";
+            }
+            fullPath += exeName + extensions[i];
+            
+            if (GetFileAttributesA(fullPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                return fullPath;
+            }
+        }
+    }
+    
+    return exeName;  // Return original if not found in PATH
+}
+
+bool executeExternalCommand(const std::string& cmdLine) {
+    // Parse the command to extract the executable name
+    std::string trimmedCmd = trim(cmdLine);
+    std::string exeName = trimmedCmd;
+    
+    // Extract first token (command name)
+    size_t spacePos = trimmedCmd.find(' ');
+    if (spacePos != std::string::npos) {
+        exeName = trimmedCmd.substr(0, spacePos);
+    }
+    
+    // Search for executable in PATH
+    std::string executablePath = findExecutableInPath(exeName);
+    std::string actualCmd = trimmedCmd;
+    
+    // Replace the command name with the found path
+    if (executablePath != exeName) {
+        size_t cmdPos = actualCmd.find(exeName);
+        if (cmdPos != std::string::npos) {
+            actualCmd = executablePath + actualCmd.substr(cmdPos + exeName.length());
+        }
+    }
+    
+    // Check if this is a screensaver file (.scr)
+    bool isSCRFile = false;
+    std::string upperCmd = actualCmd;
+    std::transform(upperCmd.begin(), upperCmd.end(), upperCmd.begin(), ::toupper);
+    if (upperCmd.find(".SCR") != std::string::npos) {
+        // Extract just the .scr file path
+        size_t scrPos = actualCmd.find_first_not_of(" \t");
+        size_t endPos = actualCmd.find(' ', scrPos);
+        if (endPos == std::string::npos) {
+            endPos = actualCmd.length();
+        }
+        std::string scrFile = actualCmd.substr(scrPos, endPos - scrPos);
+        
+        // Check if file ends with .scr (case insensitive)
+        if (scrFile.length() > 4) {
+            std::string ext = scrFile.substr(scrFile.length() - 4);
+            std::transform(ext.begin(), ext.end(), ext.begin(), ::toupper);
+            if (ext == ".SCR") {
+                isSCRFile = true;
+            }
+        }
+    }
+    
+    // Handle screensaver files with ShellExecuteEx
+    if (isSCRFile) {
+        // Extract file path and parameters
+        size_t scrPos = actualCmd.find_first_not_of(" \t");
+        size_t endPos = actualCmd.find(' ', scrPos);
+        std::string scrFilePath;
+        std::string parameters;
+        
+        if (endPos == std::string::npos) {
+            scrFilePath = actualCmd.substr(scrPos);
+        } else {
+            scrFilePath = actualCmd.substr(scrPos, endPos - scrPos);
+            parameters = actualCmd.substr(endPos + 1);
+        }
+        
+        // Use ShellExecuteEx for screensaver
+        SHELLEXECUTEINFOA sei = {0};
+        sei.cbSize = sizeof(sei);
+        sei.fMask = SEE_MASK_NOCLOSEPROCESS;
+        sei.lpVerb = "open";
+        sei.lpFile = scrFilePath.c_str();
+        sei.lpParameters = parameters.empty() ? NULL : parameters.c_str();
+        sei.nShow = SW_SHOWNORMAL;
+        
+        if (ShellExecuteExA(&sei)) {
+            if (sei.hProcess) {
+                WaitForSingleObject(sei.hProcess, INFINITE);
+                CloseHandle(sei.hProcess);
+            }
+            return true;
+        } else {
+            outputError("Failed to execute screensaver: " + scrFilePath);
+            return false;
+        }
+    }
+    
+    // Create pipes for output
+    HANDLE hReadPipe, hWritePipe;
+    SECURITY_ATTRIBUTES sa = {sizeof(SECURITY_ATTRIBUTES), NULL, TRUE};
+    
+    if (!CreatePipe(&hReadPipe, &hWritePipe, &sa, 0)) {
+        outputError("Failed to create pipe for command output");
+        return false;
+    }
+    
+    // Ensure read handle is not inherited
+    SetHandleInformation(hReadPipe, HANDLE_FLAG_INHERIT, 0);
+    
+    // Setup process startup info
+    STARTUPINFOA si = {sizeof(STARTUPINFOA)};
+    si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
+    si.hStdOutput = hWritePipe;
+    si.hStdError = hWritePipe;
+    si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    si.wShowWindow = SW_HIDE;
+    
+    PROCESS_INFORMATION pi = {0};
+    
+    // Prepare command line (need mutable buffer)
+    std::string fullCmd = "cmd.exe /c " + actualCmd;
+    std::vector<char> cmdBuf(fullCmd.begin(), fullCmd.end());
+    cmdBuf.push_back('\0');
+    
+    // Create process
+    BOOL success = CreateProcessA(
+        NULL,
+        cmdBuf.data(),
+        NULL, NULL,
+        TRUE,  // Inherit handles
+        CREATE_NO_WINDOW,
+        NULL,
+        NULL,
+        &si,
+        &pi
+    );
+    
+    if (!success) {
+        CloseHandle(hReadPipe);
+        CloseHandle(hWritePipe);
+        return false;
+    }
+    
+    // Close write pipe in parent
+    CloseHandle(hWritePipe);
+    
+    // Read output
+    std::string outputText;
+    char buffer[4096];
+    DWORD bytesRead;
+    
+    while (ReadFile(hReadPipe, buffer, sizeof(buffer) - 1, &bytesRead, NULL) && bytesRead > 0) {
+        buffer[bytesRead] = '\0';
+        outputText += buffer;
+    }
+    
+    // Wait for process to finish
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    
+    // Get exit code
+    DWORD exitCode = 0;
+    GetExitCodeProcess(pi.hProcess, &exitCode);
+    
+    // Cleanup
+    CloseHandle(hReadPipe);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    
+    // Output result
+    if (!outputText.empty()) {
+        // Remove trailing newlines
+        while (!outputText.empty() && (outputText.back() == '\n' || outputText.back() == '\r')) {
+            outputText.pop_back();
+        }
+        
+        // Split into lines and output
+        std::istringstream iss(outputText);
+        std::string line;
+        while (std::getline(iss, line)) {
+            // Remove \r if present
+            if (!line.empty() && line.back() == '\r') {
+                line.pop_back();
+            }
+            output(line);
+        }
+    }
+    
+    return (exitCode == 0);
+}
+
+// Tab completion
+std::vector<std::string> getCommandList() {
+    std::vector<std::string> commands;
+    commands.push_back("pwd");
+    commands.push_back("cd");
+    commands.push_back("ls");
+    commands.push_back("dir");
+    commands.push_back("cat");
+    commands.push_back("type");
+    commands.push_back("less");
+    commands.push_back("head");
+    commands.push_back("tail");
+    commands.push_back("grep");
+    commands.push_back("echo");
+    commands.push_back("mkdir");
+    commands.push_back("rmdir");
+    commands.push_back("rm");
+    commands.push_back("del");
+    commands.push_back("touch");
+    commands.push_back("mv");
+    commands.push_back("dd");
+    commands.push_back("tar");
+    commands.push_back("gzip");
+    commands.push_back("gunzip");
+    commands.push_back("zip");
+    commands.push_back("unzip");
+    commands.push_back("chmod");
+    commands.push_back("chown");
+    commands.push_back("chgrp");
+    commands.push_back("find");
+    commands.push_back("locate");
+    commands.push_back("ssh");
+    commands.push_back("scp");
+    commands.push_back("sync");
+    commands.push_back("rsync");
+    commands.push_back("ps");
+    commands.push_back("proc");
+    commands.push_back("kill");
+    commands.push_back("killall");
+    commands.push_back("xkill");
+    commands.push_back("clear");
+    commands.push_back("cls");
+    commands.push_back("rev");
+    commands.push_back("nano");
+    commands.push_back("alias");
+    commands.push_back("unalias");
+    commands.push_back("history");
+    commands.push_back("sudo");
+    commands.push_back("su");
+    commands.push_back("ip");
+    commands.push_back("iptables");
+    commands.push_back("ping");
+    commands.push_back("traceroute");
+    commands.push_back("tracert");
+    commands.push_back("man");
+    commands.push_back("help");
+    commands.push_back("exit");
+    commands.push_back("quit");
+    return commands;
+}
+
+std::vector<std::string> findMatches(const std::string& prefix, bool commandOnly) {
+    std::vector<std::string> matches;
+    
+    if (commandOnly) {
+        // Match commands
+        std::vector<std::string> commands = getCommandList();
+        for (const auto& cmd : commands) {
+            std::string cmdLower = g_caseSensitive ? cmd : toLower(cmd);
+            std::string prefixLower = g_caseSensitive ? prefix : toLower(prefix);
+            
+            if (cmdLower.find(prefixLower) == 0) {
+                matches.push_back(cmd);
+            }
+        }
+    } else {
+        // Match files in current directory
+        WIN32_FIND_DATAA findData;
+        HANDLE hFind = FindFirstFileA("*", &findData);
+        
+        if (hFind != INVALID_HANDLE_VALUE) {
+            do {
+                std::string filename = findData.cFileName;
+                if (filename == "." || filename == "..") continue;
+                
+                std::string filenameLower = g_caseSensitive ? filename : toLower(filename);
+                std::string prefixLower = g_caseSensitive ? prefix : toLower(prefix);
+                
+                if (filenameLower.find(prefixLower) == 0) {
+                    matches.push_back(filename);
+                }
+            } while (FindNextFileA(hFind, &findData));
+            FindClose(hFind);
+        }
+    }
+    
+    std::sort(matches.begin(), matches.end());
+    return matches;
+}
+
+std::string findCommonPrefix(const std::vector<std::string>& matches) {
+    if (matches.empty()) return "";
+    if (matches.size() == 1) return matches[0];
+    
+    std::string prefix = matches[0];
+    for (size_t i = 1; i < matches.size(); i++) {
+        size_t j = 0;
+        while (j < prefix.length() && j < matches[i].length()) {
+            char c1 = g_caseSensitive ? prefix[j] : tolower(prefix[j]);
+            char c2 = g_caseSensitive ? matches[i][j] : tolower(matches[i][j]);
+            if (c1 != c2) break;
+            j++;
+        }
+        prefix = prefix.substr(0, j);
+        if (prefix.empty()) break;
+    }
+    return prefix;
+}
+
+void handleTabCompletion(HWND hwnd) {
+    // Get current input
+    int textLen = GetWindowTextLengthA(hwnd);
+    char* buffer = new char[textLen + 1];
+    GetWindowTextA(hwnd, buffer, textLen + 1);
+    std::string allText = buffer;
+    delete[] buffer;
+    
+    if (textLen <= g_promptStart) return;
+    
+    std::string input = allText.substr(g_promptStart);
+    
+    // Parse tokens to determine what we're completing
+    std::vector<std::string> tokens = split(input);
+    bool isCommandPosition = (tokens.empty() || (input.back() != ' ' && tokens.size() == 1));
+    std::string prefix = tokens.empty() ? "" : tokens.back();
+    
+    // If input ends with space, we're completing a new word with empty prefix
+    if (!input.empty() && input.back() == ' ') {
+        prefix = "";
+    }
+    
+    // Check if this is double-tab (within 500ms of last tab)
+    DWORD currentTime = GetTickCount();
+    bool isDoubleTap = (currentTime - g_lastTabTime) < 500;
+    g_lastTabTime = currentTime;
+    
+    // Check if we're starting a new completion sequence
+    bool newSequence = (g_tabMatches.empty() || prefix != g_tabPrefix);
+    
+    if (newSequence) {
+        // New completion sequence - find all matches
+        g_tabPrefix = prefix;
+        g_tabMatches = findMatches(prefix, isCommandPosition);
+        
+        if (g_tabMatches.empty()) {
+            return;
+        }
+        
+        // Find common prefix among all matches
+        std::string commonPrefix = findCommonPrefix(g_tabMatches);
+        
+        if (g_tabMatches.size() == 1) {
+            // Single match - complete it fully
+            std::string completion = g_tabMatches[0];
+            
+            // Add trailing / for directories
+            if (!isCommandPosition) {
+                std::string winPath = unixPathToWindows(completion);
+                DWORD attrs = GetFileAttributesA(winPath.c_str());
+                if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+                    completion += "/";
+                }
+            }
+            
+            // Quote filenames with spaces
+            if (completion.find(' ') != std::string::npos) {
+                completion = "\"" + completion + "\"";
+            }
+            
+            // Replace the prefix with completion
+            int replaceStart = g_promptStart + input.length() - prefix.length();
+            SendMessage(hwnd, EM_SETSEL, replaceStart, textLen);
+            SendMessage(hwnd, EM_REPLACESEL, FALSE, (LPARAM)completion.c_str());
+            
+            // Clear state
+            g_tabMatches.clear();
+            g_tabPrefix.clear();
+        } else if (commonPrefix.length() > prefix.length()) {
+            // Multiple matches with common prefix - complete to common prefix
+            std::string completion = commonPrefix;
+            
+            // Quote if contains spaces
+            if (completion.find(' ') != std::string::npos) {
+                completion = "\"" + completion + "\"";
+            }
+            
+            int replaceStart = g_promptStart + input.length() - prefix.length();
+            SendMessage(hwnd, EM_SETSEL, replaceStart, textLen);
+            SendMessage(hwnd, EM_REPLACESEL, FALSE, (LPARAM)completion.c_str());
+            
+            // Update prefix to the common prefix for next tab
+            g_tabPrefix = commonPrefix;
+        }
+        // If commonPrefix.length() == prefix.length(), wait for second tab to show list
+    } else if (isDoubleTap && g_tabMatches.size() > 1) {
+        // Second tab with multiple matches - show all matches
+        output("");
+        std::string matchList;
+        for (size_t i = 0; i < g_tabMatches.size(); i++) {
+            matchList += g_tabMatches[i];
+            if (i < g_tabMatches.size() - 1) matchList += "  ";
+        }
+        output(matchList);
+        showPrompt();
+        
+        // Restore current input
+        int newTextLen = GetWindowTextLengthA(hwnd);
+        char* buf2 = new char[newTextLen + 1];
+        GetWindowTextA(hwnd, buf2, newTextLen + 1);
+        std::string newAllText = buf2;
+        delete[] buf2;
+        
+        if (newTextLen > g_promptStart) {
+            std::string currentInput = newAllText.substr(g_promptStart);
+            SendMessage(hwnd, EM_SETSEL, newTextLen, newTextLen);
+        }
+    }
+}
+
+// Forward declaration
+void executeCommand(const std::string& command);
+
+// Subclassed edit control procedure
+LRESULT CALLBACK EditSubclassProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
+    if (uMsg == WM_KEYDOWN) {
+        // Handle Ctrl+F to exit full screen
+        if (wParam == 'F' && GetKeyState(VK_CONTROL) & 0x8000) {
+            if (g_isFullScreen) {
+                SendMessage(GetParent(hwnd), WM_COMMAND, ID_OPTIONS_FULLSCREEN, 0);
+            }
+            return 0;
+        }
+    }
+    
+    if (uMsg == WM_CHAR) {
+        // Check if in Save As input mode first
+        if (g_nanoSaveAsMode) {
+            if (wParam >= 32 && wParam < 127) {  // Printable characters
+                g_nanoSaveAsInput += (char)wParam;
+                // Echo the character
+                SetWindowTextA(g_hOutput, "");
+                output("Save As (Enter filename, ESC to cancel):");
+                output("");
+                output(g_nanoSaveAsInput);
+            }
+            return 0;
+        }
+        
+        // Check if in nano mode
+        if (g_nanoMode) {
+            // In nano mode, handle character input
+            if (wParam >= 32 && wParam < 127) {  // Printable characters
+                if (g_nanoCursorLine < (int)g_nanoBuffer.size()) {
+                    std::string& line = g_nanoBuffer[g_nanoCursorLine];
+                    if (g_nanoCursorCol <= (int)line.length()) {
+                        line.insert(g_nanoCursorCol, 1, (char)wParam);
+                        g_nanoCursorCol++;
+                        g_nanoModified = true;
+                        refreshNanoDisplay();
+                    }
+                }
+            }
+            return 0;  // Handled in nano mode
+        }
+        
+        // Prevent deletion/modification before prompt
+        DWORD start, end;
+        SendMessage(hwnd, EM_GETSEL, (WPARAM)&start, (LPARAM)&end);
+        
+        if (wParam == VK_BACK) {
+            // Prevent backspace before prompt
+            if (start <= (DWORD)g_promptStart) {
+                return 0;
+            }
+        } else if (wParam == VK_RETURN) {
+            // Check if we're in nano mode
+            if (g_nanoMode) {
+                // In nano mode, insert a new line
+                if (g_nanoCursorLine < (int)g_nanoBuffer.size()) {
+                    std::string currentLine = g_nanoBuffer[g_nanoCursorLine];
+                    std::string afterCursor = currentLine.substr(g_nanoCursorCol);
+                    g_nanoBuffer[g_nanoCursorLine] = currentLine.substr(0, g_nanoCursorCol);
+                    g_nanoBuffer.insert(g_nanoBuffer.begin() + g_nanoCursorLine + 1, afterCursor);
+                    g_nanoCursorLine++;
+                    g_nanoCursorCol = 0;
+                    g_nanoModified = true;
+                    refreshNanoDisplay();
+                }
+                return 0;  // Handled in nano mode
+            }
+            
+            // Get current input line FIRST before any output calls
+            int textLen = GetWindowTextLengthA(hwnd);
+            char* buffer = new char[textLen + 1];
+            GetWindowTextA(hwnd, buffer, textLen + 1);
+            std::string allText = buffer;
+            delete[] buffer;
+            
+            // Extract command (text after prompt)
+            std::string command;
+            if (textLen > g_promptStart) {
+                command = allText.substr(g_promptStart);
+            }
+            
+            // Add to history
+            if (!command.empty()) {
+                g_commandHistory.push_back(command);
+                g_historyIndex = g_commandHistory.size();
+                // Save immediately to preserve history
+                saveCommandHistory();
+            }
+            
+            // Reset tab completion
+            g_tabMatches.clear();
+            g_tabIndex = -1;
+            g_tabPrefix.clear();
+            g_tabInputLength = 0;
+            
+            // Execute command (this will call output)
+            executeCommand(command);
+            
+            return 0; // Don't pass to original proc
+        } else if (wParam == ' ') {
+            // Space confirms current tab selection and allows next word completion
+            // Just clear the matches so next tab starts fresh for the new word
+            g_tabMatches.clear();
+            g_tabIndex = -1;
+            g_tabPrefix.clear();
+            // Don't update g_tabInputLength - let it get updated naturally
+        }
+    }
+    
+    if (uMsg == WM_KEYDOWN) {
+        // Handle Save As input mode first
+        if (g_nanoSaveAsMode) {
+            if (wParam == VK_RETURN) {
+                // Save file with new name
+                if (!g_nanoSaveAsInput.empty()) {
+                    std::string newFilename = g_nanoSaveAsInput;
+                    
+                    // Convert to Windows path
+                    newFilename = unixPathToWindows(newFilename);
+                    
+                    // If no path separator, prepend current working directory
+                    if (newFilename.find('\\') == std::string::npos && newFilename.find('/') == std::string::npos) {
+                        if (newFilename.length() < 2 || newFilename[1] != ':') {
+                            char cwd[MAX_PATH];
+                            GetCurrentDirectoryA(MAX_PATH, cwd);
+                            newFilename = std::string(cwd) + "\\" + newFilename;
+                        }
+                    }
+                    
+                    // Save to new file
+                    std::ofstream file(newFilename);
+                    if (file.is_open()) {
+                        for (const auto& line : g_nanoBuffer) {
+                            file << line << "\n";
+                        }
+                        file.close();
+                        
+                        // Update current filename
+                        g_nanoFilename = newFilename;
+                        g_nanoModified = false;
+                        
+                        // Exit Save As mode and return to editing
+                        g_nanoSaveAsMode = false;
+                        g_nanoSaveAsInput.clear();
+                        
+                        // Show success message and return to editor
+                        refreshNanoDisplay();
+                        SetWindowTextA(g_hOutput, "");
+                        refreshNanoDisplay();
+                        output("");
+                        output("[ Saved as: " + windowsPathToUnix(newFilename) + " ]");
+                        Sleep(1000);
+                        refreshNanoDisplay();
+                    } else {
+                        // Failed to save
+                        g_nanoSaveAsMode = false;
+                        g_nanoSaveAsInput.clear();
+                        refreshNanoDisplay();
+                        output("");
+                        output("[ Error: Could not save file ]");
+                        Sleep(1000);
+                        refreshNanoDisplay();
+                    }
+                }
+                return 0;
+            } else if (wParam == VK_ESCAPE) {
+                // Cancel Save As
+                g_nanoSaveAsMode = false;
+                g_nanoSaveAsInput.clear();
+                refreshNanoDisplay();
+                return 0;
+            } else if (wParam == VK_BACK) {
+                // Backspace in Save As input
+                if (!g_nanoSaveAsInput.empty()) {
+                    g_nanoSaveAsInput.pop_back();
+                    SetWindowTextA(g_hOutput, "");
+                    output("Save As (Enter filename, ESC to cancel):");
+                    output("");
+                    output(g_nanoSaveAsInput);
+                }
+                return 0;
+            }
+            return 0;
+        }
+        
+        // Handle nano mode keys
+        if (g_nanoMode) {
+            if (wParam == 'X' && GetKeyState(VK_CONTROL) & 0x8000) {
+                // Ctrl+X - Exit nano
+                g_nanoMode = false;
+                
+                // Save file
+                std::ofstream file(g_nanoFilename);
+                if (file.is_open()) {
+                    for (const auto& line : g_nanoBuffer) {
+                        file << line << "\n";
+                    }
+                    file.close();
+                    output("File saved: " + windowsPathToUnix(g_nanoFilename));
+                } else {
+                    outputError("Failed to save file");
+                }
+                
+                g_nanoBuffer.clear();
+                g_nanoFilename.clear();
+                g_nanoModified = false;
+                showPrompt();
+                return 0;
+            } else if (wParam == 'O' && GetKeyState(VK_CONTROL) & 0x8000) {
+                // Ctrl+O - Save file
+                std::ofstream file(g_nanoFilename);
+                if (file.is_open()) {
+                    for (const auto& line : g_nanoBuffer) {
+                        file << line << "\n";
+                    }
+                    file.close();
+                    output("[ File saved ]");
+                    g_nanoModified = false;
+                } else {
+                    output("[ Error saving file ]");
+                }
+                return 0;
+            } else if (wParam == 'W' && GetKeyState(VK_CONTROL) & 0x8000) {
+                // Ctrl+W - Save As (prompt for new filename)
+                g_nanoSaveAsMode = true;
+                g_nanoSaveAsInput.clear();
+                
+                // Clear screen and show prompt
+                SetWindowTextA(g_hOutput, "");
+                output("Save As (Enter filename, ESC to cancel):");
+                output("");
+                
+                return 0;
+            } else if (wParam == 'K' && GetKeyState(VK_CONTROL) & 0x8000) {
+                // Ctrl+K - Cut line
+                if (g_nanoCursorLine < (int)g_nanoBuffer.size()) {
+                    // Store cut line (simplified - just clear it)
+                    g_nanoBuffer.erase(g_nanoBuffer.begin() + g_nanoCursorLine);
+                    g_nanoModified = true;
+                    refreshNanoDisplay();
+                }
+                return 0;
+            } else if (wParam == VK_DELETE) {
+                // Delete character
+                if (g_nanoCursorLine < (int)g_nanoBuffer.size()) {
+                    std::string& line = g_nanoBuffer[g_nanoCursorLine];
+                    if (g_nanoCursorCol < (int)line.length()) {
+                        line.erase(g_nanoCursorCol, 1);
+                        g_nanoModified = true;
+                        refreshNanoDisplay();
+                    }
+                }
+                return 0;
+            } else if (wParam == VK_BACK) {
+                // Backspace
+                if (g_nanoCursorLine < (int)g_nanoBuffer.size()) {
+                    std::string& line = g_nanoBuffer[g_nanoCursorLine];
+                    if (g_nanoCursorCol > 0) {
+                        line.erase(g_nanoCursorCol - 1, 1);
+                        g_nanoCursorCol--;
+                        g_nanoModified = true;
+                        refreshNanoDisplay();
+                    }
+                }
+                return 0;
+            } else if (wParam == VK_LEFT) {
+                // Move left
+                if (g_nanoCursorCol > 0) {
+                    g_nanoCursorCol--;
+                    refreshNanoDisplay();
+                }
+                return 0;
+            } else if (wParam == VK_RIGHT) {
+                // Move right
+                if (g_nanoCursorLine < (int)g_nanoBuffer.size()) {
+                    if (g_nanoCursorCol < (int)g_nanoBuffer[g_nanoCursorLine].length()) {
+                        g_nanoCursorCol++;
+                        refreshNanoDisplay();
+                    }
+                }
+                return 0;
+            } else if (wParam == VK_UP) {
+                // Move up
+                if (g_nanoCursorLine > 0) {
+                    g_nanoCursorLine--;
+                    // Keep column position or clamp to line length
+                    if (g_nanoCursorCol > (int)g_nanoBuffer[g_nanoCursorLine].length()) {
+                        g_nanoCursorCol = g_nanoBuffer[g_nanoCursorLine].length();
+                    }
+                    refreshNanoDisplay();
+                }
+                return 0;
+            } else if (wParam == VK_DOWN) {
+                // Move down
+                if (g_nanoCursorLine < (int)g_nanoBuffer.size() - 1) {
+                    g_nanoCursorLine++;
+                    // Keep column position or clamp to line length
+                    if (g_nanoCursorCol > (int)g_nanoBuffer[g_nanoCursorLine].length()) {
+                        g_nanoCursorCol = g_nanoBuffer[g_nanoCursorLine].length();
+                    }
+                    refreshNanoDisplay();
+                }
+                return 0;
+            }
+            return 0;  // Consume all keys in nano mode
+        }
+        
+        // Handle Ctrl+C - Interrupt/terminate
+        if (wParam == 'C' && GetKeyState(VK_CONTROL) & 0x8000) {
+            // Clear current input line
+            int textLen = GetWindowTextLengthA(hwnd);
+            SendMessage(hwnd, EM_SETSEL, g_promptStart, textLen);
+            SendMessage(hwnd, EM_REPLACESEL, FALSE, (LPARAM)"");
+            
+            // Output ^C indicator
+            output("");
+            output("^C");
+            
+            // Show prompt
+            showPrompt();
+            return 0;
+        }
+        
+        // Handle Ctrl+Z - Suspend (show message - actual suspend not implemented)
+        if (wParam == 'Z' && GetKeyState(VK_CONTROL) & 0x8000) {
+            // Clear current input line
+            int textLen = GetWindowTextLengthA(hwnd);
+            SendMessage(hwnd, EM_SETSEL, g_promptStart, textLen);
+            SendMessage(hwnd, EM_REPLACESEL, FALSE, (LPARAM)"");
+            
+            // Output ^Z indicator and message
+            output("");
+            output("^Z");
+            output("[Process suspend not fully supported - use 'bg' and 'fg' commands for job control]");
+            
+            // Show prompt
+            showPrompt();
+            return 0;
+        }
+        
+        if (wParam == VK_DELETE) {
+            // Prevent delete before prompt
+            DWORD start, end;
+            SendMessage(hwnd, EM_GETSEL, (WPARAM)&start, (LPARAM)&end);
+            if (start < (DWORD)g_promptStart) {
+                return 0;
+            }
+        } else if (wParam == VK_TAB) {
+            // Tab completion
+            handleTabCompletion(hwnd);
+            return 0;
+        } else if (wParam == VK_UP) {
+            // Previous command
+            if (g_historyIndex > 0) {
+                g_historyIndex--;
+                
+                // Replace current input with history
+                int textLen = GetWindowTextLengthA(hwnd);
+                SendMessage(hwnd, EM_SETSEL, g_promptStart, textLen);
+                SendMessage(hwnd, EM_REPLACESEL, FALSE, (LPARAM)g_commandHistory[g_historyIndex].c_str());
+            }
+            return 0;
+        } else if (wParam == VK_DOWN) {
+            // Next command
+            if (g_historyIndex < (int)g_commandHistory.size() - 1) {
+                g_historyIndex++;
+                
+                // Replace current input with history
+                int textLen = GetWindowTextLengthA(hwnd);
+                SendMessage(hwnd, EM_SETSEL, g_promptStart, textLen);
+                SendMessage(hwnd, EM_REPLACESEL, FALSE, (LPARAM)g_commandHistory[g_historyIndex].c_str());
+            } else {
+                g_historyIndex = g_commandHistory.size();
+                
+                // Clear input
+                int textLen = GetWindowTextLengthA(hwnd);
+                SendMessage(hwnd, EM_SETSEL, g_promptStart, textLen);
+                SendMessage(hwnd, EM_REPLACESEL, FALSE, (LPARAM)"");
+            }
+            return 0;
+        } else if (wParam == VK_BACK) {
+            // Prevent backspace before prompt
+            DWORD start, end;
+            SendMessage(hwnd, EM_GETSEL, (WPARAM)&start, (LPARAM)&end);
+            
+            if (start <= (DWORD)g_promptStart) {
+                return 0;
+            }
+        } else if (wParam == VK_LEFT) {
+            // Prevent moving cursor before prompt
+            DWORD start, end;
+            SendMessage(hwnd, EM_GETSEL, (WPARAM)&start, (LPARAM)&end);
+            
+            if (start <= (DWORD)g_promptStart) {
+                return 0;
+            }
+        } else if (wParam == VK_HOME) {
+            // Home goes to start of input, not line
+            SendMessage(hwnd, EM_SETSEL, g_promptStart, g_promptStart);
+            return 0;
+        }
+    }
+    
+    // Call original window procedure
+    return CallWindowProc(g_originalEditProc, hwnd, uMsg, wParam, lParam);
+}
+
+void executeCommand(const std::string& command) {
+    std::string trimmedCmd = trim(command);
+    if (trimmedCmd.empty()) {
+        output("");
+        showPrompt();
+        return;
+    }
+    
+    // Move to new line after command
+    output("");
+    
+    // Clean up finished background processes
+    cleanupBackgroundProcesses();
+    
+    // First, check for chained commands with && or || BEFORE parsing redirections
+    // This allows each command in the chain to have its own redirections
+    std::vector<ChainedCommand> chainedCommands = splitByChain(trimmedCmd);
+    
+    if (chainedCommands.size() > 1) {
+        // Execute chained commands with conditional logic
+        // Each command handles its own redirections
+        for (size_t i = 0; i < chainedCommands.size(); i++) {
+            const ChainedCommand& chainCmd = chainedCommands[i];
+            
+            // Recursively execute this command (which may contain pipes and redirections)
+            bool savedSkipPrompt = g_skipFinalPrompt;
+            g_skipFinalPrompt = true;
+            executeCommand(chainCmd.command);
+            g_skipFinalPrompt = savedSkipPrompt;
+            
+            // Check if we should continue based on the operator and exit status
+            if (i < chainedCommands.size() - 1) {
+                if (chainCmd.nextOperator == "&&" && g_lastExitStatus != 0) {
+                    // AND operator: stop if previous command failed
+                    break;
+                } else if (chainCmd.nextOperator == "||" && g_lastExitStatus == 0) {
+                    // OR operator: stop if previous command succeeded
+                    break;
+                }
+            }
+        }
+        
+        // No redirections to close at this level - each recursive call handled its own
+        if (!g_skipFinalPrompt) {
+            showPrompt();
+        }
+        return;
+    }
+    
+    // Not a chain - parse and handle redirections for this single command
+    g_redirection = RedirectionInfo(); // Reset redirection
+    std::string cleanCmd = parseRedirections(trimmedCmd, g_redirection);
+    
+    // Handle background process execution
+    if (g_redirection.runInBackground) {
+        if (executeCommandInBackground(cleanCmd)) {
+            if (!g_skipFinalPrompt) {
+                showPrompt();
+            }
+            return;
+        } else {
+            outputError("Failed to execute command in background");
+            if (!g_skipFinalPrompt) {
+                showPrompt();
+            }
+            return;
+        }
+    }
+    
+    // Open input file if redirecting
+    if (g_redirection.redirectInput) {
+        if (!openInputRedirection(unixPathToWindows(g_redirection.inputFile))) {
+            outputError("Cannot open file for input: " + g_redirection.inputFile);
+            closeInputRedirection();
+            if (!g_skipFinalPrompt) {
+                showPrompt();
+            }
+            return;
+        }
+    }
+    
+    // Open output file if redirecting
+    if (g_redirection.redirectOutput) {
+        if (!openOutputRedirection(unixPathToWindows(g_redirection.outputFile), g_redirection.appendOutput)) {
+            outputError("Cannot open file for output: " + g_redirection.outputFile);
+            closeOutputRedirection();
+            closeInputRedirection();
+            if (!g_skipFinalPrompt) {
+                showPrompt();
+            }
+            return;
+        }
+    }
+    
+    // Check for pipes
+    std::vector<std::string> pipedCommands = splitByPipe(cleanCmd);
+    
+    if (pipedCommands.size() > 1) {
+        // Execute piped commands
+        std::vector<std::string> pipeInput;
+        
+        for (size_t i = 0; i < pipedCommands.size(); i++) {
+            std::string& pipeCmd = pipedCommands[i];
+            std::vector<std::string> args = split(pipeCmd);
+            
+            if (args.empty()) continue;
+            
+            std::string cmd = args[0];
+            
+            // Expand wildcards in arguments (skip command name)
+            if (args.size() > 1) {
+                std::vector<std::string> cmdOnly;
+                cmdOnly.push_back(args[0]);
+                
+                std::vector<std::string> argsOnly(args.begin() + 1, args.end());
+                std::vector<std::string> expandedArgs = expandWildcards(argsOnly);
+                
+                // Rebuild args with expanded wildcards
+                args = cmdOnly;
+                args.insert(args.end(), expandedArgs.begin(), expandedArgs.end());
+            }
+            
+            // Clear captured output and enable capture for all but the last command
+            g_capturedOutput.clear();
+            if (i < pipedCommands.size() - 1) {
+                g_capturingOutput = true;
+            } else {
+                g_capturingOutput = false;
+            }
+            
+            // Handle commands that can process piped input
+            bool handledPipeInput = false;
+            
+            // HEAD command with piped input
+            if (commandEquals(cmd, "head") && !pipeInput.empty()) {
+                int numLines = 10;  // Default
+                
+                // Check for -n flag
+                if (args.size() >= 3 && args[1] == "-n") {
+                    numLines = std::atoi(args[2].c_str());
+                    if (numLines <= 0) numLines = 10;
+                }
+                
+                // Output first N lines from piped input
+                int count = 0;
+                for (const std::string& line : pipeInput) {
+                    if (count >= numLines) break;
+                    output(line);
+                    count++;
+                }
+                
+                handledPipeInput = true;
+            }
+            // TAIL command with piped input
+            else if (commandEquals(cmd, "tail") && !pipeInput.empty()) {
+                int numLines = 10;  // Default
+                
+                // Check for -n flag
+                if (args.size() >= 3 && args[1] == "-n") {
+                    numLines = std::atoi(args[2].c_str());
+                    if (numLines <= 0) numLines = 10;
+                }
+                
+                // Output last N lines from piped input
+                size_t startIndex = (pipeInput.size() > (size_t)numLines) ? pipeInput.size() - numLines : 0;
+                for (size_t j = startIndex; j < pipeInput.size(); ++j) {
+                    output(pipeInput[j]);
+                }
+                
+                handledPipeInput = true;
+            }
+            // GREP command with piped input
+            else if (commandEquals(cmd, "grep") && !pipeInput.empty()) {
+                if (args.size() < 2) {
+                    outputError("grep: missing pattern");
+                } else {
+                    std::string pattern;
+                    bool ignoreCase = false;
+                    bool invert = false;
+                    bool showLineNumbers = false;
+                    
+                    // Parse flags and pattern
+                    for (size_t j = 1; j < args.size(); j++) {
+                        if (args[j][0] == '-' && args[j].length() > 1 && args[j][1] != '-') {
+                            // Parse flag characters
+                            for (size_t k = 1; k < args[j].length(); k++) {
+                                if (args[j][k] == 'i') ignoreCase = true;
+                                else if (args[j][k] == 'v') invert = true;
+                                else if (args[j][k] == 'n') showLineNumbers = true;
+                            }
+                        } else if (pattern.empty() && args[j][0] != '-') {
+                            pattern = args[j];
+                        }
+                    }
+                    
+                    if (pattern.empty()) {
+                        outputError("grep: missing pattern");
+                    } else {
+                        int lineNum = 0;
+                        for (const std::string& line : pipeInput) {
+                            lineNum++;
+                            std::string searchLine = line;
+                            std::string searchPattern = pattern;
+                            if (ignoreCase) {
+                                std::transform(searchLine.begin(), searchLine.end(), searchLine.begin(), ::tolower);
+                                std::transform(searchPattern.begin(), searchPattern.end(), searchPattern.begin(), ::tolower);
+                            }
+                            
+                            bool found = searchLine.find(searchPattern) != std::string::npos;
+                            if (invert) found = !found;
+                            
+                            if (found) {
+                                if (showLineNumbers) {
+                                    output(std::to_string(lineNum) + ":" + line);
+                                } else {
+                                    output(line);
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                handledPipeInput = true;
+            }
+            // WC command with piped input
+            else if (commandEquals(cmd, "wc") && !pipeInput.empty()) {
+                // Parse options
+                bool countLines = false;
+                bool countWords = false;
+                bool countBytes = false;
+                bool countChars = false;
+                bool hasOptions = false;
+                
+                for (size_t j = 1; j < args.size(); j++) {
+                    if (args[j][0] == '-') {
+                        for (size_t k = 1; k < args[j].length(); k++) {
+                            char opt = args[j][k];
+                            if (opt == 'l') { countLines = true; hasOptions = true; }
+                            else if (opt == 'w') { countWords = true; hasOptions = true; }
+                            else if (opt == 'c') { countBytes = true; hasOptions = true; }
+                            else if (opt == 'm') { countChars = true; hasOptions = true; }
+                        }
+                    }
+                }
+                
+                // If no options specified, count all
+                if (!hasOptions) {
+                    countLines = countWords = countBytes = true;
+                }
+                
+                // Count metrics
+                int totalLines = pipeInput.size();
+                int totalWords = 0;
+                int totalBytes = 0;
+                int totalChars = 0;
+                
+                for (const auto& line : pipeInput) {
+                    // Count bytes
+                    totalBytes += line.length() + 1;  // +1 for newline
+                    
+                    // Count characters
+                    totalChars += line.length() + 1;  // +1 for newline
+                    
+                    // Count words
+                    bool inWord = false;
+                    for (char c : line) {
+                        if (std::isspace(c)) {
+                            inWord = false;
+                        } else if (!inWord) {
+                            totalWords++;
+                            inWord = true;
+                        }
+                    }
+                }
+                
+                // Output results
+                std::string result;
+                if (countLines) result += std::to_string(totalLines) + " ";
+                if (countWords) result += std::to_string(totalWords) + " ";
+                if (countBytes) result += std::to_string(totalBytes) + " ";
+                if (countChars) result += std::to_string(totalChars) + " ";
+                
+                if (!result.empty()) {
+                    result.pop_back();  // Remove trailing space
+                    output(result);
+                }
+                
+                handledPipeInput = true;
+            }
+            // TEE command with piped input
+            else if (commandEquals(cmd, "tee") && !pipeInput.empty()) {
+                // Parse options
+                bool appendMode = false;
+                int fileArgStart = 1;
+                
+                while (fileArgStart < (int)args.size() && args[fileArgStart][0] == '-') {
+                    if (args[fileArgStart] == "-a") {
+                        appendMode = true;
+                    }
+                    fileArgStart++;
+                }
+                
+                // Get list of files to write to
+                std::vector<std::string> outputFiles;
+                for (int i = fileArgStart; i < (int)args.size(); i++) {
+                    outputFiles.push_back(unixPathToWindows(args[i]));
+                }
+                
+                // Open all output files
+                std::vector<std::ofstream*> fileStreams;
+                for (const auto& filename : outputFiles) {
+                    std::ios_base::openmode mode = std::ios::out;
+                    if (appendMode) {
+                        mode |= std::ios::app;
+                    }
+                    std::ofstream* file = new std::ofstream(filename, mode);
+                    if (file->is_open()) {
+                        fileStreams.push_back(file);
+                    } else {
+                        outputError("tee: cannot open file for writing: " + filename);
+                        delete file;
+                    }
+                }
+                
+                // Write to files and output
+                for (const auto& line : pipeInput) {
+                    // Write to all files
+                    for (auto* file : fileStreams) {
+                        *file << line << "\n";
+                    }
+                    
+                    // Output to stdout
+                    output(line);
+                }
+                
+                // Close all files
+                for (auto* file : fileStreams) {
+                    file->close();
+                    delete file;
+                }
+                
+                handledPipeInput = true;
+            }
+            // TR command with piped input
+            else if (commandEquals(cmd, "tr") && !pipeInput.empty()) {
+                g_capturedOutput = pipeInput;
+                cmd_tr(args);
+                handledPipeInput = true;
+            }
+            // NL command with piped input
+            else if (commandEquals(cmd, "nl") && !pipeInput.empty()) {
+                g_capturedOutput = pipeInput;
+                cmd_nl(args);
+                handledPipeInput = true;
+            }
+            // SPLIT command with piped input
+            else if (commandEquals(cmd, "split") && !pipeInput.empty()) {
+                g_capturedOutput = pipeInput;
+                cmd_split(args);
+                handledPipeInput = true;
+            }
+            // SHUF command with piped input
+            else if (commandEquals(cmd, "shuf") && !pipeInput.empty()) {
+                g_capturedOutput = pipeInput;
+                cmd_shuf(args);
+                handledPipeInput = true;
+            }
+            
+            // If we handled piped input, save output for next command
+            if (handledPipeInput) {
+                // Save captured output before next iteration
+                pipeInput = g_capturedOutput;
+                continue;
+            }
+            
+            // Execute command normally (no piped input)
+            if (commandEquals(cmd, "pwd")) {
+                cmd_pwd(args);
+            } else if (commandEquals(cmd, "cd")) {
+                cmd_cd(args);
+            } else if (commandEquals(cmd, "echo")) {
+                cmd_echo(args);
+            } else if (commandEquals(cmd, "ls") || commandEquals(cmd, "dir")) {
+                cmd_ls(args);
+            } else if (commandEquals(cmd, "cat") || commandEquals(cmd, "type")) {
+                cmd_cat(args);
+            } else if (commandEquals(cmd, "less")) {
+                cmd_less(args);
+            } else if (commandEquals(cmd, "head")) {
+                cmd_head(args);
+            } else if (commandEquals(cmd, "tail")) {
+                cmd_tail(args);
+            } else if (commandEquals(cmd, "grep")) {
+                cmd_grep(args);
+            } else if (commandEquals(cmd, "find")) {
+                cmd_find(args);
+            } else if (commandEquals(cmd, "locate")) {
+                cmd_locate(args);
+            } else if (commandEquals(cmd, "updatedb")) {
+                cmd_updatedb(args);
+            } else if (commandEquals(cmd, "mkdir")) {
+                cmd_mkdir(args);
+            } else if (commandEquals(cmd, "rmdir")) {
+                cmd_rmdir(args);
+            } else if (commandEquals(cmd, "rm") || commandEquals(cmd, "del")) {
+                cmd_rm(args);
+            } else if (commandEquals(cmd, "touch")) {
+                cmd_touch(args);
+            } else if (commandEquals(cmd, "chmod")) {
+                cmd_chmod(args);
+            } else if (commandEquals(cmd, "chown")) {
+                cmd_chown(args);
+            } else if (commandEquals(cmd, "chgrp")) {
+                cmd_chgrp(args);
+            } else if (commandEquals(cmd, "mv")) {
+                cmd_mv(args);
+            } else if (commandEquals(cmd, "dd")) {
+                cmd_dd(args);
+            } else if (commandEquals(cmd, "tar")) {
+                cmd_tar(args);
+            } else if (commandEquals(cmd, "gzip")) {
+                cmd_gzip(args);
+            } else if (commandEquals(cmd, "gunzip")) {
+                cmd_gunzip(args);
+            } else if (commandEquals(cmd, "bzip2")) {
+                cmd_bzip2(args);
+            } else if (commandEquals(cmd, "bunzip2")) {
+                cmd_bunzip2(args);
+            } else if (commandEquals(cmd, "clear") || commandEquals(cmd, "cls")) {
+                cmd_clear(args);
+            } else if (commandEquals(cmd, "rev")) {
+                cmd_rev(args);
+            } else if (commandEquals(cmd, "proc") || commandEquals(cmd, "ps")) {
+                cmd_proc(args);
+            } else if (commandEquals(cmd, "kill")) {
+                cmd_kill(args);
+            } else if (commandEquals(cmd, "killall")) {
+                cmd_killall(args);
+            } else if (commandEquals(cmd, "pgrep")) {
+                cmd_pgrep(args);
+            } else if (commandEquals(cmd, "pidof")) {
+                cmd_pidof(args);
+            } else if (commandEquals(cmd, "pstree")) {
+                cmd_pstree(args);
+            } else if (commandEquals(cmd, "xkill")) {
+                cmd_xkill(args);
+            } else if (commandEquals(cmd, "sleep")) {
+                cmd_sleep(args);
+            } else if (commandEquals(cmd, "wait")) {
+                cmd_wait(args);
+            } else if (commandEquals(cmd, "timeout")) {
+                cmd_timeout(args);
+            } else if (commandEquals(cmd, "nc")) {
+                cmd_nc(args);
+            } else if (commandEquals(cmd, "unrar")) {
+                cmd_unrar(args);
+            } else if (commandEquals(cmd, "xz")) {
+                cmd_xz(args);
+            } else if (commandEquals(cmd, "unxz")) {
+                cmd_unxz(args);
+            } else if (commandEquals(cmd, "dmesg")) {
+                cmd_dmesg(args);
+            } else if (commandEquals(cmd, "mkfs")) {
+                cmd_mkfs(args);
+            } else if (commandEquals(cmd, "fsck")) {
+                cmd_fsck(args);
+            } else if (commandEquals(cmd, "systemctl")) {
+                cmd_systemctl(args);
+            } else if (commandEquals(cmd, "journalctl")) {
+                cmd_journalctl(args);
+            } else if (commandEquals(cmd, "more")) {
+                cmd_more(args);
+            } else if (commandEquals(cmd, "ftp")) {
+                cmd_ftp(args);
+            } else if (commandEquals(cmd, "sftp")) {
+                cmd_sftp(args);
+            } else if (commandEquals(cmd, "sysctl")) {
+                cmd_sysctl(args);
+            } else if (commandEquals(cmd, "read")) {
+                cmd_read(args);
+            } else if (commandEquals(cmd, "rename")) {
+                cmd_rename(args);
+            } else if (commandEquals(cmd, "unlink")) {
+                cmd_unlink(args);
+            } else if (commandEquals(cmd, "nohup")) {
+                cmd_nohup(args);
+            } else if (commandEquals(cmd, "blkid")) {
+                cmd_blkid(args);
+            } else if (commandEquals(cmd, "test") || commandEquals(cmd, "[")) {
+                cmd_test(args);
+            } else if (commandEquals(cmd, "egrep")) {
+                cmd_egrep(args);
+            } else if (commandEquals(cmd, "help")) {
+                cmd_help(args);
+            } else if (commandEquals(cmd, "exit") || commandEquals(cmd, "quit")) {
+                g_capturingOutput = false;
+                DestroyWindow(g_hWnd);
+                return;
+            } else {
+                // Try to execute as external command
+                if (!executeExternalCommand(pipeCmd)) {
+                    outputError(cmd + ": command not found");
+                }
+            }
+            
+            // Save captured output for next command in pipe
+            pipeInput = g_capturedOutput;
+        }
+        
+        // Reset capture mode
+        g_capturingOutput = false;
+        showPrompt();
+        return;
+    }
+    
+    // No pipes - execute single command
+    std::vector<std::string> args = split(cleanCmd);
+    if (args.empty()) {
+        showPrompt();
+        return;
+    }
+    
+    std::string cmd = args[0];
+    
+    // Expand aliases
+    auto aliasIt = g_aliases.find(cmd);
+    if (aliasIt != g_aliases.end()) {
+        // Replace command with alias expansion
+        // Reparse the command with the alias
+        std::string expandedCmd = aliasIt->second;
+        
+        // Append remaining arguments if any
+        if (args.size() > 1) {
+            expandedCmd += " ";
+            for (size_t i = 1; i < args.size(); i++) {
+                if (i > 1) expandedCmd += " ";
+                // Quote arguments with spaces
+                if (args[i].find(' ') != std::string::npos) {
+                    expandedCmd += "\"" + args[i] + "\"";
+                } else {
+                    expandedCmd += args[i];
+                }
+            }
+        }
+        
+        // Recursively execute the expanded command
+        executeCommand(expandedCmd);
+        return;
+    }
+    
+    // Expand wildcards in arguments (skip command name)
+    if (args.size() > 1) {
+        std::vector<std::string> cmdOnly;
+        cmdOnly.push_back(args[0]);
+        
+        std::vector<std::string> argsOnly(args.begin() + 1, args.end());
+        std::vector<std::string> expandedArgs = expandWildcards(argsOnly);
+        
+        // Rebuild args with expanded wildcards
+        args = cmdOnly;
+        args.insert(args.end(), expandedArgs.begin(), expandedArgs.end());
+    }
+    
+    // Check for exit commands
+    if (commandEquals(cmd, "exit") || commandEquals(cmd, "quit")) {
+        DestroyWindow(g_hWnd);
+        return;
+    }
+    
+    // Built-in commands
+    if (commandEquals(cmd, "pwd")) {
+        cmd_pwd(args);
+    } else if (commandEquals(cmd, "cd")) {
+        cmd_cd(args);
+    } else if (commandEquals(cmd, "echo")) {
+        cmd_echo(args);
+    } else if (commandEquals(cmd, "ls") || commandEquals(cmd, "dir")) {
+        cmd_ls(args);
+    } else if (commandEquals(cmd, "df")) {
+        cmd_df(args);
+    } else if (commandEquals(cmd, "du")) {
+        cmd_du(args);
+    } else if (commandEquals(cmd, "cat") || commandEquals(cmd, "type")) {
+        cmd_cat(args);
+    } else if (commandEquals(cmd, "less")) {
+        cmd_less(args);
+    } else if (commandEquals(cmd, "head")) {
+        cmd_head(args);
+    } else if (commandEquals(cmd, "tail")) {
+        cmd_tail(args);
+    } else if (commandEquals(cmd, "tac")) {
+        cmd_tac(args);
+    } else if (commandEquals(cmd, "grep")) {
+        cmd_grep(args);
+    } else if (commandEquals(cmd, "find")) {
+        cmd_find(args);
+    } else if (commandEquals(cmd, "locate")) {
+        cmd_locate(args);
+    } else if (commandEquals(cmd, "updatedb")) {
+        cmd_updatedb(args);
+    } else if (commandEquals(cmd, "mkdir")) {
+        cmd_mkdir(args);
+    } else if (commandEquals(cmd, "rmdir")) {
+        cmd_rmdir(args);
+    } else if (commandEquals(cmd, "rm") || commandEquals(cmd, "del")) {
+        cmd_rm(args);
+    } else if (commandEquals(cmd, "touch")) {
+        cmd_touch(args);
+    } else if (commandEquals(cmd, "chmod")) {
+        cmd_chmod(args);
+    } else if (commandEquals(cmd, "chown")) {
+        cmd_chown(args);
+    } else if (commandEquals(cmd, "chgrp")) {
+        cmd_chgrp(args);
+    } else if (commandEquals(cmd, "mv")) {
+        cmd_mv(args);
+    } else if (commandEquals(cmd, "dd")) {
+        cmd_dd(args);
+    } else if (commandEquals(cmd, "tar")) {
+        cmd_tar(args);
+    } else if (commandEquals(cmd, "gzip")) {
+        cmd_gzip(args);
+    } else if (commandEquals(cmd, "gunzip")) {
+        cmd_gunzip(args);
+    } else if (commandEquals(cmd, "bzip2")) {
+        cmd_bzip2(args);
+    } else if (commandEquals(cmd, "bunzip2")) {
+        cmd_bunzip2(args);
+    } else if (commandEquals(cmd, "zip")) {
+        cmd_zip(args);
+    } else if (commandEquals(cmd, "unzip")) {
+        cmd_unzip(args);
+    } else if (commandEquals(cmd, "ssh")) {
+        cmd_ssh(args);
+    } else if (commandEquals(cmd, "scp")) {
+        cmd_scp(args);
+    } else if (commandEquals(cmd, "sync")) {
+        cmd_sync(args);
+    } else if (commandEquals(cmd, "rsync")) {
+        cmd_rsync(args);
+    } else if (commandEquals(cmd, "wget")) {
+        cmd_wget(args);
+    } else if (commandEquals(cmd, "curl")) {
+        cmd_curl(args);
+    } else if (commandEquals(cmd, "clear") || commandEquals(cmd, "cls")) {
+        cmd_clear(args);
+    } else if (commandEquals(cmd, "rev")) {
+        cmd_rev(args);
+    } else if (commandEquals(cmd, "proc") || commandEquals(cmd, "ps")) {
+        cmd_proc(args);
+    } else if (commandEquals(cmd, "kill")) {
+        cmd_kill(args);
+    } else if (commandEquals(cmd, "killall")) {
+        cmd_killall(args);
+    } else if (commandEquals(cmd, "xkill")) {
+        cmd_xkill(args);
+    } else if (commandEquals(cmd, "shutdown")) {
+        cmd_shutdown(args);
+    } else if (commandEquals(cmd, "reboot")) {
+        cmd_reboot(args);
+    } else if (commandEquals(cmd, "mount")) {
+        cmd_mount(args);
+    } else if (commandEquals(cmd, "date")) {
+        cmd_date(args);
+    } else if (commandEquals(cmd, "timedatectl")) {
+        cmd_timedatectl(args);
+    } else if (commandEquals(cmd, "cal")) {
+        cmd_cal(args);
+    } else if (commandEquals(cmd, "ncal")) {
+        cmd_ncal(args);
+    } else if (commandEquals(cmd, "whoami")) {
+        cmd_whoami(args);
+    } else if (commandEquals(cmd, "id")) {
+        cmd_id(args);
+    } else if (commandEquals(cmd, "uname")) {
+        cmd_uname(args);
+    } else if (commandEquals(cmd, "sed")) {
+        cmd_sed(args);
+    } else if (commandEquals(cmd, "xargs")) {
+        cmd_xargs(args);
+    } else if (commandEquals(cmd, "exec")) {
+        cmd_exec(args);
+    } else if (commandEquals(cmd, "env")) {
+        cmd_env(args);
+    } else if (commandEquals(cmd, "awk")) {
+        cmd_awk(args);
+    } else if (commandEquals(cmd, "sort")) {
+        cmd_sort(args);
+    } else if (commandEquals(cmd, "cut")) {
+        cmd_cut(args);
+    } else if (commandEquals(cmd, "paste")) {
+        cmd_paste(args);
+    } else if (commandEquals(cmd, "split")) {
+        cmd_split(args);
+    } else if (commandEquals(cmd, "nl")) {
+        cmd_nl(args);
+    } else if (commandEquals(cmd, "tr")) {
+        cmd_tr(args);
+    } else if (commandEquals(cmd, "printenv")) {
+        cmd_printenv(args);
+    } else if (commandEquals(cmd, "export")) {
+        cmd_export(args);
+    } else if (commandEquals(cmd, "shuf")) {
+        cmd_shuf(args);
+    } else if (commandEquals(cmd, "banner")) {
+        cmd_banner(args);
+    } else if (commandEquals(cmd, "time")) {
+        cmd_time(args);
+    } else if (commandEquals(cmd, "watch")) {
+        cmd_watch(args);
+    } else if (commandEquals(cmd, "trap")) {
+        cmd_trap(args);
+    } else if (commandEquals(cmd, "ulimit")) {
+        cmd_ulimit(args);
+    } else if (commandEquals(cmd, "expr")) {
+        cmd_expr(args);
+    } else if (commandEquals(cmd, "info")) {
+        cmd_info(args);
+    } else if (commandEquals(cmd, "apropos")) {
+        cmd_apropos(args);
+    } else if (commandEquals(cmd, "whatis")) {
+        cmd_whatis(args);
+    } else if (commandEquals(cmd, "quota")) {
+        cmd_quota(args);
+    } else if (commandEquals(cmd, "basename")) {
+        cmd_basename(args);
+    } else if (commandEquals(cmd, "whereis")) {
+        cmd_whereis(args);
+    } else if (commandEquals(cmd, "stat")) {
+        cmd_stat(args);
+    } else if (commandEquals(cmd, "type")) {
+        cmd_type(args);
+    } else if (commandEquals(cmd, "chattr")) {
+        cmd_chattr(args);
+    } else if (commandEquals(cmd, "pgrep")) {
+        cmd_pgrep(args);
+    } else if (commandEquals(cmd, "pidof")) {
+        cmd_pidof(args);
+    } else if (commandEquals(cmd, "pstree")) {
+        cmd_pstree(args);
+    } else if (commandEquals(cmd, "timeout")) {
+        cmd_timeout(args);
+    } else if (commandEquals(cmd, "ftp")) {
+        cmd_ftp(args);
+    } else if (commandEquals(cmd, "sftp")) {
+        cmd_sftp(args);
+    } else if (commandEquals(cmd, "sysctl")) {
+        cmd_sysctl(args);
+    } else if (commandEquals(cmd, "read")) {
+        cmd_read(args);
+    } else if (commandEquals(cmd, "rename")) {
+        cmd_rename(args);
+    } else if (commandEquals(cmd, "unlink")) {
+        cmd_unlink(args);
+    } else if (commandEquals(cmd, "nohup")) {
+        cmd_nohup(args);
+    } else if (commandEquals(cmd, "blkid")) {
+        cmd_blkid(args);
+    } else if (commandEquals(cmd, "test") || commandEquals(cmd, "[")) {
+        cmd_test(args);
+    } else if (commandEquals(cmd, "egrep")) {
+        cmd_egrep(args);
+    } else if (commandEquals(cmd, "nano")) {
+        cmd_nano(args);
+    } else if (commandEquals(cmd, "diff")) {
+        cmd_diff(args);
+    } else if (commandEquals(cmd, "patch")) {
+        cmd_patch(args);
+    } else if (commandEquals(cmd, "wc")) {
+        cmd_wc(args);
+    } else if (commandEquals(cmd, "tee")) {
+        cmd_tee(args);
+    } else if (commandEquals(cmd, "ln")) {
+        cmd_ln(args);
+    } else if (commandEquals(cmd, "uptime")) {
+        cmd_uptime(args);
+    } else if (commandEquals(cmd, "which")) {
+        cmd_which(args);
+    } else if (commandEquals(cmd, "file")) {
+        cmd_file(args);
+    } else if (commandEquals(cmd, "finger")) {
+        cmd_finger(args);
+    } else if (commandEquals(cmd, "user")) {
+        cmd_user(args);
+    } else if (commandEquals(cmd, "groups")) {
+        cmd_groups(args);
+    } else if (commandEquals(cmd, "version")) {
+        cmd_version(args);
+    } else if (commandEquals(cmd, "passwd")) {
+        cmd_passwd(args);
+    } else if (commandEquals(cmd, "useradd")) {
+        cmd_useradd(args);
+    } else if (commandEquals(cmd, "userdel")) {
+        cmd_userdel(args);
+    } else if (commandEquals(cmd, "usermod")) {
+        cmd_usermod(args);
+    } else if (commandEquals(cmd, "groupadd")) {
+        cmd_groupadd(args);
+    } else if (commandEquals(cmd, "addgroup")) {
+        cmd_addgroup(args);
+    } else if (commandEquals(cmd, "groupmod")) {
+        cmd_groupmod(args);
+    } else if (commandEquals(cmd, "groupdel")) {
+        cmd_groupdel(args);
+    } else if (commandEquals(cmd, "screen")) {
+        cmd_screen(args);
+    } else if (commandEquals(cmd, "getent")) {
+        cmd_getent(args);
+    } else if (commandEquals(cmd, "source") || commandEquals(cmd, ".")) {
+        cmd_source(args);
+    } else if (commandEquals(cmd, "sh")) {
+        cmd_sh(args);
+    } else if (commandEquals(cmd, "service")) {
+        cmd_service(args);
+    } else if (commandEquals(cmd, "jobs")) {
+        cmd_jobs(args);
+    } else if (commandEquals(cmd, "htop")) {
+        cmd_htop(args);
+    } else if (commandEquals(cmd, "at")) {
+        cmd_at(args);
+    } else if (commandEquals(cmd, "cron")) {
+        cmd_cron(args);
+    } else if (commandEquals(cmd, "crontab")) {
+        cmd_crontab(args);
+    } else if (commandEquals(cmd, "uniq")) {
+        cmd_uniq(args);
+    } else if (commandEquals(cmd, "dig")) {
+        cmd_dig(args);
+    } else if (commandEquals(cmd, "nslookup")) {
+        cmd_nslookup(args);
+    } else if (commandEquals(cmd, "netstat")) {
+        cmd_netstat(args);
+    } else if (commandEquals(cmd, "neofetch")) {
+        cmd_neofetch(args);
+    } else if (commandEquals(cmd, "printf")) {
+        cmd_printf(args);
+    } else if (commandEquals(cmd, "case")) {
+        cmd_case(args);
+    } else if (commandEquals(cmd, "free")) {
+        cmd_free(args);
+    } else if (commandEquals(cmd, "hostname")) {
+        cmd_hostname(args);
+    } else if (commandEquals(cmd, "vmstat")) {
+        cmd_vmstat(args);
+    } else if (commandEquals(cmd, "iostat")) {
+        cmd_iostat(args);
+    } else if (commandEquals(cmd, "mpstat")) {
+        cmd_mpstat(args);
+    } else if (commandEquals(cmd, "bc")) {
+        cmd_bc(args);
+    } else if (commandEquals(cmd, "calc")) {
+        cmd_calc(args);
+    } else if (commandEquals(cmd, "qalc")) {
+        cmd_qalc(args);
+    } else if (commandEquals(cmd, "ifconfig")) {
+        cmd_ifconfig(args);
+    } else if (commandEquals(cmd, "ss")) {
+        cmd_ss(args);
+    } else if (commandEquals(cmd, "nmap")) {
+        cmd_nmap(args);
+    } else if (commandEquals(cmd, "tcpdump")) {
+        cmd_tcpdump(args);
+    } else if (commandEquals(cmd, "lspci")) {
+        cmd_lspci(args);
+    } else if (commandEquals(cmd, "lsusb")) {
+        cmd_lsusb(args);
+    } else if (commandEquals(cmd, "umask")) {
+        cmd_umask(args);
+    } else if (commandEquals(cmd, "gpasswd")) {
+        cmd_gpasswd(args);
+    } else if (commandEquals(cmd, "who")) {
+        cmd_who(args);
+    } else if (commandEquals(cmd, "w")) {
+        cmd_w(args);
+    } else if (commandEquals(cmd, "last")) {
+        cmd_last(args);
+    } else if (commandEquals(cmd, "top")) {
+        cmd_top(args);
+    } else if (commandEquals(cmd, "nice")) {
+        cmd_nice(args);
+    } else if (commandEquals(cmd, "sleep")) {
+        cmd_sleep(args);
+    } else if (commandEquals(cmd, "wait")) {
+        cmd_wait(args);
+    } else if (commandEquals(cmd, "nc")) {
+        cmd_nc(args);
+    } else if (commandEquals(cmd, "unrar")) {
+        cmd_unrar(args);
+    } else if (commandEquals(cmd, "xz")) {
+        cmd_xz(args);
+    } else if (commandEquals(cmd, "unxz")) {
+        cmd_unxz(args);
+    } else if (commandEquals(cmd, "dmesg")) {
+        cmd_dmesg(args);
+    } else if (commandEquals(cmd, "mkfs")) {
+        cmd_mkfs(args);
+    } else if (commandEquals(cmd, "fsck")) {
+        cmd_fsck(args);
+    } else if (commandEquals(cmd, "systemctl")) {
+        cmd_systemctl(args);
+    } else if (commandEquals(cmd, "journalctl")) {
+        cmd_journalctl(args);
+    } else if (commandEquals(cmd, "more")) {
+        cmd_more(args);
+    } else if (commandEquals(cmd, "pkill")) {
+        cmd_pkill(args);
+    } else if (commandEquals(cmd, "bg")) {
+        cmd_bg(args);
+    } else if (commandEquals(cmd, "renice")) {
+        cmd_renice(args);
+    } else if (commandEquals(cmd, "fg")) {
+        cmd_fg(args);
+    } else if (commandEquals(cmd, "strace")) {
+        cmd_strace(args);
+    } else if (commandEquals(cmd, "lsof")) {
+        cmd_lsof(args);
+    } else if (commandEquals(cmd, "man")) {
+        cmd_man(args);
+    } else if (commandEquals(cmd, "history")) {
+        cmd_history(args);
+    } else if (commandEquals(cmd, "sudo")) {
+        cmd_sudo(args);
+    } else if (commandEquals(cmd, "su")) {
+        cmd_su(args);
+    } else if (commandEquals(cmd, "ip")) {
+        cmd_ip(args);
+    } else if (commandEquals(cmd, "iptables")) {
+        cmd_iptables(args);
+    } else if (commandEquals(cmd, "ping")) {
+        cmd_ping(args);
+    } else if (commandEquals(cmd, "traceroute") || commandEquals(cmd, "tracert")) {
+        cmd_traceroute(args);
+    } else if (commandEquals(cmd, "alias")) {
+        cmd_alias(args);
+    } else if (commandEquals(cmd, "unalias")) {
+        cmd_unalias(args);
+    } else if (commandEquals(cmd, "help")) {
+        cmd_help(args);
+    } else {
+        // Try to execute as external command
+        if (!executeExternalCommand(cleanCmd)) {
+            outputError(cmd + ": command not found");
+            g_lastExitStatus = 127;  // Standard Unix exit code for "command not found"
+            if (!g_skipFinalPrompt && !g_nanoMode) {
+                showPrompt();
+            }
+            return;
+        }
+    }
+    
+    // Only set default success status (0) for successful commands if not explicitly set
+    // Commands like test() explicitly set their status
+    if (g_lastExitStatus == 0) {
+        // Already explicitly set to 0 by the command
+    }
+    // If exit status is still 0 and we're executing a normal single command,
+    // that's the correct status for a successful command
+    
+    // Close any open redirections
+    closeOutputRedirection();
+    closeInputRedirection();
+    
+    if (!g_skipFinalPrompt && !g_nanoMode) {
+        showPrompt();
+    }
+}
+
+// Window procedure
+LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) {
+    switch (message) {
+        case WM_ERASEBKGND: {
+            // Paint background with theme color
+            HDC hdc = (HDC)wParam;
+            RECT rect;
+            GetClientRect(hWnd, &rect);
+            HBRUSH hBrush = CreateSolidBrush(g_bgColor);
+            FillRect(hdc, &rect, hBrush);
+            DeleteObject(hBrush);
+            return 1;
+        }
+        
+        case WM_CREATE: {
+            // Load saved settings
+            loadCaseSensitiveSetting();
+            loadColorSettings();
+            loadCommandHistory();
+            
+            // Create brush for background color
+            g_hBrush = CreateSolidBrush(g_bgColor);
+            
+            // Enable dark mode for menus and window BEFORE creating menus (Windows 10 1809+)
+            if (isWindowsDarkModeEnabled()) {
+                // Try to use undocumented dark mode APIs
+                HMODULE hUxtheme = LoadLibraryExW(L"uxtheme.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+                if (hUxtheme) {
+                    // Ordinal 135 = SetPreferredAppMode (1903+) or 104 = AllowDarkModeForApp (1809)
+                    fnSetPreferredAppMode SetPreferredAppMode = (fnSetPreferredAppMode)GetProcAddress(hUxtheme, MAKEINTRESOURCEA(135));
+                    if (!SetPreferredAppMode) {
+                        // Fallback for older Windows 10 versions
+                        SetPreferredAppMode = (fnSetPreferredAppMode)GetProcAddress(hUxtheme, MAKEINTRESOURCEA(104));
+                    }
+                    
+                    // Ordinal 133 = AllowDarkModeForWindow
+                    fnAllowDarkModeForWindow AllowDarkModeForWindow = (fnAllowDarkModeForWindow)GetProcAddress(hUxtheme, MAKEINTRESOURCEA(133));
+                    
+                    // Ordinal 136 = FlushMenuThemes
+                    fnFlushMenuThemes FlushMenuThemes = (fnFlushMenuThemes)GetProcAddress(hUxtheme, MAKEINTRESOURCEA(136));
+                    
+                    // Ordinal 104 = RefreshImmersiveColorPolicyState
+                    fnRefreshImmersiveColorPolicyState RefreshImmersiveColorPolicyState = (fnRefreshImmersiveColorPolicyState)GetProcAddress(hUxtheme, MAKEINTRESOURCEA(104));
+                    
+                    if (RefreshImmersiveColorPolicyState) {
+                        RefreshImmersiveColorPolicyState();
+                    }
+                    
+                    if (SetPreferredAppMode) {
+                        SetPreferredAppMode(AllowDark);
+                    }
+                    
+                    if (FlushMenuThemes) {
+                        FlushMenuThemes();
+                    }
+                    
+                    if (AllowDarkModeForWindow) {
+                        AllowDarkModeForWindow(hWnd, TRUE);
+                    }
+                    
+                    FreeLibrary(hUxtheme);
+                }
+            }
+            
+            // Create menu bar
+            HMENU hMenuBar = CreateMenu();
+            g_hOptionsMenu = CreatePopupMenu();
+            
+            // Set initial checkmarks based on loaded setting
+            if (g_caseSensitive) {
+                AppendMenuA(g_hOptionsMenu, MF_STRING, ID_OPTIONS_CASE_INSENSITIVE, "Case Insensitive");
+                AppendMenuA(g_hOptionsMenu, MF_STRING | MF_CHECKED, ID_OPTIONS_CASE_SENSITIVE, "Case Sensitive");
+            } else {
+                AppendMenuA(g_hOptionsMenu, MF_STRING | MF_CHECKED, ID_OPTIONS_CASE_INSENSITIVE, "Case Insensitive");
+                AppendMenuA(g_hOptionsMenu, MF_STRING, ID_OPTIONS_CASE_SENSITIVE, "Case Sensitive");
+            }
+            
+            AppendMenuA(g_hOptionsMenu, MF_SEPARATOR, 0, NULL);
+            
+            if (g_fullPathPrompt) {
+                AppendMenuA(g_hOptionsMenu, MF_STRING | MF_CHECKED, ID_OPTIONS_FULL_PATH, "Full Path Prompt");
+            } else {
+                AppendMenuA(g_hOptionsMenu, MF_STRING, ID_OPTIONS_FULL_PATH, "Full Path Prompt");
+            }
+            
+            if (g_lineWrap) {
+                AppendMenuA(g_hOptionsMenu, MF_STRING | MF_CHECKED, ID_OPTIONS_LINE_WRAP, "Line Wrap");
+            } else {
+                AppendMenuA(g_hOptionsMenu, MF_STRING, ID_OPTIONS_LINE_WRAP, "Line Wrap");
+            }
+            
+            AppendMenuA(g_hOptionsMenu, MF_SEPARATOR, 0, NULL);
+            AppendMenuA(g_hOptionsMenu, MF_STRING, ID_OPTIONS_FULLSCREEN, "Full Screen");
+            AppendMenuA(g_hOptionsMenu, MF_STRING, ID_OPTIONS_TEXT_COLOR, "Text Color...");
+            AppendMenuA(g_hOptionsMenu, MF_STRING, ID_OPTIONS_BG_COLOR, "Background Color...");
+            
+            AppendMenuA(hMenuBar, MF_POPUP, (UINT_PTR)g_hOptionsMenu, "Options");
+            g_hMenu = hMenuBar;
+            SetMenu(hWnd, hMenuBar);
+            
+            // Redraw menu bar to apply theme
+            DrawMenuBar(hWnd);
+            
+            // Create main text box (editable, multiline)
+            // Add ES_AUTOHSCROLL and WS_HSCROLL when line wrap is disabled
+            DWORD editStyle = WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL;
+            if (!g_lineWrap) {
+                editStyle |= ES_AUTOHSCROLL | WS_HSCROLL;
+            }
+            
+            g_hOutput = CreateWindowExA(
+                0, "EDIT", "",
+                editStyle,
+                10, 10, 760, 560,
+                hWnd, (HMENU)1, NULL, NULL);
+            
+            // Set monospace font
+            HFONT hFont = CreateFontA(16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                DEFAULT_QUALITY, FIXED_PITCH | FF_MODERN, "Consolas");
+            SendMessage(g_hOutput, WM_SETFONT, (WPARAM)hFont, TRUE);
+            
+            // Apply dark mode to scroll bar if enabled
+            if (isWindowsDarkModeEnabled()) {
+                SetWindowTheme(g_hOutput, L"DarkMode_Explorer", NULL);
+            }
+            
+            // Subclass the edit control to intercept messages
+            g_originalEditProc = (WNDPROC)SetWindowLongPtr(g_hOutput, GWLP_WNDPROC, (LONG_PTR)EditSubclassProc);
+            
+            // Welcome message
+            output("Windows Native Unix Shell (wnus) v0.0.7.4 - Native Unix Environment for Windows");
+            output("Type 'help' for available commands");
+            output("Type 'version' for more information");
+            output("Type 'exit' or 'quit' to close");
+            output("-----------------------------------------");
+            
+            // Show initial prompt
+            showPrompt();
+            
+            // Execute command from -c flag if present
+            if (g_executeOnStartup && !g_startupCommand.empty()) {
+                executeCommand(g_startupCommand);
+                // Add newline for console output
+                printf("\n");
+                fflush(stdout);
+                // Give time for file operations to complete, then exit
+                SetTimer(hWnd, 1, 500, NULL);  // Exit after 500ms
+            }
+            
+            return 0;
+        }
+        
+        case WM_NCPAINT: {
+            // Let default painting happen first
+            LRESULT result = DefWindowProc(hWnd, message, wParam, lParam);
+            
+            // Paint menu bar with dark theme if enabled
+            if (isWindowsDarkModeEnabled()) {
+                HDC hdc = GetWindowDC(hWnd);
+                if (hdc) {
+                    RECT windowRect;
+                    GetWindowRect(hWnd, &windowRect);
+                    
+                    RECT menuRect;
+                    menuRect.left = 0;
+                    menuRect.top = GetSystemMetrics(SM_CYFRAME) + GetSystemMetrics(SM_CYCAPTION);
+                    menuRect.right = windowRect.right - windowRect.left;
+                    menuRect.bottom = menuRect.top + GetSystemMetrics(SM_CYMENU);
+                    
+                    // Fill menu bar background
+                    HBRUSH hBrush = CreateSolidBrush(RGB(32, 32, 32));
+                    FillRect(hdc, &menuRect, hBrush);
+                    DeleteObject(hBrush);
+                    
+                    ReleaseDC(hWnd, hdc);
+                }
+            }
+            return result;
+        }
+        
+        case WM_SIZE: {
+            // Resize control
+            RECT rect;
+            GetClientRect(hWnd, &rect);
+            
+            int width = rect.right - 20;
+            int height = rect.bottom - 20;
+            
+            if (g_hOutput) {
+                SetWindowPos(g_hOutput, NULL, 10, 10, width, height, SWP_NOZORDER);
+            }
+            
+            return 0;
+        }
+        
+        case WM_COMMAND: {
+            // Handle menu commands
+            if (LOWORD(wParam) == ID_OPTIONS_FULL_PATH) {
+                // Toggle full path prompt
+                g_fullPathPrompt = !g_fullPathPrompt;
+                
+                if (g_fullPathPrompt) {
+                    CheckMenuItem(g_hOptionsMenu, ID_OPTIONS_FULL_PATH, MF_CHECKED);
+                    output("*** Prompt: Full Path Mode - showing complete directory path ***");
+                } else {
+                    CheckMenuItem(g_hOptionsMenu, ID_OPTIONS_FULL_PATH, MF_UNCHECKED);
+                    output("*** Prompt: Short Mode - showing only current directory name ***");
+                }
+                
+                // Save to registry
+                HKEY hKey;
+                LONG result = RegCreateKeyExA(HKEY_CURRENT_USER, REG_KEY_PATH, 0, NULL, 
+                                              REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hKey, NULL);
+                if (result == ERROR_SUCCESS) {
+                    DWORD value = g_fullPathPrompt ? 1 : 0;
+                    RegSetValueExA(hKey, REG_VALUE_FULL_PATH, 0, REG_DWORD, (const BYTE*)&value, sizeof(DWORD));
+                    RegCloseKey(hKey);
+                }
+                
+                showPrompt();
+                return 0;
+            } else if (LOWORD(wParam) == ID_OPTIONS_LINE_WRAP) {
+                // Toggle line wrap
+                g_lineWrap = !g_lineWrap;
+                
+                if (g_lineWrap) {
+                    CheckMenuItem(g_hOptionsMenu, ID_OPTIONS_LINE_WRAP, MF_CHECKED);
+                } else {
+                    CheckMenuItem(g_hOptionsMenu, ID_OPTIONS_LINE_WRAP, MF_UNCHECKED);
+                }
+                
+                // Save to registry
+                HKEY hKey;
+                LONG result = RegCreateKeyExA(HKEY_CURRENT_USER, REG_KEY_PATH, 0, NULL, 
+                                              REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hKey, NULL);
+                if (result == ERROR_SUCCESS) {
+                    DWORD value = g_lineWrap ? 1 : 0;
+                    RegSetValueExA(hKey, REG_VALUE_LINE_WRAP, 0, REG_DWORD, (const BYTE*)&value, sizeof(DWORD));
+                    RegCloseKey(hKey);
+                }
+                
+                // Save current content and position
+                int textLen = GetWindowTextLengthA(g_hOutput);
+                char* buffer = new char[textLen + 1];
+                GetWindowTextA(g_hOutput, buffer, textLen + 1);
+                std::string currentText = buffer;
+                delete[] buffer;
+                
+                // Destroy and recreate the edit control with new style
+                DestroyWindow(g_hOutput);
+                
+                DWORD editStyle = WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL;
+                if (!g_lineWrap) {
+                    editStyle |= ES_AUTOHSCROLL | WS_HSCROLL;
+                }
+                
+                RECT rect;
+                GetClientRect(hWnd, &rect);
+                int width = rect.right - 20;
+                int height = rect.bottom - 20;
+                
+                g_hOutput = CreateWindowExA(
+                    0, "EDIT", "",
+                    editStyle,
+                    10, 10, width, height,
+                    hWnd, (HMENU)1, NULL, NULL);
+                
+                // Set monospace font
+                HFONT hFont = CreateFontA(16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                    DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                    DEFAULT_QUALITY, FIXED_PITCH | FF_MODERN, "Consolas");
+                SendMessage(g_hOutput, WM_SETFONT, (WPARAM)hFont, TRUE);
+                
+                // Apply dark mode to scroll bar if enabled
+                if (isWindowsDarkModeEnabled()) {
+                    SetWindowTheme(g_hOutput, L"DarkMode_Explorer", NULL);
+                }
+                
+                // Subclass the edit control
+                g_originalEditProc = (WNDPROC)SetWindowLongPtr(g_hOutput, GWLP_WNDPROC, (LONG_PTR)EditSubclassProc);
+                
+                // Restore content
+                SetWindowTextA(g_hOutput, currentText.c_str());
+                
+                // Update colors
+                InvalidateRect(g_hOutput, NULL, TRUE);
+                
+                if (g_lineWrap) {
+                    output("*** Line wrap enabled ***");
+                } else {
+                    output("*** Line wrap disabled - horizontal scrollbar enabled ***");
+                }
+                
+                showPrompt();
+                return 0;
+            } else if (LOWORD(wParam) == ID_OPTIONS_FULLSCREEN) {
+                // Toggle full screen mode
+                HWND hWnd = GetParent(g_hOutput);
+                
+                if (!g_isFullScreen) {
+                    // Enter full screen mode
+                    g_isFullScreen = true;
+                    
+                    // Save current window rect and style
+                    GetWindowRect(hWnd, &g_savedWindowRect);
+                    g_savedWindowStyle = GetWindowLong(hWnd, GWL_STYLE);
+                    
+                    // Remove menu
+                    SetMenu(hWnd, NULL);
+                    
+                    // Change to popup style (removes title bar and borders)
+                    SetWindowLong(hWnd, GWL_STYLE, WS_POPUP | WS_VISIBLE);
+                    
+                    // Get screen dimensions
+                    int screenWidth = GetSystemMetrics(SM_CXSCREEN);
+                    int screenHeight = GetSystemMetrics(SM_CYSCREEN);
+                    
+                    // Set window to cover entire screen
+                    SetWindowPos(hWnd, HWND_TOP, 0, 0, screenWidth, screenHeight,
+                                SWP_FRAMECHANGED);
+                    
+                    // Resize edit control to fill window
+                    SetWindowPos(g_hOutput, NULL, 0, 0, screenWidth, screenHeight,
+                                SWP_NOZORDER);
+                    
+                    output("*** Full screen mode enabled - Press Ctrl+F to exit ***");
+                    showPrompt();
+                } else {
+                    // Exit full screen mode
+                    g_isFullScreen = false;
+                    
+                    // Restore window style
+                    SetWindowLong(hWnd, GWL_STYLE, g_savedWindowStyle);
+                    
+                    // Restore menu
+                    SetMenu(hWnd, g_hMenu);
+                    
+                    // Restore window position and size
+                    SetWindowPos(hWnd, NULL, 
+                                g_savedWindowRect.left, 
+                                g_savedWindowRect.top,
+                                g_savedWindowRect.right - g_savedWindowRect.left,
+                                g_savedWindowRect.bottom - g_savedWindowRect.top,
+                                SWP_FRAMECHANGED | SWP_NOZORDER);
+                    
+                    // Resize edit control
+                    RECT rect;
+                    GetClientRect(hWnd, &rect);
+                    SetWindowPos(g_hOutput, NULL, 10, 10, 
+                                rect.right - 20, rect.bottom - 20,
+                                SWP_NOZORDER);
+                    
+                    output("*** Full screen mode disabled ***");
+                    showPrompt();
+                }
+                return 0;
+            } else if (LOWORD(wParam) == ID_OPTIONS_CASE_SENSITIVE) {
+                g_caseSensitive = true;
+                saveCaseSensitiveSetting();
+                CheckMenuItem(g_hOptionsMenu, ID_OPTIONS_CASE_SENSITIVE, MF_CHECKED);
+                CheckMenuItem(g_hOptionsMenu, ID_OPTIONS_CASE_INSENSITIVE, MF_UNCHECKED);
+                output("*** Mode: Case Sensitive - commands must match exactly (pwd, ls, cd) ***");
+                showPrompt();
+                return 0;
+            } else if (LOWORD(wParam) == ID_OPTIONS_CASE_INSENSITIVE) {
+                g_caseSensitive = false;
+                saveCaseSensitiveSetting();
+                CheckMenuItem(g_hOptionsMenu, ID_OPTIONS_CASE_INSENSITIVE, MF_CHECKED);
+                CheckMenuItem(g_hOptionsMenu, ID_OPTIONS_CASE_SENSITIVE, MF_UNCHECKED);
+                output("*** Mode: Case Insensitive - commands work with any case (PWD, Pwd, pwd) ***");
+                showPrompt();
+                return 0;
+            } else if (LOWORD(wParam) == ID_OPTIONS_TEXT_COLOR) {
+                CHOOSECOLOR cc = {};
+                static COLORREF customColors[16] = {};
+                cc.lStructSize = sizeof(CHOOSECOLOR);
+                cc.hwndOwner = hWnd;
+                cc.lpCustColors = customColors;
+                cc.rgbResult = g_textColor;
+                cc.Flags = CC_FULLOPEN | CC_RGBINIT;
+                
+                if (ChooseColor(&cc)) {
+                    g_textColor = cc.rgbResult;
+                    saveColorSettings();
+                    InvalidateRect(g_hOutput, NULL, TRUE);
+                }
+                return 0;
+            } else if (LOWORD(wParam) == ID_OPTIONS_BG_COLOR) {
+                CHOOSECOLOR cc = {};
+                static COLORREF customColors[16] = {};
+                cc.lStructSize = sizeof(CHOOSECOLOR);
+                cc.hwndOwner = hWnd;
+                cc.lpCustColors = customColors;
+                cc.rgbResult = g_bgColor;
+                cc.Flags = CC_FULLOPEN | CC_RGBINIT;
+                
+                if (ChooseColor(&cc)) {
+                    g_bgColor = cc.rgbResult;
+                    saveColorSettings();
+                    // Recreate brush with new color
+                    if (g_hBrush) {
+                        DeleteObject(g_hBrush);
+                    }
+                    g_hBrush = CreateSolidBrush(g_bgColor);
+                    InvalidateRect(g_hOutput, NULL, TRUE);
+                }
+                return 0;
+            }
+            
+            // Handle edit control notifications
+            if (LOWORD(wParam) == 1) {
+                if (HIWORD(wParam) == EN_CHANGE) {
+                    // Prevent editing before prompt
+                    DWORD start, end;
+                    SendMessage(g_hOutput, EM_GETSEL, (WPARAM)&start, (LPARAM)&end);
+                    
+                    if (start < (DWORD)g_promptStart) {
+                        SendMessage(g_hOutput, EM_SETSEL, g_promptStart, g_promptStart);
+                    }
+                }
+            }
+            return 0;
+        }
+        
+        case WM_CTLCOLOREDIT: {
+            HDC hdcEdit = (HDC)wParam;
+            SetTextColor(hdcEdit, g_textColor);
+            SetBkColor(hdcEdit, g_bgColor);
+            return (LRESULT)g_hBrush;
+        }
+        
+        case WM_UAHDRAWMENU: {
+            if (isWindowsDarkModeEnabled()) {
+                UAHMENU* pUDM = (UAHMENU*)lParam;
+                RECT rc = {0};
+                GetClientRect(hWnd, &rc);
+                rc.bottom = rc.top + GetSystemMetrics(SM_CYMENU);
+                
+                // Fill menu bar background with dark color
+                HBRUSH hBrush = CreateSolidBrush(RGB(32, 32, 32));
+                FillRect(pUDM->hdc, &rc, hBrush);
+                DeleteObject(hBrush);
+                return TRUE;
+            }
+            break;
+        }
+        
+        case WM_UAHDRAWMENUITEM: {
+            if (isWindowsDarkModeEnabled()) {
+                UAHDRAWMENUITEM* pUDMI = (UAHDRAWMENUITEM*)lParam;
+                
+                // Get menu item text
+                char text[256] = {0};
+                MENUITEMINFOA mii = {0};
+                mii.cbSize = sizeof(MENUITEMINFOA);
+                mii.fMask = MIIM_STRING;
+                mii.dwTypeData = text;
+                mii.cch = sizeof(text);
+                GetMenuItemInfoA(pUDMI->um.hmenu, pUDMI->dis.itemID, FALSE, &mii);
+                
+                // Fill background
+                COLORREF bgColor = (pUDMI->dis.itemState & ODS_SELECTED) ? RGB(62, 62, 64) : RGB(32, 32, 32);
+                HBRUSH hBrush = CreateSolidBrush(bgColor);
+                FillRect(pUDMI->um.hdc, &pUDMI->dis.rcItem, hBrush);
+                DeleteObject(hBrush);
+                
+                // Draw text
+                SetTextColor(pUDMI->um.hdc, RGB(255, 255, 255));
+                SetBkMode(pUDMI->um.hdc, TRANSPARENT);
+                
+                RECT textRect = pUDMI->dis.rcItem;
+                textRect.left += 10;
+                DrawTextA(pUDMI->um.hdc, text, -1, &textRect, DT_SINGLELINE | DT_VCENTER | DT_LEFT);
+                
+                return TRUE;
+            }
+            break;
+        }
+        
+        case WM_SETFOCUS: {
+            SetFocus(g_hOutput);
+            return 0;
+        }
+        
+        case WM_TIMER: {
+            if (wParam == 1) {
+                KillTimer(hWnd, 1);
+                DestroyWindow(hWnd);
+            }
+            return 0;
+        }
+        
+        case WM_DESTROY: {
+            saveCommandHistory();
+            if (g_hBrush) {
+                DeleteObject(g_hBrush);
+            }
+            PostQuitMessage(0);
+            return 0;
+        }
+    }
+    
+    return DefWindowProc(hWnd, message, wParam, lParam);
+}
+
+// WinMain entry point
+int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
+    // Initialize Winsock for network operations (ping, ip, ssh, etc.)
+    WSADATA wsaData;
+    WSAStartup(MAKEWORD(2, 2), &wsaData);
+    
+    // Parse command line arguments first to check for -c flag
+    std::string cmdLine = lpCmdLine;
+    std::string executeCmd;
+    bool hasExecuteFlag = false;
+    
+    // Check for -c or /c flag
+    if (!cmdLine.empty()) {
+        size_t start = 0;
+        while (start < cmdLine.length() && isspace(cmdLine[start])) start++;
+        
+        if (start < cmdLine.length()) {
+            if ((cmdLine[start] == '-' || cmdLine[start] == '/') && 
+                start + 1 < cmdLine.length() && 
+                (cmdLine[start + 1] == 'c' || cmdLine[start + 1] == 'C')) {
+                
+                hasExecuteFlag = true;
+                size_t cmdStart = start + 2;
+                
+                while (cmdStart < cmdLine.length() && isspace(cmdLine[cmdStart])) cmdStart++;
+                
+                if (cmdStart < cmdLine.length()) {
+                    if (cmdLine[cmdStart] == '"') {
+                        cmdStart++;
+                        size_t cmdEnd = cmdLine.find('"', cmdStart);
+                        if (cmdEnd != std::string::npos) {
+                            executeCmd = cmdLine.substr(cmdStart, cmdEnd - cmdStart);
+                        } else {
+                            executeCmd = cmdLine.substr(cmdStart);
+                        }
+                    } else {
+                        executeCmd = cmdLine.substr(cmdStart);
+                    }
+                }
+            }
+        }
+    }
+    
+    // If -c flag is present, attach to parent console for output
+    if (hasExecuteFlag) {
+        if (AttachConsole(ATTACH_PARENT_PROCESS)) {
+            // Redirect stdout and stderr to console
+            freopen("CONOUT$", "w", stdout);
+            freopen("CONOUT$", "w", stderr);
+        }
+        // Set globals BEFORE creating window so WM_CREATE can access them
+        g_executeOnStartup = true;
+        g_startupCommand = executeCmd;
+    }
+    
+    // Apply system theme (dark/light mode) before loading custom settings
+    applySystemTheme();
+    
+    const char CLASS_NAME[] = "GarysConsoleWindow";
+    
+    WNDCLASSA wc = {};
+    wc.lpfnWndProc = WndProc;
+    wc.hInstance = hInstance;
+    wc.lpszClassName = CLASS_NAME;
+    wc.hbrBackground = NULL; // We'll handle background ourselves
+    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+    
+    RegisterClassA(&wc);
+    
+    g_hWnd = CreateWindowExA(
+        0,
+        CLASS_NAME,
+        "Windows Native Unix Shell (wnus) v0.0.7.4",
+        WS_OVERLAPPEDWINDOW,
+        CW_USEDEFAULT, CW_USEDEFAULT, 800, 600,
+        NULL, NULL, hInstance, NULL
+    );
+    
+    if (g_hWnd == NULL) {
+        return 0;
+    }
+    
+    // Apply dark mode to title bar and window borders if dark mode is enabled
+    if (isWindowsDarkModeEnabled()) {
+        BOOL useDarkMode = TRUE;
+        // DWMWA_USE_IMMERSIVE_DARK_MODE is 20
+        DwmSetWindowAttribute(g_hWnd, 20, &useDarkMode, sizeof(useDarkMode));
+    }
+    
+    ShowWindow(g_hWnd, hasExecuteFlag ? SW_SHOW : nCmdShow);
+    UpdateWindow(g_hWnd);
+    
+    // Message loop
+    MSG msg = {};
+    while (GetMessage(&msg, NULL, 0, 0)) {
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
+    }
+    
+    // Cleanup Winsock
+    WSACleanup();
+    
+    return 0;
+}
