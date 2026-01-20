@@ -1,5 +1,5 @@
 # Windows Native Unix Shell (wnus) User Manual
-## Version 0.0.8.1
+## Version 0.0.8.2
 
 ---
 
@@ -37,8 +37,8 @@ allowing Windows users to enjoy the power and flexibility of Unix command-line t
 ### System Requirements
 
 - **Operating System**: Windows 7 or later (Windows 10/11 recommended)
-- **Memory**: 10 MB RAM minimum
-- **Disk Space**: 5 MB for executable
+- **Memory**: 15 MB RAM minimum, 32 MB recommended
+- **Disk Space**: 5-6 MB for executable
 - **Privileges**: Standard user for most commands, Administrator for system operations
 
 ---
@@ -2850,6 +2850,14 @@ Code    Meaning
 - Added internal `pgrep`, `pidof`, `pstree`, `timeout`, `ftp`, `sftp`, and `sysctl`
 - Expanded process lookup/tree capabilities and timed command execution
 - Added connectivity probes for FTP/SSH/SFTP and sysctl-style system info
+
+**v0.0.8.2**
+- Implemented virtual root filesystem (wnus:/)
+- Added unified drive access via /C, /D, etc. paths
+- Changed path format from C:/path to /C/path for consistency
+- Added `cd /` to access virtual root with all drives listed
+- Enhanced path mapping between Windows and Unix-style paths
+- Updated memory requirements and size documentation
 
 **v0.0.8.1**
 - Added internal `xdg-open` command for opening files/URLs with default applications

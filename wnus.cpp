@@ -393,6 +393,8 @@ bool g_skipFinalPrompt = false;  // Skip final prompt in executeCommand
 RECT g_savedWindowRect = {0};
 LONG g_savedWindowStyle = 0;
 bool g_capturingOutput = false;
+// Virtual root flag: when true, we are at wnus:/ where drives are listed
+bool g_atVirtualRoot = false;
 std::vector<std::string> g_capturedOutput;
 int g_lastExitStatus = 0;  // Track exit status of last command (0 = success)
 bool g_executeOnStartup = false;
@@ -553,7 +555,28 @@ std::string expandTildePath(const std::string& path) {
 std::string unixPathToWindows(const std::string& path) {
     // First expand tilde to home directory
     std::string expanded = expandTildePath(path);
-    
+
+    // Handle virtual root mapping: /C/... -> C:\...
+    if (!expanded.empty() && expanded[0] == '/') {
+        // Root only stays as '/'
+        if (expanded.size() == 1) {
+            return expanded; // special-cased by cd/ls
+        }
+        // Pattern: /X or /X/...
+        if (expanded.size() >= 2 && std::isalpha((unsigned char)expanded[1])) {
+            char drive = (char)std::toupper((unsigned char)expanded[1]);
+            std::string rest;
+            if (expanded.size() > 2) {
+                // Skip optional slash
+                if (expanded[2] == '/') rest = expanded.substr(3);
+                else rest = expanded.substr(2);
+            }
+            std::string win = std::string(1, drive) + ":";
+            if (!rest.empty()) win += "\\" + rest;
+            return win;
+        }
+    }
+
     // Then convert forward slashes to backslashes
     std::string result = expanded;
     std::replace(result.begin(), result.end(), '/', '\\');
@@ -561,9 +584,20 @@ std::string unixPathToWindows(const std::string& path) {
 }
 
 std::string windowsPathToUnix(const std::string& path) {
-    std::string result = path;
-    std::replace(result.begin(), result.end(), '\\', '/');
-    return result;
+    std::string p = path;
+    std::replace(p.begin(), p.end(), '\\', '/');
+    // Map C:/something -> /C/something
+    if (p.size() >= 2 && std::isalpha((unsigned char)p[0]) && p[1] == ':') {
+        char drive = (char)std::toupper((unsigned char)p[0]);
+        std::string rest;
+        if (p.size() > 2) {
+            rest = p.substr(2);
+            if (!rest.empty() && rest[0] == '/') rest = rest.substr(1);
+        }
+        if (!rest.empty()) return std::string("/") + drive + "/" + rest;
+        return std::string("/") + drive;
+    }
+    return p;
 }
 
 // Pad string to the right with spaces
@@ -1285,12 +1319,15 @@ std::string getCurrentPrompt() {
     char cwd[MAX_PATH];
     std::string prompt = "wnus$ ";
     if (_getcwd(cwd, sizeof(cwd)) != NULL) {
-        std::string path = windowsPathToUnix(cwd);
+        std::string path = g_atVirtualRoot ? std::string("/") : windowsPathToUnix(cwd);
         if (!g_fullPathPrompt) {
             // Show only current directory name
-            size_t lastSlash = path.find_last_of('/');
-            if (lastSlash != std::string::npos) {
-                path = path.substr(lastSlash + 1);
+            if (path != "/") {
+                size_t lastSlash = path.find_last_of('/');
+                if (lastSlash != std::string::npos) {
+                    path = path.substr(lastSlash + 1);
+                }
+                if (path.empty()) path = "/";
             }
         }
         prompt = "wnus:" + path + "$ ";
@@ -1407,6 +1444,10 @@ void cmd_pwd() {
     // No args needed, so just execute
     char cwd[MAX_PATH];
     if (_getcwd(cwd, sizeof(cwd)) != NULL) {
+        if (g_atVirtualRoot) {
+            output("/");
+            return;
+        }
         std::string path = windowsPathToUnix(cwd);
         
         // Check if current directory is home directory
@@ -1444,14 +1485,24 @@ void cmd_cd(const std::vector<std::string>& args) {
     if (args.size() < 2) {
         // cd with no args goes to home
         const char* home = getenv("USERPROFILE");
-        if (home && _chdir(home) == 0) {
-            return;
-        }
+        if (home && _chdir(home) == 0) { g_atVirtualRoot = false; return; }
     } else {
-        std::string path = unixPathToWindows(args[1]);
-        if (_chdir(path.c_str()) == 0) {
-            return;
+        std::string arg = args[1];
+        // Handle virtual root
+        if (arg == "/" || arg == "\\") { g_atVirtualRoot = true; return; }
+        // If at virtual root and user types drive letter (e.g., cd C)
+        if (g_atVirtualRoot && arg.size() == 1 && std::isalpha((unsigned char)arg[0])) {
+            std::string drive; drive += (char)std::toupper((unsigned char)arg[0]); drive += ":\\";
+            if (_chdir(drive.c_str()) == 0) { g_atVirtualRoot = false; return; }
         }
+        // Handle /C/... absolute mapping
+        if (arg.size() >= 2 && arg[0] == '/' && std::isalpha((unsigned char)arg[1])) {
+            std::string win = unixPathToWindows(arg);
+            if (_chdir(win.c_str()) == 0) { g_atVirtualRoot = false; return; }
+        }
+        // Normal path
+        std::string path = unixPathToWindows(arg);
+        if (_chdir(path.c_str()) == 0) { g_atVirtualRoot = false; return; }
         outputError("cd: " + args[1] + ": No such file or directory");
     }
 }
@@ -1498,6 +1549,36 @@ void cmd_ls(const std::vector<std::string>& args) {
     
     // Process each path
     for (const std::string& path : paths) {
+        // Virtual root: list logical drives when path is '/' or '.' at virtual root
+        if (path == "/" || (path == "." && g_atVirtualRoot)) {
+            DWORD drives = GetLogicalDrives();
+            std::vector<std::string> entries;
+            for (int i = 0; i < 26; i++) {
+                if (drives & (1 << i)) {
+                    std::string name;
+                    name += (char)('A' + i);
+                    name += "/";
+                    entries.push_back(name);
+                }
+            }
+            // Output in short or long format
+            if (longFormat) {
+                for (const auto& e : entries) {
+                    char buffer[256];
+                    sprintf(buffer, "d---------          0 01/01/1970 00:00 %s", e.c_str());
+                    output(buffer);
+                }
+            } else {
+                std::string result;
+                for (size_t i = 0; i < entries.size(); ++i) {
+                    result += entries[i];
+                    if (i + 1 < entries.size()) result += "  ";
+                }
+                if (!result.empty()) output(result);
+            }
+            continue;
+        }
+
         std::string winPath = unixPathToWindows(path);
         
         // Check if path is a file or directory
@@ -18373,7 +18454,7 @@ void cmd_version(const std::vector<std::string>& args) {
     }
     
     output("╔════════════════════════════════════════════════════════════════╗");
-    output("║      Windows Native Unix Shell (wnus) version 0.0.8.1          ║");
+    output("║      Windows Native Unix Shell (wnus) version 0.0.8.2          ║");
     output("║     A Comprehensive Bash-like Console for Windows (NTFS)       ║");
     output("╚════════════════════════════════════════════════════════════════╝");
     output("");
@@ -29453,7 +29534,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             g_originalEditProc = (WNDPROC)SetWindowLongPtr(g_hOutput, GWLP_WNDPROC, (LONG_PTR)EditSubclassProc);
             
             // Welcome message
-            output("Windows Native Unix Shell (wnus) v0.0.8.1 - Native Unix Environment for Windows");
+            output("Windows Native Unix Shell (wnus) v0.0.8.2 - Native Unix Environment for Windows");
             output("Type 'help' for available commands");
             output("Type 'version' for more information");
             output("Type 'exit' or 'quit' to close");
@@ -29900,7 +29981,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     g_hWnd = CreateWindowExA(
         0,
         CLASS_NAME,
-        "Windows Native Unix Shell (wnus) v0.0.8.1",
+        "Windows Native Unix Shell (wnus) v0.0.8.2",
         WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT, CW_USEDEFAULT, 800, 600,
         NULL, NULL, hInstance, NULL

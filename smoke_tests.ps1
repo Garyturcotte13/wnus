@@ -30,6 +30,14 @@ $tests += @(
     'du -B 1K -d 0 .'
 )
 
+# Virtual root tests
+$tests += @(
+    'cd / && pwd',
+    'cd / && ls',
+    'cd / && cd C && pwd',
+    'cd / && cd /C/Windows && pwd'
+)
+
 function Run-Test {
     param(
         [string]$Cmd,
