@@ -1,5 +1,5 @@
 # Windows Native Unix Shell (wnus) User Manual
-## Version 0.0.8.3
+## Version 0.0.9.6
 
 ---
 
@@ -23,14 +23,14 @@
 
 ### What is Windows Native Unix Shell?
 
-Windows Native Unix Shell (wnus) is a comprehensive Unix/Linux-like command-line shell for Windows. It provides over 250 Unix/Linux commands implemented natively in C++,
+Windows Native Unix Shell (wnus) is a comprehensive Unix/Linux-like command-line shell for Windows. It provides 276+ fully implemented Unix/Linux commands in C++,
 allowing Windows users to enjoy the power and flexibility of Unix command-line tools without requiring WSL, Git Bash, Cygwin, or any other third-party installations.
 
 ### Key Benefits
 
 - **Native Windows Integration**: Full NTFS file system support with Windows ACL integration
 - **No Dependencies**: Single executable with no external requirements
-- **Comprehensive**: 262+ commands covering file operations, text processing, networking, and system administration (250+ fully implemented, 12+ informational)
+- **Comprehensive**: 273+ fully implemented commands covering file operations, text processing, networking, and system administration
 - **Well Documented**: Every command includes `--help` text and full man pages
 - **Familiar Interface**: Bash-like syntax and behavior for easy adoption
 
@@ -38,7 +38,7 @@ allowing Windows users to enjoy the power and flexibility of Unix command-line t
 
 - **Operating System**: Windows 7 or later (Windows 10/11 recommended)
 - **Memory**: 15 MB RAM minimum, 32 MB recommended
-- **Disk Space**: 5.2 MB for executable
+- **Disk Space**: 5.3 MB for executable
 - **Privileges**: Standard user for most commands, Administrator for system operations
 
 ---
@@ -2164,6 +2164,38 @@ ssh -p 2222 user@example.com
 
 **Note**: Uses external OpenSSH client if available, falls back to internal implementation.
 
+### SSH-KEYGEN - SSH Key Generation
+
+```bash
+# Generate default RSA key (2048 bits)
+ssh-keygen
+
+# Generate 4096-bit RSA key
+ssh-keygen -t rsa -b 4096
+
+# Generate Ed25519 key
+ssh-keygen -t ed25519
+
+# Generate key with comment
+ssh-keygen -t rsa -C "user@hostname"
+
+# Specify output file
+ssh-keygen -f ~/.ssh/custom_key
+
+# Show key fingerprint
+ssh-keygen -l -f ~/.ssh/id_rsa
+
+# Print public key from private key
+ssh-keygen -y -f ~/.ssh/id_rsa
+
+# Examples:
+ssh-keygen -t rsa -b 4096 -C "admin@server"
+ssh-keygen -t ed25519 -f ~/.ssh/deployment_key
+ssh-keygen -l -f ~/.ssh/id_rsa.pub
+```
+
+**Note**: Uses Windows CryptoAPI for key generation. Keys stored in PEM and SSH public key formats.
+
 ### SCP - Secure Copy
 
 ```bash
@@ -2840,7 +2872,150 @@ Code    Meaning
 
 ### L. Version History
 
-**v0.0.8.3** (Current)
+**v0.0.9.6** (Current)
+- Added 3 new text editor commands: `fvi`, `jed`, and `emacs`
+- `fvi`: Free Vi-like text editor
+  * Interactive text editor with Vi key bindings
+  * Supports creating new files (-n flag) and editing existing files
+  * Key bindings: Ctrl+S (save), Ctrl+X (exit), Ctrl+K (cut), Ctrl+Y (paste)
+  * File buffer management with proper line handling
+- `jed`: Jove-like editor
+  * Lightweight editor combining Vi and Emacs key bindings
+  * Full text editing with file persistence
+  * Supports create mode (-n) and edit mode for existing files
+  * Enhanced with undo/redo and improved text manipulation
+- `emacs`: Emacs-like text editor
+  * Command-line Emacs implementation
+  * Extended Emacs key bindings for productivity
+  * Quiet mode (-q) for non-interactive scripts
+  * Full file editing with comprehensive key bindings
+- New TEXT EDITORS section in help command with all three editors listed
+- Increased command count from 273 to 276+ fully implemented commands
+- File size: 5.6 MB (estimated), optimized for text editing workflows
+- All 3 editors use shared buffer management with Windows console integration
+
+**v0.0.9.5**
+- Added 4 new system utility commands: `fuser`, `fdisk`, `parted`, and enhanced `fsck`
+- `fuser`: Identify processes using files or sockets with verbose output
+  * Process finder and file/socket usage analyzer
+  * Supports signal listing (-l) and process termination (-k)
+  * Windows Toolhelp32 API integration for process detection
+- `fdisk`: Partition disk management utility
+  * List all partitions (-l flag) with details
+  * Show disk space summary (-s flag) with usage percentages
+  * Support for multiple drive inspection
+  * Displays drive geometry and partition table information
+- `parted`: GNU parted equivalent for volume management
+  * List partitions and volume information
+  * Verbose mode with detailed partition analysis
+  * Support for MBR/GPT partition table display
+  * Creates formatted output compatible with parted syntax
+- Enhanced `fsck`: Full filesystem check and repair implementation
+  * Read-only check mode (-n flag) for non-destructive analysis
+  * Multi-pass filesystem verification (4-pass checking)
+  * Detailed inode and block analysis with status reporting
+  * Verbose output (-v) for detailed filesystem information
+  * Reports total/used/free inodes and blocks
+- New DISK & PARTITION MANAGEMENT section in help command
+- Increased command count from 270 to 273+ fully implemented commands
+- File size: 5.6 MB (estimated), optimized for system partition management
+
+**v0.0.9.4**
+- Added `ffmpeg` multimedia file analyzer and information tool
+- Multimedia file detection with format and codec identification
+- File signature analysis with magic number detection (MP4, MKV, MP3, WAV, etc.)
+- Display of media information including codec, bitrate, and file metadata
+- Supports codec listing (-codecs) and format listing (-formats) options
+- File size and throughput analysis for multimedia files
+- Uses Windows Media Foundation for file detection
+- New MEDIA & ENCODING section in help with multimedia commands
+- Increased command count from 269 to 270+ fully implemented commands
+- File size: 5.5 MB (5374.95 KB), optimized for multimedia file analysis
+
+**v0.0.9.3**
+- Added 6 new commands: `pv`, `fgrep`, `tree`, `zcat`, `chage`, `mysql`
+- `pv` (Pipe Viewer): Monitor data throughput with progress bar, ETA, rate calculation
+- `fgrep` (Fixed Grep): Search for fixed strings without regex support (-i, -n, -v, -c flags)
+- `tree`: Display directory structure with ASCII graphics (-d, -a, -L flags)
+- `zcat`: View compressed gzip files without extracting (header parsing)
+- `chage`: Manage password expiry information (-l, -M, -m, -E flags with Windows integration)
+- `mysql`: MySQL client connectivity test with host/port/user/password/database options
+- All new commands use Windows APIs only with no external dependencies
+- Increased command count from 263 to 269+ fully implemented commands
+- File size: 5.4 MB (5359.08 KB), optimized for data monitoring and file management
+
+**v0.0.9.2**
+- Added `ssh-keygen` command for SSH key generation and management
+- Full RSA key pair generation using Windows CryptoAPI (2048-4096 bits)
+- Generates both private key (PEM format) and public key (SSH format)
+- Supports key fingerprint display (-l), public key extraction (-y)
+- Key files stored in ~/.ssh/ directory with proper permissions
+- Increased command count from 262 to 263+ fully implemented commands
+- File size: 5.3 MB, optimized for SSH key management
+
+**v0.0.9.1**
+- Enhanced `iostat` command with real CPU statistics using GetSystemTimes() Windows API
+- Added interval and count parameters for continuous monitoring (e.g., "iostat 1 3")
+- Implemented device enumeration showing actual fixed disk drives on system
+- Added extended statistics mode with CPU cores, memory load, and disk usage information
+- Improved iostat to calculate real user%, system%, and idle% from CPU time deltas
+- File size: 5.3 MB, optimized for I/O and CPU performance monitoring
+
+**v0.0.9.0**
+- Enhanced `quota` command with actual disk space reporting for all accessible drives
+- Now displays total, used, free space, and usage percentage for each drive
+- Added verbose mode (-v) showing volume labels and filesystem types
+- Added -a flag to show all drive types including network shares
+- Replaced informational-only quota with fully functional disk space utility
+- File size: 5.3 MB, optimized for disk space management
+
+**v0.0.8.9**
+- Implemented `lspci` with full WMI-based PCI device enumeration showing device names, IDs, and slot information
+- Implemented `lsusb` with full WMI-based USB device enumeration displaying vendor IDs, product IDs, and device status
+- Added verbose mode (-v, -vv) for both lspci and lsusb with detailed manufacturer and driver information
+- Replaced informational-only implementations with actual Windows device enumeration using COM/WMI APIs
+- Updated from 260 to 262+ fully implemented commands (all 262 commands now fully functional)
+- File size: 5.3 MB, optimized for hardware device detection and system diagnostics
+
+**v0.0.8.8**
+- Enhanced `hostname -i` to use Windows Winsock API for proper IP address resolution
+- Improved `vmstat` output with real process counts from Windows Toolhelp32 API
+- Better formatted vmstat statistics table with proper column alignment
+- Updated from 258 to 260+ fully implemented commands (reduced informational from 4 to 2)
+- File size: 5.2 MB, optimized for system information and network operations
+
+**v0.0.8.7**
+- Implemented stdin support for `sed` command - can now read from pipes and process streaming data
+- Enhanced `sha1sum` with Windows BCrypt API for authentic SHA-1 (160-bit) cryptographic hashing
+- Enhanced `sha256sum` with Windows BCrypt API for authentic SHA-256 (256-bit) cryptographic hashing
+- Replaced simplified hash algorithms with proper cryptographic implementations
+- Updated from 255 to 258+ fully implemented commands (reduced informational from 7 to 4)
+- File size: 5.2 MB, optimized for cryptographic operations and stream processing
+
+**v0.0.8.6**
+- Enhanced `uname -v` to display actual Windows build number from registry (instead of placeholder)
+- Implemented full unit conversion in `qalc`/`bc`: distance (km/miles, m/ft, cm/inches), weight (kg/lbs, g/oz), temperature (C/F/K), volume (l/gal)
+- Improved `nmap` port scanning display with clearer messaging
+- Updated from 253 to 255+ fully implemented commands (reduced informational from 9 to 7)
+- File size: 5.2 MB, optimized for unit calculations and system information
+
+**v0.0.8.5**
+- Enhanced `expr` command with full string comparison support (<=, >=, !=, <, >, =)
+- String comparison now properly trims whitespace and returns 1/0 for true/false
+- Updated help command descriptions: removed "stub" references for lpr/lp, write/wall, tty
+- Improved command documentation accuracy across help system
+- Updated from 252 to 253+ fully implemented commands (reduced informational from 10 to 9)
+- File size: 5.2 MB, optimized for expression evaluation
+
+**v0.0.8.4**
+- Enhanced `timedatectl` with real Windows Time service (W32Time) status detection for NTP sync
+- Implemented full `trap` signal handler system with console control handler registration
+- Trap supports INT (Ctrl+C), BREAK (Ctrl+Break), HUP (close), TERM (logoff) signals
+- Added persistent trap handler storage and signal name normalization (SIGINT→INT, etc.)
+- Updated from 250 to 252+ fully implemented commands (reduced informational from 12 to 10)
+- File size: 5.2 MB, optimized for signal handling and time services
+
+**v0.0.8.3**
 - Enhanced messaging commands: `mesg` now persists per-user preferences, `write` and `wall` use Windows session messaging (WTSSendMessage)
 - Implemented full `watch` loop with `-n` interval, `-c` count, timing output, and interactive quit
 - Improved `tty` to check actual console attachment status and return proper exit codes
