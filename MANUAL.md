@@ -1,5 +1,5 @@
 # Windows Native Unix Shell (wnus) User Manual
-## Version 0.0.7.3
+## Version 0.0.8.1
 
 ---
 
@@ -23,14 +23,14 @@
 
 ### What is Windows Native Unix Shell?
 
-Windows Native Unix Shell (wnus) is a comprehensive Unix/Linux-like command-line shell for Windows. It provides over 140 Unix/Linux commands implemented natively in C++,
+Windows Native Unix Shell (wnus) is a comprehensive Unix/Linux-like command-line shell for Windows. It provides over 246 Unix/Linux commands implemented natively in C++,
 allowing Windows users to enjoy the power and flexibility of Unix command-line tools without requiring WSL, Git Bash, Cygwin, or any other third-party installations.
 
 ### Key Benefits
 
 - **Native Windows Integration**: Full NTFS file system support with Windows ACL integration
 - **No Dependencies**: Single executable with no external requirements
-- **Comprehensive**: 154+ commands covering file operations, text processing, networking, and system administration
+- **Comprehensive**: 262+ commands covering file operations, text processing, networking, and system administration
 - **Well Documented**: Every command includes `--help` text and full man pages
 - **Familiar Interface**: Bash-like syntax and behavior for easy adoption
 
@@ -1516,9 +1516,173 @@ dd if=/dev/sda of=backup.img bs=4M
 # count=number of blocks
 ```
 
+#### make - Build Automation
+```bash
+# Build default target
+make
+
+# Build specific target
+make target_name
+
+# Use specific Makefile
+make -f Makefile.custom
+
+# Run from different directory
+make -C /path/to/project
+
+# Show commands without executing
+make -n
+
+# Force rebuild all targets
+make -B
+
+# Makefile format:
+# target: dependencies
+# 	command1
+# 	command2
+#
+# Example Makefile:
+# program: main.o utils.o
+# 	g++ -o program main.o utils.o
+#
+# main.o: main.cpp
+# 	g++ -c main.cpp
+#
+# clean:
+# 	rm -f *.o program
+```
+
 ---
 
-## 6. Advanced Features
+## 5. File Utilities
+
+### cp - Copy Files
+```bash
+# Copy file
+cp file1.txt file2.txt
+
+# Copy to directory
+cp file.txt /path/to/dir/
+
+# Copy recursively
+cp -r dir1 dir2
+
+# Copy with verbose output
+cp -v file.txt backup.txt
+
+# Preserve timestamps
+cp -p file.txt backup.txt
+
+# Force overwrite
+cp -f file.txt existing.txt
+```
+
+### dirname - Extract Directory Path
+```bash
+# Get directory portion
+dirname /path/to/file.txt    # Output: /path/to
+
+# Current directory indicator
+dirname file.txt             # Output: .
+
+# Handle trailing slashes
+dirname /path/to/dir/        # Output: /path/to
+```
+
+### readlink - Resolve Symbolic Links
+```bash
+# Display link target
+readlink mylink
+
+# Follow to final target
+readlink -f mylink
+
+# No newline output
+readlink -n mylink
+```
+
+### realpath - Print Absolute Path
+```bash
+# Get absolute path
+realpath file.txt
+
+# Resolve relative paths
+realpath ../dir/file
+
+# Current directory
+realpath .
+```
+
+### mktemp - Create Temporary Files
+```bash
+# Create temporary file
+mktemp
+
+# Create temporary directory
+mktemp -d
+
+# With custom template
+mktemp tmpfile.XXXXXX
+
+# Dry run (print name only)
+mktemp -u
+
+# Use custom prefix directory
+mktemp -p C:\Temp file.XXXXXX
+```
+
+### install - Copy with Attributes
+```bash
+# Simple copy
+install program /usr/bin/
+
+# Create directories
+install -d /path/to/new/dir
+
+# Set permissions
+install -m 755 script.sh /usr/local/bin/
+
+# Verbose output
+install -v myfile /destination/
+```
+
+---
+
+## 6. Text Formatting
+
+### fmt - Reformat Text
+```bash
+# Reformat to default width (75)
+fmt file.txt
+
+# Custom width
+fmt -w 60 file.txt
+
+# From stdin
+echo "Very long line of text here" | fmt
+
+# Justify paragraphs
+cat long_paragraph.txt | fmt -w 70
+```
+
+### fold - Wrap Long Lines
+```bash
+# Wrap to 80 columns
+fold file.txt
+
+# Custom width
+fold -w 60 file.txt
+
+# Break at spaces
+fold -s -w 70 file.txt
+
+# From stdin
+echo "Long line here" | fold -w 20
+```
+
+---
+
+## 7. Advanced Features
 
 ### Piping and Redirection
 
@@ -2686,6 +2850,12 @@ Code    Meaning
 - Added internal `pgrep`, `pidof`, `pstree`, `timeout`, `ftp`, `sftp`, and `sysctl`
 - Expanded process lookup/tree capabilities and timed command execution
 - Added connectivity probes for FTP/SSH/SFTP and sysctl-style system info
+
+**v0.0.8.1**
+- Added internal `xdg-open` command for opening files/URLs with default applications
+- Uses Windows ShellExecute API for native application association
+- Supports files, directories, and URLs (http://, https://, etc.)
+- Updated version to 0.0.8.1 with 262+ total commands
 
 **v0.0.6.9**
 - Added internal `quota`, `basename`, `whereis`, `stat`, `type`, and `chattr`

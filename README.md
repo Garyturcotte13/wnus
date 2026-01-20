@@ -1,15 +1,15 @@
-# Windows Native Unix Shell (wnus) - Version 0.0.7.4
+# Windows Native Unix Shell (wnus) - Version 0.0.8.1
 
 A comprehensive Unix/Linux-like shell environment for Windows, implemented entirely in C++ without external dependencies. Windows Native Unix Shell brings the power and familiarity of bash commands to native Windows, with full NTFS support and Windows API integration.
 
 [![Platform](https://img.shields.io/badge/platform-Windows-blue.svg)](https://www.microsoft.com/windows)
 [![Build](https://img.shields.io/badge/build-passing-brightgreen.svg)](.)
-[![Version](https://img.shields.io/badge/version-0.0.7.4-orange.svg)](.)
+[![Version](https://img.shields.io/badge/version-0.0.8.1-orange.svg)](.)
 
 ## 🌟 Overview
 
 **Windows Native Unix Shell (wnus)** is a standalone bash-like console application for Windows that provides:
-- **154+ commands** with 140+ fully implemented and 14+ informational guides
+- **262+ commands** with 246+ fully implemented and 16+ informational guides
 - **Native Windows integration** using NTFS file system and Windows APIs
 - **No external dependencies** - no WSL, Git Bash, Cygwin, or other installations required
 - **Full bash compatibility** for common command-line workflows including I/O redirection and process control
@@ -18,7 +18,7 @@ A comprehensive Unix/Linux-like shell environment for Windows, implemented entir
 ## ✨ Key Features
 
 ### Core Capabilities
-- 🔧 **140+ Unix/Linux commands** implemented natively in C++
+- 🔧 **246+ Unix/Linux commands** implemented natively in C++
 - 📁 **Native NTFS support** with Windows ACL integration
 - 🔀 **Full pipe operations** (`|`) for command chaining
 - 🔗 **Command chaining** with `&&` (AND) and `||` (OR) operators
@@ -97,11 +97,37 @@ wnus.exe -c "ls -la"
 - `dd` - Low-level file copy
 - `file`, `blkid` - File/device information
 
-### Text Processing (15 commands)
+### Text Processing (21 commands)
 - `grep`, `egrep`, `sed`, `awk` - Pattern matching and text processing
 - `sort`, `cut`, `paste`, `uniq` - Text manipulation
 - `wc`, `tee`, `diff`, `patch` - Text utilities
-- `rev`, `printf`, `echo` - Text output
+- `cmp`, `sdiff`, `rev`, `printf`, `echo`, `yes`, `seq`, `jot`, `factor` - Text output and generators
+
+### Text Formatting & Analysis (18 commands)
+- `fmt` - Reformat paragraph text
+- `fold` - Wrap text to specified width
+- `pr` - Paginate text with headers
+- `lpr`, `lp` - Send jobs to printer (stubbed)
+- `expand` - Convert tabs to spaces
+- `unexpand` - Convert spaces to tabs
+- `od` - Octal/hexadecimal dump
+- `hexdump`, `hd` - Hex dump with ASCII
+- `strings` - Extract printable strings from binary files
+- `column` - Format output into columns
+- `comm` - Compare sorted files
+- `join` - Join lines on common field
+- `look` - Display lines beginning with string
+- `tsort` - Topological sort
+- `vis`, `unvis` - Display/reverse non-printable characters
+- `tac` - Print files with lines in reverse order
+
+### Encoding & Checksums (6 commands)
+- `base64` - Base64 encode/decode
+- `md5sum` - MD5 checksum
+- `sha1sum` - SHA1 checksum
+- `sha256sum` - SHA256 checksum
+- `cksum` - CRC checksum
+- `sum` - Checksum and block count
 
 ### File Search (4 commands)
 - `find` - Find files/directories
@@ -109,20 +135,23 @@ wnus.exe -c "ls -la"
 - `which` - Locate command in PATH
 - `file` - Determine file type
 
-### System Info (15 commands)
+### System Info (19 commands)
 - `df`, `du` - Disk usage
 - `uptime`, `uname`, `date` - System information
 - `cal`, `ncal` - Calendar display
 - `free`, `vmstat`, `iostat`, `mpstat` - System statistics
-- `hostname`, `neofetch`, `sysctl` - Host information and tunables
+- `hostname`, `hostid`, `arch`, `nproc`, `lsb_release` - Host identifiers
+- `neofetch`, `sysctl` - Host information and tunables
 
-### User & Group (18 commands)
+### User & Group (23 commands)
 - `whoami`, `who`, `w`, `last`, `id` - User information
 - `finger`, `user`, `groups` - User details
+- `logname`, `users` - Session user reporting
 - `passwd` - Password management
 - `useradd`, `userdel`, `usermod` - User administration
 - `groupadd`, `groupmod`, `groupdel` - Group administration
 - `gpasswd`, `getent` - Account management
+- `mesg`, `write`, `wall` - Local messaging controls
 
 ### Process Management (23 commands)
 - `ps`, `proc`, `htop`, `top` - Process viewing
@@ -133,12 +162,24 @@ wnus.exe -c "ls -la"
 - `strace`, `lsof` - Debugging (info guides)
 - `sleep`, `wait`, `timeout`, `nohup` - Delays and timed execution
 
-### Archives & Compression (10 commands)
+### Archives & Compression (11 commands)
 - `tar` - Archive management
 - `gzip/gunzip` - Gzip compression
 - `zip/unzip` - ZIP archives
 - `bzip2/bunzip2` - Bzip2 (info guides)
 - `dd` - Low-level copy
+- `make` - Build automation from Makefile
+
+### File Utilities (9 commands)
+- `cp` - Copy files and directories
+- `dirname` - Extract directory from pathname
+- `readlink` - Display symbolic link target
+- `realpath` - Print resolved absolute path
+- `mktemp` - Create temporary file/directory
+- `install` - Copy files and set attributes
+- `truncate` - Shrink or extend file size
+- `fallocate` - Preallocate file space
+- `pathchk` - Validate pathnames
 
 ### Network & Remote (20 commands)
 - `ssh`, `scp`, `rsync` - Remote access
@@ -155,11 +196,13 @@ Tip: For a quick FTP connectivity check, use `ftp -u anonymous -w anonymous@ tes
 - `shutdown`, `reboot` - Power management
 - `sync` - File system sync
 
-### Shell & Scripting (16 commands)
+### Shell & Scripting (21 commands)
 - `sh`, `source`, `exec` - Script execution
 - `echo`, `printf` - Output
 - `bc`, `calc`, `qalc` - Calculators
 - `xargs` - Argument processing
+- `true`, `false`, `tty`, `script`, `logger` - Shell utilities and logging
+- `xdg-open` - Open files/URLs with default application
 - `alias/unalias` - Command shortcuts
 - `history` - Command history
 - `umask` - File mode mask
@@ -347,7 +390,29 @@ Run as Administrator or use built-in `sudo` command.
 
 ## 🔄 Version History
 
-### v0.0.7.4 (Current)
+### v0.0.7.6 (Current)
+- Added 8 new utility commands:
+  - `cp` - Copy files and directories with -r/-f/-i/-v/-p flags
+  - `dirname` - Extract directory portion from pathnames
+  - `readlink` - Display symbolic link targets with -f flag
+  - `realpath` - Print resolved absolute file paths
+  - `mktemp` - Create temporary files/directories with random names
+  - `install` - Copy files and set attributes with -d/-m/-v flags
+  - `fmt` - Reformat paragraph text with -w flag
+  - `fold` - Wrap text to specified width with -s flag
+- Updated command count from 155 to 163 (149 fully implemented)
+- Full implementations with proper error handling and all standard flags
+
+### v0.0.7.5
+- Added internal `make` command for build automation from Makefile
+- Implemented full Makefile parser with dependency resolution and timestamp-based rebuilding
+- Added support for `-f`, `-C`, `-n`, and `-B` flags in make command
+- Added tilde (~) expansion for home directory shortcut in all path operations
+- Updated pwd command to display "~" when in home directory
+- Renamed project from garyscon to wnus (Windows Native Unix Shell)
+- Fixed command chaining to properly isolate redirection contexts between commands
+
+### v0.0.7.4
 - Added full I/O redirection support:
   - Output redirection with `>` (overwrite)
   - Append redirection with `>>` (append)
