@@ -474,8 +474,48 @@ std::string trim(const std::string& str) {
     return str.substr(start, end - start + 1);
 }
 
+std::string expandTildePath(const std::string& path) {
+    if (path.empty() || path[0] != '~') {
+        return path;
+    }
+    
+    // Get user's home directory from USERPROFILE environment variable
+    const char* home = std::getenv("USERPROFILE");
+    if (!home) {
+        // Fallback: try to build from HOMEDRIVE + HOMEPATH
+        const char* drive = std::getenv("HOMEDRIVE");
+        const char* homepath = std::getenv("HOMEPATH");
+        if (drive && homepath) {
+            std::string result = std::string(drive) + std::string(homepath);
+            if (path.length() > 1) {
+                // Append the rest of the path after ~
+                result += path.substr(1);
+            }
+            return result;
+        }
+        return path; // Return unchanged if no home directory found
+    }
+    
+    std::string homeDir = home;
+    
+    if (path.length() == 1) {
+        // Just ~ = home directory
+        return homeDir;
+    } else if (path[1] == '/' || path[1] == '\\') {
+        // ~/something = home/something
+        return homeDir + path.substr(1);
+    } else {
+        // ~something = not expanded (like ~username, which we don't support)
+        return path;
+    }
+}
+
 std::string unixPathToWindows(const std::string& path) {
-    std::string result = path;
+    // First expand tilde to home directory
+    std::string expanded = expandTildePath(path);
+    
+    // Then convert forward slashes to backslashes
+    std::string result = expanded;
     std::replace(result.begin(), result.end(), '/', '\\');
     return result;
 }
@@ -1316,7 +1356,19 @@ void cmd_pwd() {
     // No args needed, so just execute
     char cwd[MAX_PATH];
     if (_getcwd(cwd, sizeof(cwd)) != NULL) {
-        output(windowsPathToUnix(cwd));
+        std::string path = windowsPathToUnix(cwd);
+        
+        // Check if current directory is home directory
+        const char* home = std::getenv("USERPROFILE");
+        if (home) {
+            std::string homeDir = windowsPathToUnix(home);
+            if (path == homeDir) {
+                output("~");
+                return;
+            }
+        }
+        
+        output(path);
     } else {
         outputError("pwd: error getting current directory");
     }
