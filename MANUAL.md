@@ -1,5 +1,5 @@
 # Windows Native Unix Shell (wnus) User Manual
-## Version 0.0.8.2
+## Version 0.0.8.3
 
 ---
 
@@ -23,14 +23,14 @@
 
 ### What is Windows Native Unix Shell?
 
-Windows Native Unix Shell (wnus) is a comprehensive Unix/Linux-like command-line shell for Windows. It provides over 246 Unix/Linux commands implemented natively in C++,
+Windows Native Unix Shell (wnus) is a comprehensive Unix/Linux-like command-line shell for Windows. It provides over 250 Unix/Linux commands implemented natively in C++,
 allowing Windows users to enjoy the power and flexibility of Unix command-line tools without requiring WSL, Git Bash, Cygwin, or any other third-party installations.
 
 ### Key Benefits
 
 - **Native Windows Integration**: Full NTFS file system support with Windows ACL integration
 - **No Dependencies**: Single executable with no external requirements
-- **Comprehensive**: 262+ commands covering file operations, text processing, networking, and system administration
+- **Comprehensive**: 262+ commands covering file operations, text processing, networking, and system administration (250+ fully implemented, 12+ informational)
 - **Well Documented**: Every command includes `--help` text and full man pages
 - **Familiar Interface**: Bash-like syntax and behavior for easy adoption
 
@@ -38,7 +38,7 @@ allowing Windows users to enjoy the power and flexibility of Unix command-line t
 
 - **Operating System**: Windows 7 or later (Windows 10/11 recommended)
 - **Memory**: 15 MB RAM minimum, 32 MB recommended
-- **Disk Space**: 5-6 MB for executable
+- **Disk Space**: 5.2 MB for executable
 - **Privileges**: Standard user for most commands, Administrator for system operations
 
 ---
@@ -2836,20 +2836,19 @@ Code    Meaning
 | Pipes                | ✓            | ✓      | ✓          | ✓        | ✓      |
 | Tab Completion       | ✓            | ✓      | ✓          | ✓        | ✓      |
 | Shell Scripting      | ✓            | ✓      | ✓          | ✓        | ✓      |
-| File Size            | 4.4 MB       | Built-in| Built-in  | ~300 MB  | ~1 GB  |
+| File Size            | 5.2 MB       | Built-in| Built-in  | ~300 MB  | ~1 GB  |
 
 ### L. Version History
 
-**v0.0.7.1** (Current)
-- Added internal `read`, `rename`, `unlink`, `nohup`, `blkid`, `test`, and `egrep`
-- Enhanced shell scripting with input reading and conditional testing
-- Improved file operations with pattern-based renaming and unlinking
-- Added process immunity with nohup and block device attribute display
-
-**v0.0.7.0**
-- Added internal `pgrep`, `pidof`, `pstree`, `timeout`, `ftp`, `sftp`, and `sysctl`
-- Expanded process lookup/tree capabilities and timed command execution
-- Added connectivity probes for FTP/SSH/SFTP and sysctl-style system info
+**v0.0.8.3** (Current)
+- Enhanced messaging commands: `mesg` now persists per-user preferences, `write` and `wall` use Windows session messaging (WTSSendMessage)
+- Implemented full `watch` loop with `-n` interval, `-c` count, timing output, and interactive quit
+- Improved `tty` to check actual console attachment status and return proper exit codes
+- Upgraded `lpr`/`lp` from stubs to local spool directory queue (%TEMP%/wnus_spool)
+- Replaced placeholder MD5 hash with full RFC 1321-compatible implementation
+- Added `users` command using Windows Terminal Services session enumeration
+- Updated from 246 to 250+ fully implemented commands (reduced stubs from 16 to 12)
+- File size: 5.2 MB, optimized for messaging and session management
 
 **v0.0.8.2**
 - Implemented virtual root filesystem (wnus:/)

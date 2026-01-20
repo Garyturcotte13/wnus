@@ -12,6 +12,7 @@
 #include <psapi.h>
 #include <winternl.h>
 #include <bcrypt.h>
+#include <wtsapi32.h>
 #include <string>
 #include <vector>
 #include <sstream>
@@ -29,10 +30,14 @@
 #include <set>
 #include <queue>
 #include <filesystem>
+#include <conio.h>
+#include <cctype>
+#include <cstring>
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "bcrypt.lib")
+#pragma comment(lib, "wtsapi32.lib")
 
 // Reparse point structures for symbolic link handling
 typedef struct _REPARSE_DATA_BUFFER {
@@ -359,6 +364,9 @@ typedef BOOL(WINAPI* fnAllowDarkModeForWindow)(HWND hWnd, BOOL allow);
 typedef BOOL(WINAPI* fnShouldAppsUseDarkMode)();
 typedef void(WINAPI* fnFlushMenuThemes)();
 typedef void(WINAPI* fnRefreshImmersiveColorPolicyState)();
+
+// Forward declarations for helpers defined later
+bool createDirectoryRecursive(const std::string& path);
 
 // Undocumented menu messages for dark mode
 #define WM_UAHDRAWMENU 0x0091
@@ -2454,43 +2462,194 @@ void cmd_logname(const std::vector<std::string>& args) {
     }
 }
 
+// Messaging/session helpers (defined below)
+struct SessionEntry {
+    DWORD sessionId = 0;
+    std::string user;
+    std::string domain;
+    WTS_CONNECTSTATE_CLASS state = WTSActive;
+};
+std::vector<SessionEntry> enumerateSessions();
+bool isInteractiveSession(const SessionEntry& session);
+
 // users - list logged-in users (Windows: current user)
 void cmd_users(const std::vector<std::string>& args) {
     if (checkHelpFlag(args)) {
         output("Usage: users");
-        output("  Show users currently logged in (single session on Windows)");
+        output("  Show users currently logged in (all Windows sessions)");
         return;
     }
-    char name[256];
-    DWORD size = sizeof(name);
-    if (GetUserNameA(name, &size)) {
-        output(name);
-        g_lastExitStatus = 0;
-    } else {
-        outputError("users: unable to determine user name");
-        g_lastExitStatus = 1;
+
+    auto sessions = enumerateSessions();
+    std::set<std::string> names;
+    for (const auto& session : sessions) {
+        if (!isInteractiveSession(session)) continue;
+        if (!session.user.empty()) {
+            names.insert(session.user);
+        }
     }
+
+    if (names.empty()) {
+        char name[256];
+        DWORD size = sizeof(name);
+        if (GetUserNameA(name, &size)) {
+            output(name);
+            g_lastExitStatus = 0;
+        } else {
+            outputError("users: unable to determine user name");
+            g_lastExitStatus = 1;
+        }
+        return;
+    }
+
+    std::ostringstream oss;
+    bool first = true;
+    for (const auto& n : names) {
+        if (!first) oss << " ";
+        oss << n;
+        first = false;
+    }
+    output(oss.str());
+    g_lastExitStatus = 0;
+}
+
+std::string getCurrentUsername() {
+    char username[256];
+    DWORD usernameSize = sizeof(username);
+    if (GetUserNameA(username, &usernameSize)) {
+        return username;
+    }
+    return "";
+}
+
+std::string getMesgPreferenceDirectory() {
+    char path[MAX_PATH] = {0};
+    if (GetEnvironmentVariableA("ProgramData", path, sizeof(path))) {
+        std::string dir = std::string(path) + "\\wnus\\mesg";
+        createDirectoryRecursive(dir);
+        return dir;
+    }
+
+    GetTempPathA(MAX_PATH, path);
+    std::string dir = std::string(path) + "wnus_mesg";
+    createDirectoryRecursive(dir);
+    return dir;
+}
+
+std::string getMesgPreferenceFile(const std::string& user) {
+    return getMesgPreferenceDirectory() + "\\" + user + ".allow";
+}
+
+bool loadMesgPreference(const std::string& user) {
+    std::ifstream in(getMesgPreferenceFile(user));
+    if (!in.is_open()) return true;  // default allow
+
+    std::string line;
+    std::getline(in, line);
+    if (line.empty()) return true;
+    char c = (char)tolower(line[0]);
+    return !(c == 'n' || c == '0');
+}
+
+void saveMesgPreference(const std::string& user, bool allow) {
+    std::ofstream out(getMesgPreferenceFile(user), std::ios::trunc);
+    if (out.is_open()) {
+        out << (allow ? 'y' : 'n');
+    }
+}
+
+std::vector<SessionEntry> enumerateSessions() {
+    std::vector<SessionEntry> sessions;
+    PWTS_SESSION_INFOA pSessionInfo = nullptr;
+    DWORD count = 0;
+
+    if (WTSEnumerateSessionsA(WTS_CURRENT_SERVER_HANDLE, 0, 1, &pSessionInfo, &count)) {
+        for (DWORD i = 0; i < count; ++i) {
+            SessionEntry entry;
+            entry.sessionId = pSessionInfo[i].SessionId;
+            entry.state = pSessionInfo[i].State;
+
+            LPSTR buffer = nullptr;
+            DWORD bytesReturned = 0;
+
+            if (WTSQuerySessionInformationA(WTS_CURRENT_SERVER_HANDLE, entry.sessionId, WTSUserName, &buffer, &bytesReturned) && buffer) {
+                entry.user = buffer;
+                WTSFreeMemory(buffer);
+            }
+
+            buffer = nullptr;
+            bytesReturned = 0;
+            if (WTSQuerySessionInformationA(WTS_CURRENT_SERVER_HANDLE, entry.sessionId, WTSDomainName, &buffer, &bytesReturned) && buffer) {
+                entry.domain = buffer;
+                WTSFreeMemory(buffer);
+            }
+
+            if (!entry.user.empty()) {
+                sessions.push_back(entry);
+            }
+        }
+        WTSFreeMemory(pSessionInfo);
+    }
+
+    return sessions;
+}
+
+bool isUserMessagingAllowed(const std::string& user) {
+    if (user.empty()) return false;
+    return loadMesgPreference(user);
+}
+
+bool sendMessageToSession(const SessionEntry& session, const std::string& title, const std::string& body, DWORD timeoutMs = 5000, bool waitResponse = false) {
+    DWORD response = 0;
+    return WTSSendMessageA(WTS_CURRENT_SERVER_HANDLE,
+                           session.sessionId,
+                           (LPSTR)title.c_str(),
+                           (DWORD)title.size(),
+                           (LPSTR)body.c_str(),
+                           (DWORD)body.size(),
+                           MB_OK | MB_ICONINFORMATION,
+                           timeoutMs,
+                           &response,
+                           waitResponse) == TRUE;
+}
+
+bool isInteractiveSession(const SessionEntry& session) {
+    return session.state == WTSActive || session.state == WTSConnected;
 }
 
 // mesg - allow/deny write(1)
 void cmd_mesg(const std::vector<std::string>& args) {
     if (checkHelpFlag(args)) {
         output("Usage: mesg [y|n]");
-        output("  Control write/wall permission (local stub)");
+        output("  Control write/wall permission for your session (persists)");
         return;
     }
+
+    std::string currentUser = getCurrentUsername();
+    if (currentUser.empty()) {
+        outputError("mesg: unable to determine current user");
+        g_lastExitStatus = 1;
+        return;
+    }
+
+    // Refresh state from disk before showing/updating
+    g_mesgAllowed = loadMesgPreference(currentUser);
+
     if (args.size() == 1) {
         output(std::string("is ") + (g_mesgAllowed ? "y" : "n"));
         g_lastExitStatus = 0;
         return;
     }
+
     std::string val = args[1];
     if (val == "y" || val == "yes" || val == "Y") {
         g_mesgAllowed = true;
+        saveMesgPreference(currentUser, true);
         output("write access allowed");
         g_lastExitStatus = 0;
     } else if (val == "n" || val == "no" || val == "N") {
         g_mesgAllowed = false;
+        saveMesgPreference(currentUser, false);
         output("write access denied");
         g_lastExitStatus = 0;
     } else {
@@ -2499,49 +2658,133 @@ void cmd_mesg(const std::vector<std::string>& args) {
     }
 }
 
-// write - send a message (local stub)
+// write - send a message to a user using Windows session messaging
 void cmd_write(const std::vector<std::string>& args) {
     if (checkHelpFlag(args)) {
         output("Usage: write <user> <message>");
-        output("  Send a short message to a user (local stub)");
+        output("  Send a short message to a user (Windows session message box)");
         return;
     }
-    if (!g_mesgAllowed) {
-        outputError("write: messaging is disabled (mesg n)");
-        g_lastExitStatus = 1;
-        return;
-    }
+
     if (args.size() < 3) {
         outputError("write: missing message");
         g_lastExitStatus = 1;
         return;
     }
-    std::string user = args[1];
+
+    std::string targetUser = args[1];
     std::string message = joinArgs(args, 2, " ");
-    output("Message to " + user + " (local delivery): " + message);
-    g_lastExitStatus = 0;
+
+    auto sessions = enumerateSessions();
+    std::vector<SessionEntry> targets;
+    for (const auto& session : sessions) {
+        if (!isInteractiveSession(session)) continue;
+        if (toLower(session.user) == toLower(targetUser) && isUserMessagingAllowed(session.user)) {
+            targets.push_back(session);
+        }
+    }
+
+    if (targets.empty()) {
+        outputError("write: user not logged in or messaging disabled");
+        g_lastExitStatus = 1;
+        return;
+    }
+
+    std::string sender = getCurrentUsername();
+    if (sender.empty()) sender = "unknown";
+
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    char timestamp[64];
+    snprintf(timestamp, sizeof(timestamp), "%04d-%02d-%02d %02d:%02d:%02d",
+             st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+
+    std::string title = "write from " + sender;
+    std::string body = "From: " + sender + "\nTo: " + targetUser + "\nTime: " + timestamp + "\n\n" + message;
+
+    int delivered = 0;
+    for (const auto& target : targets) {
+        if (sendMessageToSession(target, title, body, 8000, true)) {
+            delivered++;
+        }
+    }
+
+    if (delivered == 0) {
+        outputError("write: failed to deliver message");
+        g_lastExitStatus = 1;
+    } else {
+        output("write: delivered to " + std::to_string(delivered) + " session(s)");
+        g_lastExitStatus = 0;
+    }
 }
 
 // wall - broadcast message
 void cmd_wall(const std::vector<std::string>& args) {
     if (checkHelpFlag(args)) {
         output("Usage: wall <message>");
-        output("  Broadcast a message to all users (local stub)");
+        output("  Broadcast a message to all users (Windows session message box)");
         return;
     }
-    if (!g_mesgAllowed) {
-        outputError("wall: messaging is disabled (mesg n)");
-        g_lastExitStatus = 1;
-        return;
-    }
+
     if (args.size() < 2) {
         outputError("wall: missing message");
         g_lastExitStatus = 1;
         return;
     }
+
     std::string message = joinArgs(args, 1, " ");
-    output("Broadcast message: " + message);
-    g_lastExitStatus = 0;
+    auto sessions = enumerateSessions();
+
+    if (sessions.empty()) {
+        outputError("wall: no active sessions detected");
+        g_lastExitStatus = 1;
+        return;
+    }
+
+    std::string sender = getCurrentUsername();
+    if (sender.empty()) sender = "wnus";
+    char computer[MAX_COMPUTERNAME_LENGTH + 1] = {0};
+    DWORD compSize = MAX_COMPUTERNAME_LENGTH + 1;
+    if (!GetComputerNameA(computer, &compSize)) {
+        strcpy_s(computer, "localhost");
+    }
+
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    char timestamp[64];
+    snprintf(timestamp, sizeof(timestamp), "%04d-%02d-%02d %02d:%02d:%02d",
+             st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+
+    std::string title = "wall from " + sender + "@" + computer;
+    std::string body = "Broadcast from " + sender + "@" + computer + " at " + timestamp + "\n\n" + message;
+
+    int delivered = 0;
+    int skipped = 0;
+    for (const auto& session : sessions) {
+        if (!isInteractiveSession(session)) continue;
+        if (!isUserMessagingAllowed(session.user)) {
+            skipped++;
+            continue;
+        }
+        if (sendMessageToSession(session, title, body, 8000, false)) {
+            delivered++;
+        } else {
+            skipped++;
+        }
+    }
+
+    if (delivered == 0) {
+        outputError("wall: failed to deliver message");
+        g_lastExitStatus = 1;
+    } else {
+        std::ostringstream oss;
+        oss << "wall: delivered to " << delivered << " session(s)";
+        if (skipped > 0) {
+            oss << "; skipped " << skipped << " (mesg n or unreachable)";
+        }
+        output(oss.str());
+        g_lastExitStatus = 0;
+    }
 }
 
 // pathchk - validate path names
@@ -2610,14 +2853,20 @@ void cmd_tty(const std::vector<std::string>& args) {
         if (args[i] == "-s") silent = true;
         else if (checkHelpFlag(args)) {
             output("Usage: tty [-s]");
-            output("  Print the file name of the terminal");
+            output("  Print the file name of the terminal or report not a tty");
+            return;
+        } else {
+            outputError("tty: invalid option " + args[i]);
+            g_lastExitStatus = 1;
             return;
         }
     }
+
+    bool isTty = _isatty(_fileno(stdout)) != 0;
     if (!silent) {
-        output("/dev/tty");
+        output(isTty ? "/dev/tty" : "not a tty");
     }
-    g_lastExitStatus = 0;
+    g_lastExitStatus = isTty ? 0 : 1;
 }
 
 // script helpers
@@ -6372,7 +6621,156 @@ void cmd_base64(const std::vector<std::string>& args) {
     }
 }
 
-// MD5 hash implementation
+// MD5 hash implementation (RFC 1321 compatible)
+struct MD5State {
+    uint32_t a = 0x67452301;
+    uint32_t b = 0xefcdab89;
+    uint32_t c = 0x98badcfe;
+    uint32_t d = 0x10325476;
+    uint64_t bits = 0;       // message length in bits
+    uint8_t buffer[64] = {0};
+    size_t bufferLen = 0;
+};
+
+uint32_t md5LeftRotate(uint32_t x, uint32_t c) {
+    return (x << c) | (x >> (32 - c));
+}
+
+void md5ProcessBlock(MD5State& state, const uint8_t block[64]) {
+    uint32_t M[16];
+    for (int i = 0; i < 16; ++i) {
+        M[i] = (uint32_t)block[i * 4] |
+               ((uint32_t)block[i * 4 + 1] << 8) |
+               ((uint32_t)block[i * 4 + 2] << 16) |
+               ((uint32_t)block[i * 4 + 3] << 24);
+    }
+
+    uint32_t A = state.a;
+    uint32_t B = state.b;
+    uint32_t C = state.c;
+    uint32_t D = state.d;
+
+    static const uint32_t s[] = {
+        7, 12, 17, 22,  7, 12, 17, 22,  7, 12, 17, 22,  7, 12, 17, 22,
+        5,  9, 14, 20,  5,  9, 14, 20,  5,  9, 14, 20,  5,  9, 14, 20,
+        4, 11, 16, 23,  4, 11, 16, 23,  4, 11, 16, 23,  4, 11, 16, 23,
+        6, 10, 15, 21,  6, 10, 15, 21,  6, 10, 15, 21,  6, 10, 15, 21
+    };
+
+    static const uint32_t K[] = {
+        0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee,
+        0xf57c0faf, 0x4787c62a, 0xa8304613, 0xfd469501,
+        0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be,
+        0x6b901122, 0xfd987193, 0xa679438e, 0x49b40821,
+        0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa,
+        0xd62f105d,  0x2441453, 0xd8a1e681, 0xe7d3fbc8,
+        0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed,
+        0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a,
+        0xfffa3942, 0x8771f681, 0x6d9d6122, 0xfde5380c,
+        0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70,
+        0x289b7ec6, 0xeaa127fa, 0xd4ef3085,  0x4881d05,
+        0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665,
+        0xf4292244, 0x432aff97, 0xab9423a7, 0xfc93a039,
+        0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1,
+        0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1,
+        0xf7537e82, 0xbd3af235, 0x2ad7d2bb, 0xeb86d391
+    };
+
+    for (uint32_t i = 0; i < 64; ++i) {
+        uint32_t F = 0;
+        uint32_t g = 0;
+
+        if (i < 16) {
+            F = (B & C) | (~B & D);
+            g = i;
+        } else if (i < 32) {
+            F = (D & B) | (~D & C);
+            g = (5 * i + 1) % 16;
+        } else if (i < 48) {
+            F = B ^ C ^ D;
+            g = (3 * i + 5) % 16;
+        } else {
+            F = C ^ (B | ~D);
+            g = (7 * i) % 16;
+        }
+
+        uint32_t temp = D;
+        D = C;
+        C = B;
+        uint32_t rotateInput = A + F + K[i] + M[g];
+        B = B + md5LeftRotate(rotateInput, s[i]);
+        A = temp;
+    }
+
+    state.a += A;
+    state.b += B;
+    state.c += C;
+    state.d += D;
+}
+
+void md5Apply(MD5State& state, const uint8_t* data, size_t len) {
+    size_t offset = 0;
+    while (len > 0) {
+        size_t copyLen = std::min(len, (size_t)(64 - state.bufferLen));
+        memcpy(state.buffer + state.bufferLen, data + offset, copyLen);
+        state.bufferLen += copyLen;
+        offset += copyLen;
+        len -= copyLen;
+
+        if (state.bufferLen == 64) {
+            md5ProcessBlock(state, state.buffer);
+            state.bufferLen = 0;
+        }
+    }
+}
+
+void md5Update(MD5State& state, const uint8_t* data, size_t len) {
+    state.bits += (uint64_t)len * 8;
+    md5Apply(state, data, len);
+}
+
+std::string md5Finalize(MD5State& state) {
+    // Padding: 0x80 followed by zeros to reach 56 bytes mod 64
+    uint8_t padStart = 0x80;
+    md5Apply(state, &padStart, 1);
+
+    uint8_t zeros[64] = {0};
+    size_t padZeros = (state.bufferLen <= 56) ? (56 - state.bufferLen) : (64 + 56 - state.bufferLen);
+    if (padZeros > 0) {
+        md5Apply(state, zeros, padZeros);
+    }
+
+    // Append original length (little-endian)
+    uint8_t lengthBytes[8];
+    for (int i = 0; i < 8; ++i) {
+        lengthBytes[i] = (uint8_t)((state.bits >> (8 * i)) & 0xFF);
+    }
+    md5Apply(state, lengthBytes, 8);
+
+    std::ostringstream oss;
+    oss << std::hex << std::setfill('0');
+    uint32_t digestParts[4] = {state.a, state.b, state.c, state.d};
+    for (uint32_t part : digestParts) {
+        for (int i = 0; i < 4; ++i) {
+            oss << std::setw(2) << ((part >> (8 * i)) & 0xFF);
+        }
+    }
+    return oss.str();
+}
+
+std::string md5HashStream(std::istream& in) {
+    MD5State state;
+    std::vector<char> buffer(4096);
+    while (in.good()) {
+        in.read(buffer.data(), buffer.size());
+        std::streamsize readBytes = in.gcount();
+        if (readBytes > 0) {
+            md5Update(state, reinterpret_cast<uint8_t*>(buffer.data()), (size_t)readBytes);
+        }
+    }
+    return md5Finalize(state);
+}
+
 void cmd_md5sum(const std::vector<std::string>& args) {
     if (checkHelpFlag(args) || args.size() < 2) {
         output("Usage: md5sum [file...]");
@@ -6383,29 +6781,17 @@ void cmd_md5sum(const std::vector<std::string>& args) {
         output("  md5sum file1.txt file2.txt");
         return;
     }
-    
-    // Simple MD5 implementation (simplified for demonstration)
-    auto md5 = [](const std::string& input) -> std::string {
-        // This is a placeholder - real MD5 would be more complex
-        unsigned long hash = 0;
-        for (char c : input) {
-            hash = hash * 31 + c;
-        }
-        char buf[33];
-        sprintf(buf, "%032lx", hash);
-        return std::string(buf);
-    };
-    
+
     for (size_t i = 1; i < args.size(); i++) {
-        std::ifstream file(args[i], std::ios::binary);
+        std::ifstream file(unixPathToWindows(args[i]), std::ios::binary);
         if (!file.is_open()) {
             outputError("md5sum: cannot open '" + args[i] + "'");
             continue;
         }
-        std::string content((std::istreambuf_iterator<char>(file)),
-                           std::istreambuf_iterator<char>());
-        output(md5(content) + "  " + args[i]);
+        std::string digest = md5HashStream(file);
+        output(digest + "  " + args[i]);
     }
+    g_lastExitStatus = 0;
 }
 
 // SHA1 hash implementation
@@ -6776,23 +7162,68 @@ void cmd_pr(const std::vector<std::string>& args) {
     }
 }
 
-// lpr - stub printer command
+// lpr - queue files to a local spool directory
 void cmd_lpr(const std::vector<std::string>& args) {
     if (checkHelpFlag(args)) {
         output("Usage: lpr [FILE]...");
-        output("  Send files to printer (stub)");
-        output("  Note: Printing is not available; content is not spooled");
+        output("  Queue files into %TEMP%/wnus_spool for printing or archiving");
+        output("  Creates a printable job file with metadata for each input file.");
         return;
     }
-    
+
     if (args.size() < 2) {
-        output("lpr: no files specified; printing is not available in this environment");
+        outputError("lpr: missing file operand");
+        g_lastExitStatus = 1;
         return;
     }
-    
+
+    char tempPath[MAX_PATH];
+    GetTempPathA(MAX_PATH, tempPath);
+    std::string spoolDir = std::string(tempPath) + "wnus_spool";
+    createDirectoryRecursive(spoolDir);
+
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    char timestamp[64];
+    snprintf(timestamp, sizeof(timestamp), "%04d%02d%02d_%02d%02d%02d",
+             st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+
+    int queued = 0;
+
     for (size_t i = 1; i < args.size(); ++i) {
-        output("lpr: print simulation for '" + args[i] + "'");
+        std::string sourcePath = unixPathToWindows(args[i]);
+        std::ifstream in(sourcePath, std::ios::binary);
+        if (!in.is_open()) {
+            outputError("lpr: cannot open '" + args[i] + "'");
+            continue;
+        }
+
+        std::ostringstream jobName;
+        jobName << "job_" << timestamp << "_" << GetTickCount() << "_" << i << ".txt";
+        std::string outPath = spoolDir + "\\" + jobName.str();
+
+        std::ofstream out(outPath, std::ios::binary);
+        if (!out.is_open()) {
+            outputError("lpr: cannot create spool file for '" + args[i] + "'");
+            continue;
+        }
+
+        out << "=== wnus lpr job ===\n";
+        out << "Created: " << timestamp << "\n";
+        out << "Source: " << args[i] << "\n";
+        out << "Spool:  " << outPath << "\n";
+        out << "--------------------\n";
+        out << in.rdbuf();
+        out << "\n=== end of job ===\n";
+        out.close();
+        queued++;
+
+        std::ostringstream msg;
+        msg << "lpr: queued '" << args[i] << "' -> " << windowsPathToUnix(outPath);
+        output(msg.str());
     }
+
+    g_lastExitStatus = queued > 0 ? 0 : 1;
 }
 
 // lp - alias to lpr stub
@@ -13865,22 +14296,20 @@ void cmd_man(const std::vector<std::string>& args) {
         output("    watch - execute command repeatedly");
         output("");
         output("SYNOPSIS");
-        output("    watch [-n seconds] <command>");
+        output("    watch [-n seconds] [-c count] <command>");
         output("");
         output("DESCRIPTION");
         output("    Executes command repeatedly at specified intervals (default: 2 seconds).");
-        output("    Note: Full loop not implemented; executes once with timing info.");
+        output("    Stop early by pressing 'q' while watch is running.");
         output("");
         output("OPTIONS");
         output("    -n <seconds>   Interval in seconds (default: 2)");
+        output("    -c <count>     Number of iterations before stopping");
         output("");
         output("EXAMPLES");
         output("    watch -n 5 date");
+        output("    watch -n 1 -c 3 ipconfig");
         output("    watch ls -la");
-        output("");
-        output("NOTE");
-        output("    For continuous watching, use PowerShell:");
-        output("    while($true) { cls; <command>; sleep <interval> }");
         output("");
         output("SEE ALSO");
         output("    time, sleep");
@@ -14768,7 +15197,7 @@ void cmd_man(const std::vector<std::string>& args) {
         output("    users");
         output("");
         output("DESCRIPTION");
-        output("    Shows users logged into the current system session (Windows stub).");
+        output("    Lists unique users with active Windows sessions.");
 
     } else if (cmd == "mesg") {
         output("NAME");
@@ -14778,7 +15207,7 @@ void cmd_man(const std::vector<std::string>& args) {
         output("    mesg [y|n]");
         output("");
         output("DESCRIPTION");
-        output("    Enables (y) or disables (n) receiving write/wall messages.");
+        output("    Enables (y) or disables (n) receiving write/wall messages (persistent).");
 
     } else if (cmd == "write") {
         output("NAME");
@@ -14788,7 +15217,7 @@ void cmd_man(const std::vector<std::string>& args) {
         output("    write USER MESSAGE");
         output("");
         output("DESCRIPTION");
-        output("    Sends MESSAGE to USER (local stub implementation).");
+        output("    Sends MESSAGE to USER via Windows session message box (respects mesg). ");
 
     } else if (cmd == "wall") {
         output("NAME");
@@ -14798,7 +15227,7 @@ void cmd_man(const std::vector<std::string>& args) {
         output("    wall MESSAGE");
         output("");
         output("DESCRIPTION");
-        output("    Broadcasts MESSAGE to all users (local stub implementation).");
+        output("    Broadcasts MESSAGE to all interactive sessions (respects mesg). ");
 
     } else if (cmd == "pathchk") {
         output("NAME");
@@ -14838,7 +15267,7 @@ void cmd_man(const std::vector<std::string>& args) {
         output("    tty [-s]");
         output("");
         output("DESCRIPTION");
-        output("    Prints /dev/tty (stub). -s suppresses output.");
+        output("    Prints /dev/tty when attached to a console; exits 1 if not a tty.");
 
     } else if (cmd == "script") {
         output("NAME");
@@ -18454,7 +18883,7 @@ void cmd_version(const std::vector<std::string>& args) {
     }
     
     output("╔════════════════════════════════════════════════════════════════╗");
-    output("║      Windows Native Unix Shell (wnus) version 0.0.8.2          ║");
+    output("║      Windows Native Unix Shell (wnus) version 0.0.8.3          ║");
     output("║     A Comprehensive Bash-like Console for Windows (NTFS)       ║");
     output("╚════════════════════════════════════════════════════════════════╝");
     output("");
@@ -18464,7 +18893,7 @@ void cmd_version(const std::vector<std::string>& args) {
     output("═══════════════════════════════════════════════════════════════════");
     output("CORE FEATURES:");
     output("═══════════════════════════════════════════════════════════════════");
-    output("  ✓ 262+ commands (246+ fully implemented, 16+ informational/guides)");
+    output("  ✓ 262+ commands (250+ fully implemented, 12+ informational/guides)");
     output("  ✓ Native Windows NTFS file system support");
     output("  ✓ Full pipe operation support (|)");
     output("  ✓ Interactive tab completion");
@@ -23892,53 +24321,102 @@ void cmd_time(const std::vector<std::string>& args) {
 // watch command - execute command repeatedly
 void cmd_watch(const std::vector<std::string>& args) {
     if (checkHelpFlag(args) || args.size() < 2) {
-        output("Usage: watch [-n seconds] <command>");
+        output("Usage: watch [-n seconds] [-c count] <command>");
         output("  Execute command repeatedly at intervals");
         output("");
         output("OPTIONS");
         output("  -n <seconds>   Interval in seconds (default: 2)");
+        output("  -c <count>     Number of iterations before stopping (default: infinite)");
         output("");
         output("EXAMPLES");
         output("  watch -n 5 date");
+        output("  watch -n 1 -c 3 ipconfig");
         output("  watch ls -la");
         output("");
         output("NOTE");
-        output("  Press Ctrl+C to stop watching (not fully supported in this shell)");
-        output("  For now, watch executes the command once with timing info");
+        output("  Press 'q' to stop early. Ctrl+C will also stop watch and shell.");
         return;
     }
-    
+
     int interval = 2;
+    int iterations = -1; // infinite by default
     size_t cmdStart = 1;
-    
+
     // Parse options
-    if (args.size() >= 3 && args[1] == "-n") {
-        interval = std::atoi(args[2].c_str());
-        if (interval <= 0) interval = 2;
-        cmdStart = 3;
+    size_t i = 1;
+    while (i < args.size()) {
+        if (args[i] == "-n" && i + 1 < args.size()) {
+            interval = std::max(1, std::atoi(args[i + 1].c_str()));
+            i += 2;
+        } else if ((args[i] == "-c" || args[i] == "--count") && i + 1 < args.size()) {
+            iterations = std::atoi(args[i + 1].c_str());
+            if (iterations <= 0) iterations = 1;
+            i += 2;
+        } else {
+            cmdStart = i;
+            break;
+        }
     }
-    
+
     if (cmdStart >= args.size()) {
         outputError("watch: no command specified");
         return;
     }
-    
+
     // Build command string
     std::string cmdStr;
-    for (size_t i = cmdStart; i < args.size(); ++i) {
-        if (i > cmdStart) cmdStr += " ";
-        cmdStr += args[i];
+    for (size_t j = cmdStart; j < args.size(); ++j) {
+        if (j > cmdStart) cmdStr += " ";
+        cmdStr += args[j];
     }
-    
+
     output("Every " + std::to_string(interval) + "s: " + cmdStr);
-    output("");
-    
-    // For now, execute once (full watch loop would require background thread)
-    executeCommand(cmdStr);
-    
-    output("");
-    output("NOTE: Full watch loop not implemented in this shell version");
-    output("Use PowerShell: while($true) { cls; <cmd>; sleep " + std::to_string(interval) + " }");
+    output("(press 'q' to stop)");
+
+    int executed = 0;
+    bool aborted = false;
+
+    while (iterations < 0 || executed < iterations) {
+        executed++;
+
+        output("");
+        output("--- watch iteration " + std::to_string(executed) + " ---");
+
+        auto start = std::chrono::steady_clock::now();
+        executeCommand(cmdStr);
+        auto end = std::chrono::steady_clock::now();
+        auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+
+        std::ostringstream timing;
+        timing << "(duration: " << std::fixed << std::setprecision(3) << (elapsedMs / 1000.0) << "s)";
+        output(timing.str());
+
+        if (iterations > 0 && executed >= iterations) {
+            break;
+        }
+
+        int waitMs = std::max(1, interval) * 1000;
+        int waited = 0;
+        while (waited < waitMs) {
+            Sleep(100);
+            waited += 100;
+            if (_kbhit()) {
+                int ch = _getch();
+                if (ch == 'q' || ch == 'Q' || ch == 3) { // 'q' or Ctrl+C
+                    aborted = true;
+                    break;
+                }
+            }
+        }
+
+        if (aborted) {
+            break;
+        }
+    }
+
+    if (aborted) {
+        output("watch: stopped by user");
+    }
 }
 
 // trap command - set signal handlers (stub)
@@ -24515,8 +24993,8 @@ void cmd_whatis(const std::vector<std::string>& args) {
         {"cmp", "cmp - compare two files byte by byte"},
         {"sdiff", "sdiff - side-by-side file comparison"},
         {"pr", "pr - paginate text with headers"},
-        {"lpr", "lpr - send files to printer (stub)"},
-        {"lp", "lp - send files to printer (stub)"},
+        {"lpr", "lpr - queue files into local spool directory"},
+        {"lp", "lp - queue files into local spool directory"},
         {"arch", "arch - display machine architecture"},
         {"nproc", "nproc - show number of processing units"},
         {"lsb_release", "lsb_release - show distribution information"},
@@ -29534,7 +30012,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             g_originalEditProc = (WNDPROC)SetWindowLongPtr(g_hOutput, GWLP_WNDPROC, (LONG_PTR)EditSubclassProc);
             
             // Welcome message
-            output("Windows Native Unix Shell (wnus) v0.0.8.2 - Native Unix Environment for Windows");
+            output("Windows Native Unix Shell (wnus) v0.0.8.3 - Native Unix Environment for Windows");
             output("Type 'help' for available commands");
             output("Type 'version' for more information");
             output("Type 'exit' or 'quit' to close");
@@ -29914,6 +30392,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     // Initialize Winsock for network operations (ping, ip, ssh, etc.)
     WSADATA wsaData;
     WSAStartup(MAKEWORD(2, 2), &wsaData);
+
+    // Load persisted mesg preference for current user
+    std::string startupUser = getCurrentUsername();
+    if (!startupUser.empty()) {
+        g_mesgAllowed = loadMesgPreference(startupUser);
+    }
     
     // Parse command line arguments first to check for -c flag
     std::string cmdLine = lpCmdLine;
@@ -29981,7 +30465,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     g_hWnd = CreateWindowExA(
         0,
         CLASS_NAME,
-        "Windows Native Unix Shell (wnus) v0.0.8.2",
+        "Windows Native Unix Shell (wnus) v0.0.8.3",
         WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT, CW_USEDEFAULT, 800, 600,
         NULL, NULL, hInstance, NULL

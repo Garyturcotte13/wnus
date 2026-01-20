@@ -1,15 +1,15 @@
-# Windows Native Unix Shell (wnus) - Version 0.0.8.2
+# Windows Native Unix Shell (wnus) - Version 0.0.8.3
 
 A comprehensive Unix/Linux-like shell environment for Windows, implemented entirely in C++ without external dependencies. Windows Native Unix Shell brings the power and familiarity of bash commands to native Windows, with full NTFS support and Windows API integration.
 
 [![Platform](https://img.shields.io/badge/platform-Windows-blue.svg)](https://www.microsoft.com/windows)
 [![Build](https://img.shields.io/badge/build-passing-brightgreen.svg)](.)
-[![Version](https://img.shields.io/badge/version-0.0.8.2-orange.svg)](.)
+[![Version](https://img.shields.io/badge/version-0.0.8.3-orange.svg)](.)
 
 ## 🌟 Overview
 
 **Windows Native Unix Shell (wnus)** is a standalone bash-like console application for Windows that provides:
-- **262+ commands** with 246+ fully implemented and 16+ informational guides
+- **262+ commands** with 250+ fully implemented and 12+ informational guides
 - **Native Windows integration** using NTFS file system and Windows APIs
 - **No external dependencies** - no WSL, Git Bash, Cygwin, or other installations required
 - **Full bash compatibility** for common command-line workflows including I/O redirection and process control
@@ -18,7 +18,7 @@ A comprehensive Unix/Linux-like shell environment for Windows, implemented entir
 ## ✨ Key Features
 
 ### Core Capabilities
-- 🔧 **246+ Unix/Linux commands** implemented natively in C++
+- 🔧 **250+ Unix/Linux commands** implemented natively in C++
 - 📁 **Native NTFS support** with Windows ACL integration
 - �️ **Virtual root filesystem** (wnus:/) with unified drive access via /C, /D, etc.
 - �🔀 **Full pipe operations** (`|`) for command chaining
@@ -48,7 +48,7 @@ A comprehensive Unix/Linux-like shell environment for Windows, implemented entir
 ### Prerequisites
 - Windows 7 or later (Windows 10/11 recommended)
 - C++ compiler (MSVC, MinGW, or Clang)
-- ~5 MB disk space for executable
+- ~5.2 MB disk space for executable
 - ~15 MB RAM minimum for typical usage
 
 ### Building

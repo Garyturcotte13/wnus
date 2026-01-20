@@ -25,7 +25,7 @@ if (-not (Test-Path $sourceFile)) {
 # Compile with g++
 Write-Host "Compiling $sourceFile..." -ForegroundColor Green
 try {
-    g++ $sourceFile -o $outputFile -static -std=c++11 -O2 -mwindows -ldwmapi -luxtheme -lshlwapi -lws2_32 -liphlpapi -lbcrypt -lpsapi
+    g++ $sourceFile -o $outputFile -static -std=c++11 -O2 -mwindows -ldwmapi -luxtheme -lshlwapi -lws2_32 -liphlpapi -lbcrypt -lpsapi -lwtsapi32
     
     if ($LASTEXITCODE -eq 0) {
         Write-Host "Build successful!" -ForegroundColor Green
