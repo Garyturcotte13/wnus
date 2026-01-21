@@ -43180,6 +43180,10 @@ LRESULT CALLBACK EditSubclassProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lP
             SendMessage(hwnd, EM_SETSEL, g_promptStart, g_promptStart);
             return 0;
         }
+    } else if (uMsg == WM_CHAR) {
+        // Prevent default processing for keys we handle in WM_KEYDOWN
+        if (wParam == VK_TAB) return 0;
+        if (wParam == VK_RETURN) return 0;
     }
     
     // Call original window procedure
