@@ -8,5 +8,5 @@ add_executable(wnus wnus.cpp)
 
 # Link against necessary Windows libraries
 if(WIN32)
-    target_link_libraries(wnus)
+    target_link_libraries(wnus netapi32 dnsapi advapi32)
 endif()
