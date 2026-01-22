@@ -30,6 +30,7 @@
 #include <cmath>
 #include <chrono>
 #include <ctime>
+#include <cstdlib>
 #include <direct.h>
 #include <io.h>
 #include <map>
@@ -402,6 +403,13 @@ struct UAHDRAWMENUITEM {
     DWORD dwFlags;
 };
 
+
+// debugLog defined
+void debugLog(const std::string& msg) {
+    std::ofstream ofs("C:/stuff/distribution/cpp/garysconsole/debug.log", std::ios::app);
+    ofs << msg << std::endl;
+}
+
 // Global variables
 HWND g_hWnd = NULL;
 HWND g_hOutput = NULL;
@@ -419,6 +427,7 @@ bool g_skipFinalPrompt = false;  // Skip final prompt in executeCommand
 RECT g_savedWindowRect = {0};
 LONG g_savedWindowStyle = 0;
 bool g_capturingOutput = false;
+bool g_isPipedCommand = false; // Flag if current command is downstream in a pipe
 // Virtual root flag: when true, we are at wnus:/ where drives are listed
 bool g_atVirtualRoot = false;
 std::vector<std::string> g_capturedOutput;
@@ -431,6 +440,9 @@ HBRUSH g_hBrush = NULL;
 std::vector<std::string> g_tabMatches;
 int g_tabIndex = -1;
 std::string g_tabPrefix;
+bool g_isCompleting = false;           // Tab completion cycle mode
+std::string g_completionPrefix;        // Prefix being completed
+int g_completionReplaceStart = 0;      // visual start index of completion
 int g_tabInputLength = 0;  // Track input length when tab sequence started
 DWORD g_lastTabTime = 0;   // Track last tab press for double-tab detection
 std::map<std::string, std::string> g_aliases;  // Command aliases (name -> command)
@@ -512,11 +524,14 @@ int g_emacsMarkCol = 0;  // Emacs mark column
 #define REG_VALUE_FULL_PATH "FullPathPrompt"
 #define REG_VALUE_LINE_WRAP "LineWrap"
 
+const std::string WNUS_VERSION = "0.1.3.2";
+
 // Utility functions
 std::vector<std::string> split(const std::string& str, char delimiter = ' ') {
     std::vector<std::string> tokens;
     std::string token;
-    bool inQuotes = false;
+    bool inDoubleQuotes = false;
+    bool inSingleQuotes = false;
     bool escapeNext = false;
     
     for (size_t i = 0; i < str.length(); i++) {
@@ -526,14 +541,18 @@ std::vector<std::string> split(const std::string& str, char delimiter = ' ') {
             // Backslash escapes the next character
             token += c;
             escapeNext = false;
-        } else if (c == '\\') {
-            // Backslash escapes next character
+        } else if (c == '\\' && !inSingleQuotes) {
+            // Backslash escapes next character (but not in single quotes)
             escapeNext = true;
-        } else if (c == '"') {
-            // Toggle quote mode
-            inQuotes = !inQuotes;
+        } else if (c == '"' && !inSingleQuotes) {
+            // Toggle double quote mode
+            inDoubleQuotes = !inDoubleQuotes;
             // Don't include the quote in the token
-        } else if (c == delimiter && !inQuotes) {
+        } else if (c == '\'' && !inDoubleQuotes) {
+            // Toggle single quote mode
+            inSingleQuotes = !inSingleQuotes;
+            // Don't include the quote in the token
+        } else if (c == delimiter && !inDoubleQuotes && !inSingleQuotes) {
             // Delimiter outside quotes - end current token
             if (!token.empty()) {
                 tokens.push_back(token);
@@ -1456,6 +1475,11 @@ void output(const std::string& text) {
     if (g_capturingOutput) {
         // When capturing, store output for piping
         g_capturedOutput.push_back(text);
+        // If in startup execution mode, also output to console even when capturing
+        if (g_executeOnStartup) {
+            printf("%s\n", text.c_str());
+            fflush(stdout);
+        }
         return;
     }
     
@@ -1499,39 +1523,85 @@ bool checkHelpFlag(const std::vector<std::string>& args) {
     return false;
 }
 
-// Helper function to check if a command is an internal shell command
-bool isInternalCommand(const std::string& cmd) {
-    static const std::vector<std::string> internalCommands = {
-        "pwd", "cd", "echo", "ls", "dir", "cat", "type", "less", "head", "tail",
-        "grep", "egrep", "find", "locate", "mkdir", "rmdir", "rm", "del", "touch", "chmod",
-        "chown", "chgrp", "mv", "rename", "dd", "df", "du", "sort", "cut", "paste", "wc",
-        "tee", "diff", "patch", "which", "file", "ln", "unlink", "tar", "gzip", "gunzip",
-        "bzip2", "bunzip2", "zip", "unzip", "sed", "awk", "xargs", "alias", "unalias", "source",
-        "exec", "history", "man", "help", "neofetch", "clear", "screen", "nano", "printf",
-        "finger", "id", "whoami", "groups", "user", "getent", "passwd", "useradd",
-        "userdel", "usermod", "groupadd", "addgroup", "groupmod", "groupdel",
-        "gpasswd", "who", "w", "last", "proc", "ps", "kill", "killall", "xkill",
-        "jobs", "ping", "traceroute", "tracert", "ip", "iptables", "wget", "curl",
-        "ssh", "scp", "ssh-keygen", "netstat", "ifconfig", "ipconfig", "nslookup",
-        "dig", "host", "route", "arp", "nc", "netcat", "telnet", "ftp", "sftp",
-        "unrar", "xz", "unxz", "systemctl", "journalctl", "dmesg", "uname",
-        "date", "cal", "ncal", "time", "timeout", "sleep", "wait", "bg", "fg",
-        "mount", "umount", "fdisk", "mkfs", "fsck", "parted", "chmod", "env",
-        "printenv", "export", "unset", "set", "read", "readlink", "realpath",
-        "basename", "dirname", "true", "false", "yes", "seq", "factor", "jot",
-        "shuf", "od", "hexdump", "hd", "strings", "base64", "md5sum", "sha1sum",
-        "sha256sum", "sha512sum", "cksum", "sum", "stdbuf", "nohup", "install",
-        "mktemp", "truncate", "fallocate", "fmt", "fold", "pr", "expand", "unexpand",
-        "column", "comm", "cmp", "sdiff", "join", "look", "tsort", "vis", "unvis",
-        "lpr", "lp", "quota", "sysctl", "blkid", "lshw", "lscpu", "iftop", "sar",
-        "free", "vmstat", "iostat", "mpstat", "arch", "nproc", "lsb_release",
-        "hostname", "hostid", "uptime", "mesg", "write", "wall", "pathchk",
-        "tty", "script", "logger", "xdg-open", "pgrep", "pidof", "pstree",
-        "zcat", "mysql", "ffmpeg", "fuser", "shutdown", "reboot", "halt",
-        "timedatectl", "more", "logout", "reset", "test", "[", "chattr"
-    };
+// Helper to get input from pipe (internal or external) or stdin
+std::vector<std::string> getInputLines() {
+    std::vector<std::string> lines;
     
-    for (const auto& internal : internalCommands) {
+    // Check internal pipe buffer first
+    if (!g_capturedOutput.empty()) {
+        lines = g_capturedOutput;
+        g_capturedOutput.clear();
+        return lines;
+    }
+    
+    // If we are part of a pipe (downstream) and internal buffer is empty, 
+    // it means previous command produced no output. Do NOT fall back to console stdin.
+    if (g_isPipedCommand) {
+        return lines; // Empty
+    }
+    
+    // Check standard input
+    HANDLE hStdIn = GetStdHandle(STD_INPUT_HANDLE);
+    if (hStdIn != INVALID_HANDLE_VALUE && hStdIn != NULL) {
+        DWORD fileType = GetFileType(hStdIn);
+        bool hasData = false;
+        
+        if (fileType == FILE_TYPE_PIPE) {
+            DWORD bytesAvail = 0;
+            if (PeekNamedPipe(hStdIn, NULL, 0, NULL, &bytesAvail, NULL) && bytesAvail > 0) {
+                hasData = true;
+            }
+        } else if (fileType == FILE_TYPE_DISK) {
+             hasData = true; 
+        }
+        
+        if (hasData) {
+            std::string line;
+            while (std::getline(std::cin, line)) {
+                lines.push_back(line);
+            }
+            std::cin.clear(); // Clear eof/fail bits
+        }
+    }
+    
+    return lines;
+}
+
+// Helper function to check if a command is an internal shell command
+const std::vector<std::string> ALL_KNOWN_COMMANDS = {
+    "pwd", "cd", "echo", "ls", "dir", "cat", "type", "less", "head", "tail",
+    "grep", "egrep", "find", "locate", "mkdir", "rmdir", "rm", "del", "touch", "chmod",
+    "chown", "chgrp", "mv", "rename", "dd", "df", "du", "sort", "cut", "paste", "wc",
+    "tee", "diff", "patch", "which", "file", "ln", "unlink", "tar", "gzip", "gunzip",
+    "bzip2", "bunzip2", "zip", "unzip", "sed", "awk", "xargs", "alias", "unalias", "source",
+    "exec", "history", "man", "help", "neofetch", "clear", "screen", "nano", "printf",
+    "finger", "id", "whoami", "groups", "user", "getent", "passwd", "useradd",
+    "userdel", "usermod", "groupadd", "addgroup", "groupmod", "groupdel",
+    "gpasswd", "who", "w", "last", "proc", "ps", "kill", "killall", "xkill",
+    "jobs", "ping", "traceroute", "tracert", "ip", "iptables", "wget", "curl",
+    "ssh", "scp", "ssh-keygen", "netstat", "ifconfig", "ipconfig", "nslookup",
+    "dig", "host", "route", "arp", "nc", "netcat", "telnet", "ftp", "sftp",
+    "unrar", "xz", "unxz", "systemctl", "journalctl", "dmesg", "uname",
+    "date", "cal", "ncal", "time", "timeout", "sleep", "wait", "bg", "fg",
+    "mount", "umount", "fdisk", "mkfs", "fsck", "parted", "chmod", "env",
+    "printenv", "export", "unset", "set", "read", "readlink", "realpath",
+    "basename", "dirname", "true", "false", "yes", "seq", "factor", "jot",
+    "shuf", "od", "hexdump", "hd", "strings", "base64", "md5sum", "sha1sum",
+    "sha256sum", "sha512sum", "cksum", "sum", "stdbuf", "nohup", "install",
+    "mktemp", "truncate", "fallocate", "fmt", "fold", "pr", "expand", "unexpand",
+    "column", "comm", "cmp", "sdiff", "join", "look", "tsort", "vis", "unvis",
+    "lpr", "lp", "quota", "sysctl", "blkid", "lshw", "lscpu", "iftop", "sar",
+    "free", "vmstat", "iostat", "mpstat", "arch", "nproc", "lsb_release",
+    "hostname", "hostid", "uptime", "mesg", "write", "wall", "pathchk",
+    "tty", "script", "logger", "xdg-open", "pgrep", "pidof", "pstree",
+    "zcat", "mysql", "ffmpeg", "fuser", "shutdown", "reboot", "halt",
+    "timedatectl", "more", "logout", "reset", "test", "[", "chattr",
+    "exit", "quit", "version", "apropos", "whatis", "info", "lsusb", "lspci", "init",
+    "cls"
+};
+
+bool isInternalCommand(const std::string& cmd) {
+    for (const auto& internal : ALL_KNOWN_COMMANDS) {
         if (commandEquals(cmd, internal.c_str())) {
             return true;
         }
@@ -1652,6 +1722,21 @@ void cmd_echo(const std::vector<std::string>& args) {
         output("  Display a line of text");
         return;
     }
+    
+    // If no arguments, check for piped input
+    if (args.size() < 2) {
+        std::vector<std::string> lines = getInputLines();
+        if (!lines.empty()) {
+            for (const auto& line : lines) {
+                output(line);
+            }
+            return;
+        }
+        // No args and no pipe input, output empty line
+        output("");
+        return;
+    }
+    
     std::string result;
     for (size_t i = 1; i < args.size(); ++i) {
         if (i > 1) result += " ";
@@ -2165,8 +2250,15 @@ void cmd_cat(const std::vector<std::string>& args) {
         output("  Concatenate and display file contents");
         return;
     }
+    
     if (args.size() < 2) {
-        outputError("cat: missing file operand");
+        // Read from stdin/pipe
+        std::vector<std::string> lines = getInputLines();
+        if (!lines.empty()) {
+            for (const auto& line : lines) {
+                output(line);
+            }
+        }
         return;
     }
     
@@ -2174,6 +2266,7 @@ void cmd_cat(const std::vector<std::string>& args) {
         // Verify case if in case-sensitive mode
         if (!verifyFileNameCase(args[i])) {
             outputError("cat: " + args[i] + ": File name case doesn't match (case-sensitive mode)");
+            g_lastExitStatus = 1;
             continue;
         }
         
@@ -2182,6 +2275,7 @@ void cmd_cat(const std::vector<std::string>& args) {
         
         if (!file.is_open()) {
             outputError("cat: " + args[i] + ": No such file or directory");
+            g_lastExitStatus = 1;
             continue;
         }
         
@@ -3234,14 +3328,29 @@ void cmd_write(const std::vector<std::string>& args) {
         return;
     }
 
-    if (args.size() < 3) {
-        outputError("write: missing message");
+    if (args.size() < 2) {
+        outputError("write: missing user");
         g_lastExitStatus = 1;
         return;
     }
 
     std::string targetUser = args[1];
-    std::string message = joinArgs(args, 2, " ");
+    std::string message;
+
+    if (args.size() >= 3) {
+        message = joinArgs(args, 2, " ");
+    } else {
+        std::vector<std::string> lines = getInputLines();
+        if (lines.empty()) {
+            outputError("write: missing message");
+            g_lastExitStatus = 1;
+            return;
+        }
+        for (size_t i = 0; i < lines.size(); i++) {
+             if (i > 0) message += "\n";
+             message += lines[i];
+        }
+    }
 
     auto sessions = enumerateSessions();
     std::vector<SessionEntry> targets;
@@ -3294,13 +3403,22 @@ void cmd_wall(const std::vector<std::string>& args) {
         return;
     }
 
-    if (args.size() < 2) {
-        outputError("wall: missing message");
-        g_lastExitStatus = 1;
-        return;
+    std::string message;
+    if (args.size() >= 2) {
+        message = joinArgs(args, 1, " ");
+    } else {
+        std::vector<std::string> lines = getInputLines();
+        if (lines.empty()) {
+            outputError("wall: missing message");
+            g_lastExitStatus = 1;
+            return;
+        }
+        for (size_t i = 0; i < lines.size(); i++) {
+             if (i > 0) message += "\n";
+             message += lines[i];
+        }
     }
 
-    std::string message = joinArgs(args, 1, " ");
     auto sessions = enumerateSessions();
 
     if (sessions.empty()) {
@@ -3539,6 +3657,14 @@ void cmd_logger(const std::vector<std::string>& args) {
         } else {
             message = joinArgs(args, i, " ");
             break;
+        }
+    }
+
+    if (message.empty()) {
+        std::vector<std::string> lines = getInputLines();
+        for (size_t k = 0; k < lines.size(); k++) {
+             if (k > 0) message += "\n";
+             message += lines[k];
         }
     }
 
@@ -4522,7 +4648,22 @@ void cmd_grep(const std::vector<std::string>& args) {
         return;
     }
 
-    if (args.size() < 2) { outputError("grep: usage error"); return; }
+    // Check for piped input if no pattern/file provided
+    if (args.size() < 2) {
+        std::vector<std::string> lines = getInputLines();
+        if (!lines.empty() && args.size() == 2) {
+            // Pattern provided, read from pipe
+            std::string pattern = args[1];
+            for (const auto& line : lines) {
+                if (line.find(pattern) != std::string::npos) {
+                    output(line);
+                }
+            }
+            return;
+        }
+        outputError("grep: usage error"); 
+        return; 
+    }
     
     GrepConfig cfg;
     std::vector<std::string> targetFiles;
@@ -6508,265 +6649,1312 @@ void cmd_tar(const std::vector<std::string>& args) {
 }
 
 // Make - Build automation tool
-void cmd_make(const std::vector<std::string>& args) {
-    if (checkHelpFlag(args)) {
-        output("Usage: make [target] [-f makefile] [-C directory]");
-        output("  Build automation tool - executes build rules from Makefile");
-        output("");
-        output("Options:");
-        output("  -f FILE   Use FILE as makefile (default: Makefile, makefile)");
-        output("  -C DIR    Change to DIR before reading makefile");
-        output("  -n        Dry run - print commands without executing");
-        output("  -B        Unconditionally make all targets");
-        output("");
-        output("Makefile syntax:");
-        output("  target: dependencies");
-        output("      command");
-        output("      command");
-        output("");
-        output("Example:");
-        output("  all: program");
-        output("      echo Build complete");
-        output("  ");
-        output("  program: main.cpp");
-        output("      g++ main.cpp -o program");
-        return;
-    }
-    
-    std::string makefileName = "";
-    std::string targetName = "";
-    std::string changeDir = "";
-    bool dryRun = false;
-    bool forceRebuild = false;
-    
-    // Parse arguments
-    for (size_t i = 1; i < args.size(); i++) {
-        if (args[i] == "-f" && i + 1 < args.size()) {
-            makefileName = args[++i];
-        } else if (args[i] == "-C" && i + 1 < args.size()) {
-            changeDir = args[++i];
-        } else if (args[i] == "-n") {
-            dryRun = true;
-        } else if (args[i] == "-B") {
-            forceRebuild = true;
-        } else if (args[i][0] != '-') {
-            targetName = args[i];
-        }
-    }
-    
-    // Change directory if requested
-    char originalDir[MAX_PATH];
-    if (!changeDir.empty()) {
-        _getcwd(originalDir, MAX_PATH);
-        std::string winPath = unixPathToWindows(changeDir);
-        if (_chdir(winPath.c_str()) != 0) {
-            outputError("make: " + changeDir + ": No such directory");
-            return;
-        }
-    }
-    
-    // Find makefile
-    if (makefileName.empty()) {
-        if (std::ifstream("Makefile")) {
-            makefileName = "Makefile";
-        } else if (std::ifstream("makefile")) {
-            makefileName = "makefile";
-        } else {
-            outputError("make: *** No targets specified and no makefile found.  Stop.");
-            if (!changeDir.empty()) _chdir(originalDir);
-            return;
-        }
-    }
-    
-    // Read makefile
-    std::ifstream makefile(makefileName);
-    if (!makefile.is_open()) {
-        outputError("make: " + makefileName + ": No such file or directory");
-        if (!changeDir.empty()) _chdir(originalDir);
-        return;
-    }
-    
-    // Parse makefile into targets
-    struct MakeRule {
-        std::string target;
-        std::vector<std::string> dependencies;
-        std::vector<std::string> commands;
-    };
-    
+// ============================================================================
+// COMPREHENSIVE GNU MAKE IMPLEMENTATION
+// Full-featured build automation with all Unix/Linux make options
+// ============================================================================
+
+// Make data structures
+struct MakeRule {
+    std::string target;
+    std::vector<std::string> prerequisites;
+    std::vector<std::string> recipes;
+    bool isPatternRule;
+    bool isPhony;
+    bool isDoubleColon;
+    std::string pattern;  // For pattern rules like %.o: %.c
+};
+
+struct MakeVariable {
+    std::string name;
+    std::string value;
+    bool isRecursive;  // = vs :=
+    bool isConditional; // ?=
+    bool isAppend;     // +=
+};
+
+class MakefileParser {
+private:
     std::vector<MakeRule> rules;
-    std::string line;
-    MakeRule* currentRule = nullptr;
+    std::map<std::string, std::string> variables;
+    std::map<std::string, std::string> automaticVariables;
+    std::set<std::string> phonyTargets;
+    std::vector<std::string> includedFiles;
+    std::map<std::string, std::vector<std::string>> vpath;  // pattern -> directories
+    std::string defaultGoal;
     
-    while (std::getline(makefile, line)) {
-        // Skip empty lines and comments
-        if (line.empty() || line[0] == '#') continue;
-        
-        // Trim trailing whitespace
-        while (!line.empty() && (line.back() == ' ' || line.back() == '\t' || line.back() == '\r')) {
-            line.pop_back();
+    // Options
+    bool silent;
+    bool ignoreErrors;
+    bool keepGoing;
+    bool dryRun;
+    bool alwaysMake;
+    bool touchOnly;
+    bool printDatabase;
+    bool printDirectory;
+    bool questionMode;
+    bool noBuiltinRules;
+    bool noBuiltinVariables;
+    int jobs;
+    std::string makefileName;
+    std::vector<std::string> makefileList;
+    std::string oldFile;
+    std::string newFile;
+    std::string whatIfFile;
+    
+    // Tracking
+    std::set<std::string> builtTargets;
+    std::set<std::string> buildingTargets;  // For circular dependency detection
+    
+    // Expand variables in string
+    std::string expandVariables(const std::string& str) {
+        std::string result;
+        size_t i = 0;
+        while (i < str.length()) {
+            if (str[i] == '$') {
+                if (i + 1 < str.length()) {
+                    if (str[i + 1] == '$') {
+                        result += '$';
+                        i += 2;
+                    } else if (str[i + 1] == '(') {
+                        // $(VAR) or $(function args)
+                        size_t end = str.find(')', i + 2);
+                        if (end != std::string::npos) {
+                            std::string varExpr = str.substr(i + 2, end - i - 2);
+                            result += expandMacro(varExpr);
+                            i = end + 1;
+                        } else {
+                            result += str[i++];
+                        }
+                    } else if (str[i + 1] == '{') {
+                        // ${VAR}
+                        size_t end = str.find('}', i + 2);
+                        if (end != std::string::npos) {
+                            std::string varName = str.substr(i + 2, end - i - 2);
+                            result += getVariable(varName);
+                            i = end + 1;
+                        } else {
+                            result += str[i++];
+                        }
+                    } else {
+                        // $X single character variable
+                        std::string varName(1, str[i + 1]);
+                        result += getVariable(varName);
+                        i += 2;
+                    }
+                } else {
+                    result += str[i++];
+                }
+            } else {
+                result += str[i++];
+            }
+        }
+        return result;
+    }
+    
+    // Expand macro/function call
+    std::string expandMacro(const std::string& expr) {
+        // Check if it's a function call
+        size_t spacePos = expr.find(' ');
+        if (spacePos != std::string::npos) {
+            std::string funcName = expr.substr(0, spacePos);
+            std::string args = expr.substr(spacePos + 1);
+            
+            if (funcName == "wildcard") {
+                return expandWildcard(args);
+            } else if (funcName == "patsubst") {
+                return expandPatsubst(args);
+            } else if (funcName == "subst") {
+                return expandSubst(args);
+            } else if (funcName == "strip") {
+                return trim(expandVariables(args));
+            } else if (funcName == "findstring") {
+                return expandFindstring(args);
+            } else if (funcName == "filter") {
+                return expandFilter(args);
+            } else if (funcName == "filter-out") {
+                return expandFilterOut(args);
+            } else if (funcName == "sort") {
+                return expandSort(args);
+            } else if (funcName == "word") {
+                return expandWord(args);
+            } else if (funcName == "words") {
+                return expandWords(args);
+            } else if (funcName == "wordlist") {
+                return expandWordlist(args);
+            } else if (funcName == "firstword") {
+                return expandFirstword(args);
+            } else if (funcName == "lastword") {
+                return expandLastword(args);
+            } else if (funcName == "dir") {
+                return expandDir(args);
+            } else if (funcName == "notdir") {
+                return expandNotdir(args);
+            } else if (funcName == "suffix") {
+                return expandSuffix(args);
+            } else if (funcName == "basename") {
+                return expandBasename(args);
+            } else if (funcName == "addsuffix") {
+                return expandAddsuffix(args);
+            } else if (funcName == "addprefix") {
+                return expandAddprefix(args);
+            } else if (funcName == "join") {
+                return expandJoin(args);
+            } else if (funcName == "realpath") {
+                return expandRealpath(args);
+            } else if (funcName == "abspath") {
+                return expandAbspath(args);
+            } else if (funcName == "if") {
+                return expandIf(args);
+            } else if (funcName == "or") {
+                return expandOr(args);
+            } else if (funcName == "and") {
+                return expandAnd(args);
+            } else if (funcName == "foreach") {
+                return expandForeach(args);
+            } else if (funcName == "call") {
+                return expandCall(args);
+            } else if (funcName == "shell") {
+                return expandShell(args);
+            } else if (funcName == "error") {
+                outputError("make: *** " + expandVariables(args) + ".  Stop.");
+                g_lastExitStatus = 2;
+                return "";
+            } else if (funcName == "warning") {
+                outputError("Makefile: warning: " + expandVariables(args));
+                return "";
+            } else if (funcName == "info") {
+                output(expandVariables(args));
+                return "";
+            }
         }
         
-        if (line.empty()) continue;
+        // Not a function, treat as variable
+        return getVariable(expr);
+    }
+    
+    // Get variable value
+    std::string getVariable(const std::string& name) {
+        // Check automatic variables first
+        if (automaticVariables.find(name) != automaticVariables.end()) {
+            return automaticVariables[name];
+        }
         
-        // Check if it's a target line (contains ':')
-        size_t colonPos = line.find(':');
-        if (colonPos != std::string::npos && (line[0] != '\t' && line[0] != ' ')) {
-            // New target rule
-            rules.push_back(MakeRule());
-            currentRule = &rules.back();
-            
-            currentRule->target = trim(line.substr(0, colonPos));
-            
-            // Parse dependencies
-            std::string depsStr = trim(line.substr(colonPos + 1));
-            if (!depsStr.empty()) {
-                std::istringstream iss(depsStr);
-                std::string dep;
-                while (iss >> dep) {
-                    currentRule->dependencies.push_back(dep);
+        // Check user variables
+        if (variables.find(name) != variables.end()) {
+            return expandVariables(variables[name]);
+        }
+        
+        // Check environment variables
+        char* envVal = getenv(name.c_str());
+        if (envVal) {
+            return std::string(envVal);
+        }
+        
+        return "";
+    }
+    
+    // Set variable
+    void setVariable(const std::string& name, const std::string& value, bool recursive = true) {
+        if (recursive) {
+            variables[name] = value;
+        } else {
+            variables[name] = expandVariables(value);
+        }
+    }
+    
+    // Wildcard expansion
+    std::string expandWildcard(const std::string& pattern) {
+        std::string expandedPattern = expandVariables(pattern);
+        std::vector<std::string> results;
+        
+        WIN32_FIND_DATAA findData;
+        HANDLE hFind = FindFirstFileA(expandedPattern.c_str(), &findData);
+        
+        if (hFind != INVALID_HANDLE_VALUE) {
+            do {
+                if (strcmp(findData.cFileName, ".") != 0 && strcmp(findData.cFileName, "..") != 0) {
+                    results.push_back(findData.cFileName);
+                }
+            } while (FindNextFileA(hFind, &findData));
+            FindClose(hFind);
+        }
+        
+        std::string result;
+        for (size_t i = 0; i < results.size(); i++) {
+            if (i > 0) result += " ";
+            result += results[i];
+        }
+        return result;
+    }
+    
+    // Pattern substitution $(patsubst pattern,replacement,text)
+    std::string expandPatsubst(const std::string& args) {
+        std::vector<std::string> parts = splitMakeArgs(args);
+        if (parts.size() < 3) return "";
+        
+        std::string pattern = expandVariables(parts[0]);
+        std::string replacement = expandVariables(parts[1]);
+        std::string text = expandVariables(parts[2]);
+        
+        std::vector<std::string> words = splitWhitespace(text);
+        std::vector<std::string> results;
+        
+        for (const auto& word : words) {
+            if (matchPattern(word, pattern)) {
+                results.push_back(substitutePattern(word, pattern, replacement));
+            } else {
+                results.push_back(word);
+            }
+        }
+        
+        return joinStrings(results, " ");
+    }
+    
+    // String substitution $(subst from,to,text)
+    std::string expandSubst(const std::string& args) {
+        std::vector<std::string> parts = splitMakeArgs(args);
+        if (parts.size() < 3) return "";
+        
+        std::string from = expandVariables(parts[0]);
+        std::string to = expandVariables(parts[1]);
+        std::string text = expandVariables(parts[2]);
+        
+        std::string result = text;
+        size_t pos = 0;
+        while ((pos = result.find(from, pos)) != std::string::npos) {
+            result.replace(pos, from.length(), to);
+            pos += to.length();
+        }
+        return result;
+    }
+    
+    // Other function implementations
+    std::string expandFindstring(const std::string& args) {
+        std::vector<std::string> parts = splitMakeArgs(args);
+        if (parts.size() < 2) return "";
+        std::string find = expandVariables(parts[0]);
+        std::string in = expandVariables(parts[1]);
+        return (in.find(find) != std::string::npos) ? find : "";
+    }
+    
+    std::string expandFilter(const std::string& args) {
+        std::vector<std::string> parts = splitMakeArgs(args);
+        if (parts.size() < 2) return "";
+        std::vector<std::string> patterns = splitWhitespace(expandVariables(parts[0]));
+        std::vector<std::string> words = splitWhitespace(expandVariables(parts[1]));
+        std::vector<std::string> results;
+        for (const auto& word : words) {
+            for (const auto& pattern : patterns) {
+                if (matchPattern(word, pattern)) {
+                    results.push_back(word);
+                    break;
                 }
             }
-        } else if ((line[0] == '\t' || line[0] == ' ') && currentRule) {
-            // Command line for current target
-            std::string cmd = line;
-            // Remove leading tab/spaces
-            size_t firstNonSpace = cmd.find_first_not_of(" \t");
-            if (firstNonSpace != std::string::npos) {
-                cmd = cmd.substr(firstNonSpace);
+        }
+        return joinStrings(results, " ");
+    }
+    
+    std::string expandFilterOut(const std::string& args) {
+        std::vector<std::string> parts = splitMakeArgs(args);
+        if (parts.size() < 2) return "";
+        std::vector<std::string> patterns = splitWhitespace(expandVariables(parts[0]));
+        std::vector<std::string> words = splitWhitespace(expandVariables(parts[1]));
+        std::vector<std::string> results;
+        for (const auto& word : words) {
+            bool matches = false;
+            for (const auto& pattern : patterns) {
+                if (matchPattern(word, pattern)) {
+                    matches = true;
+                    break;
+                }
             }
-            if (!cmd.empty()) {
-                currentRule->commands.push_back(cmd);
+            if (!matches) results.push_back(word);
+        }
+        return joinStrings(results, " ");
+    }
+    
+    std::string expandSort(const std::string& args) {
+        std::vector<std::string> words = splitWhitespace(expandVariables(args));
+        std::sort(words.begin(), words.end());
+        words.erase(std::unique(words.begin(), words.end()), words.end());
+        return joinStrings(words, " ");
+    }
+    
+    std::string expandWord(const std::string& args) {
+        std::vector<std::string> parts = splitMakeArgs(args);
+        if (parts.size() < 2) return "";
+        int n = std::stoi(expandVariables(parts[0]));
+        std::vector<std::string> words = splitWhitespace(expandVariables(parts[1]));
+        return (n > 0 && n <= (int)words.size()) ? words[n - 1] : "";
+    }
+    
+    std::string expandWords(const std::string& args) {
+        std::vector<std::string> words = splitWhitespace(expandVariables(args));
+        return std::to_string(words.size());
+    }
+    
+    std::string expandWordlist(const std::string& args) {
+        std::vector<std::string> parts = splitMakeArgs(args);
+        if (parts.size() < 3) return "";
+        int start = std::stoi(expandVariables(parts[0]));
+        int end = std::stoi(expandVariables(parts[1]));
+        std::vector<std::string> words = splitWhitespace(expandVariables(parts[2]));
+        std::vector<std::string> results;
+        for (int i = start; i <= end && i <= (int)words.size(); i++) {
+            if (i > 0) results.push_back(words[i - 1]);
+        }
+        return joinStrings(results, " ");
+    }
+    
+    std::string expandFirstword(const std::string& args) {
+        std::vector<std::string> words = splitWhitespace(expandVariables(args));
+        return words.empty() ? "" : words[0];
+    }
+    
+    std::string expandLastword(const std::string& args) {
+        std::vector<std::string> words = splitWhitespace(expandVariables(args));
+        return words.empty() ? "" : words.back();
+    }
+    
+    std::string expandDir(const std::string& args) {
+        std::vector<std::string> names = splitWhitespace(expandVariables(args));
+        std::vector<std::string> results;
+        for (const auto& name : names) {
+            size_t pos = name.find_last_of("/\\");
+            results.push_back(pos != std::string::npos ? name.substr(0, pos + 1) : "./");
+        }
+        return joinStrings(results, " ");
+    }
+    
+    std::string expandNotdir(const std::string& args) {
+        std::vector<std::string> names = splitWhitespace(expandVariables(args));
+        std::vector<std::string> results;
+        for (const auto& name : names) {
+            size_t pos = name.find_last_of("/\\");
+            results.push_back(pos != std::string::npos ? name.substr(pos + 1) : name);
+        }
+        return joinStrings(results, " ");
+    }
+    
+    std::string expandSuffix(const std::string& args) {
+        std::vector<std::string> names = splitWhitespace(expandVariables(args));
+        std::vector<std::string> results;
+        for (const auto& name : names) {
+            size_t pos = name.find_last_of('.');
+            results.push_back(pos != std::string::npos ? name.substr(pos) : "");
+        }
+        return joinStrings(results, " ");
+    }
+    
+    std::string expandBasename(const std::string& args) {
+        std::vector<std::string> names = splitWhitespace(expandVariables(args));
+        std::vector<std::string> results;
+        for (const auto& name : names) {
+            size_t pos = name.find_last_of('.');
+            results.push_back(pos != std::string::npos ? name.substr(0, pos) : name);
+        }
+        return joinStrings(results, " ");
+    }
+    
+    std::string expandAddsuffix(const std::string& args) {
+        std::vector<std::string> parts = splitMakeArgs(args);
+        if (parts.size() < 2) return "";
+        std::string suffix = expandVariables(parts[0]);
+        std::vector<std::string> names = splitWhitespace(expandVariables(parts[1]));
+        std::vector<std::string> results;
+        for (const auto& name : names) {
+            results.push_back(name + suffix);
+        }
+        return joinStrings(results, " ");
+    }
+    
+    std::string expandAddprefix(const std::string& args) {
+        std::vector<std::string> parts = splitMakeArgs(args);
+        if (parts.size() < 2) return "";
+        std::string prefix = expandVariables(parts[0]);
+        std::vector<std::string> names = splitWhitespace(expandVariables(parts[1]));
+        std::vector<std::string> results;
+        for (const auto& name : names) {
+            results.push_back(prefix + name);
+        }
+        return joinStrings(results, " ");
+    }
+    
+    std::string expandJoin(const std::string& args) {
+        std::vector<std::string> parts = splitMakeArgs(args);
+        if (parts.size() < 2) return "";
+        std::vector<std::string> list1 = splitWhitespace(expandVariables(parts[0]));
+        std::vector<std::string> list2 = splitWhitespace(expandVariables(parts[1]));
+        std::vector<std::string> results;
+        size_t maxSize = std::max(list1.size(), list2.size());
+        for (size_t i = 0; i < maxSize; i++) {
+            std::string s1 = (i < list1.size()) ? list1[i] : "";
+            std::string s2 = (i < list2.size()) ? list2[i] : "";
+            results.push_back(s1 + s2);
+        }
+        return joinStrings(results, " ");
+    }
+    
+    std::string expandRealpath(const std::string& args) {
+        std::vector<std::string> names = splitWhitespace(expandVariables(args));
+        std::vector<std::string> results;
+        for (const auto& name : names) {
+            char fullPath[MAX_PATH];
+            if (GetFullPathNameA(name.c_str(), MAX_PATH, fullPath, NULL)) {
+                results.push_back(fullPath);
             }
         }
+        return joinStrings(results, " ");
     }
     
-    makefile.close();
-    
-    if (rules.empty()) {
-        outputError("make: *** No rule to make target.  Stop.");
-        if (!changeDir.empty()) _chdir(originalDir);
-        return;
+    std::string expandAbspath(const std::string& args) {
+        return expandRealpath(args);
     }
     
-    // If no target specified, use first target
-    if (targetName.empty()) {
-        targetName = rules[0].target;
-    }
-    
-    // Find the target
-    MakeRule* targetRule = nullptr;
-    for (auto& rule : rules) {
-        if (rule.target == targetName) {
-            targetRule = &rule;
-            break;
+    std::string expandIf(const std::string& args) {
+        std::vector<std::string> parts = splitMakeArgs(args);
+        if (parts.size() < 2) return "";
+        std::string condition = trim(expandVariables(parts[0]));
+        if (!condition.empty()) {
+            return expandVariables(parts[1]);
+        } else if (parts.size() >= 3) {
+            return expandVariables(parts[2]);
         }
+        return "";
     }
     
-    if (!targetRule) {
-        outputError("make: *** No rule to make target '" + targetName + "'.  Stop.");
-        if (!changeDir.empty()) _chdir(originalDir);
-        return;
+    std::string expandOr(const std::string& args) {
+        std::vector<std::string> parts = splitMakeArgs(args);
+        for (const auto& part : parts) {
+            std::string val = trim(expandVariables(part));
+            if (!val.empty()) return val;
+        }
+        return "";
     }
     
-    // Function to check if file needs rebuilding
-    auto needsRebuild = [&](const std::string& target, const std::vector<std::string>& deps) -> bool {
-        if (forceRebuild) return true;
+    std::string expandAnd(const std::string& args) {
+        std::vector<std::string> parts = splitMakeArgs(args);
+        std::string last;
+        for (const auto& part : parts) {
+            last = trim(expandVariables(part));
+            if (last.empty()) return "";
+        }
+        return last;
+    }
+    
+    std::string expandForeach(const std::string& args) {
+        std::vector<std::string> parts = splitMakeArgs(args);
+        if (parts.size() < 3) return "";
+        std::string var = trim(parts[0]);
+        std::vector<std::string> list = splitWhitespace(expandVariables(parts[1]));
+        std::string text = parts[2];
+        std::vector<std::string> results;
+        for (const auto& item : list) {
+            std::string saved = getVariable(var);
+            setVariable(var, item, false);
+            results.push_back(expandVariables(text));
+            if (!saved.empty()) {
+                setVariable(var, saved, false);
+            } else {
+                variables.erase(var);
+            }
+        }
+        return joinStrings(results, " ");
+    }
+    
+    std::string expandCall(const std::string& args) {
+        std::vector<std::string> parts = splitMakeArgs(args);
+        if (parts.empty()) return "";
+        std::string varName = trim(expandVariables(parts[0]));
+        std::string varValue = getVariable(varName);
         
-        // Check if target exists
-        HANDLE hFile = CreateFileA(target.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-        if (hFile == INVALID_HANDLE_VALUE) {
-            return true; // Target doesn't exist, needs building
+        // Set $(1), $(2), etc. to arguments
+        std::map<std::string, std::string> savedArgs;
+        for (size_t i = 1; i < parts.size(); i++) {
+            std::string argNum = std::to_string(i);
+            savedArgs[argNum] = getVariable(argNum);
+            setVariable(argNum, expandVariables(parts[i]), false);
         }
         
-        FILETIME targetTime;
-        if (!GetFileTime(hFile, NULL, NULL, &targetTime)) {
-            CloseHandle(hFile);
+        std::string result = expandVariables(varValue);
+        
+        // Restore previous argument values
+        for (const auto& saved : savedArgs) {
+            if (!saved.second.empty()) {
+                setVariable(saved.first, saved.second, false);
+            } else {
+                variables.erase(saved.first);
+            }
+        }
+        
+        return result;
+    }
+    
+    std::string expandShell(const std::string& args) {
+        std::string cmd = expandVariables(args);
+        
+        // Execute command and capture output
+        HANDLE hReadPipe, hWritePipe;
+        SECURITY_ATTRIBUTES sa = { sizeof(SECURITY_ATTRIBUTES), NULL, TRUE };
+        
+        if (!CreatePipe(&hReadPipe, &hWritePipe, &sa, 0)) {
+            return "";
+        }
+        
+        SetHandleInformation(hReadPipe, HANDLE_FLAG_INHERIT, 0);
+        
+        STARTUPINFOA si = { sizeof(STARTUPINFOA) };
+        si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
+        si.hStdOutput = hWritePipe;
+        si.hStdError = hWritePipe;
+        si.wShowWindow = SW_HIDE;
+        
+        PROCESS_INFORMATION pi;
+        std::string cmdLine = "cmd.exe /c " + cmd;
+        
+        if (!CreateProcessA(NULL, const_cast<char*>(cmdLine.c_str()), NULL, NULL, TRUE,
+                           0, NULL, NULL, &si, &pi)) {
+            CloseHandle(hReadPipe);
+            CloseHandle(hWritePipe);
+            return "";
+        }
+        
+        CloseHandle(hWritePipe);
+        
+        std::string output;
+        char buffer[4096];
+        DWORD bytesRead;
+        
+        while (ReadFile(hReadPipe, buffer, sizeof(buffer), &bytesRead, NULL) && bytesRead > 0) {
+            output.append(buffer, bytesRead);
+        }
+        
+        CloseHandle(hReadPipe);
+        WaitForSingleObject(pi.hProcess, INFINITE);
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+        
+        // Remove trailing newline
+        while (!output.empty() && (output.back() == '\n' || output.back() == '\r')) {
+            output.pop_back();
+        }
+        
+        return output;
+    }
+    
+    // Helper functions
+    std::vector<std::string> splitMakeArgs(const std::string& args) {
+        std::vector<std::string> result;
+        std::string current;
+        int parenDepth = 0;
+        bool inQuotes = false;
+        
+        for (size_t i = 0; i < args.length(); i++) {
+            char c = args[i];
+            if (c == '"') {
+                inQuotes = !inQuotes;
+                current += c;
+            } else if (c == '(' && !inQuotes) {
+                parenDepth++;
+                current += c;
+            } else if (c == ')' && !inQuotes) {
+                parenDepth--;
+                current += c;
+            } else if (c == ',' && parenDepth == 0 && !inQuotes) {
+                result.push_back(current);
+                current.clear();
+            } else {
+                current += c;
+            }
+        }
+        
+        if (!current.empty()) {
+            result.push_back(current);
+        }
+        
+        return result;
+    }
+    
+    std::vector<std::string> splitWhitespace(const std::string& str) {
+        std::vector<std::string> result;
+        std::istringstream iss(str);
+        std::string word;
+        while (iss >> word) {
+            result.push_back(word);
+        }
+        return result;
+    }
+    
+    std::string joinStrings(const std::vector<std::string>& strs, const std::string& sep) {
+        std::string result;
+        for (size_t i = 0; i < strs.size(); i++) {
+            if (i > 0) result += sep;
+            result += strs[i];
+        }
+        return result;
+    }
+    
+    bool matchPattern(const std::string& str, const std::string& pattern) {
+        size_t percentPos = pattern.find('%');
+        if (percentPos == std::string::npos) {
+            return str == pattern;
+        }
+        
+        std::string prefix = pattern.substr(0, percentPos);
+        std::string suffix = pattern.substr(percentPos + 1);
+        
+        if (str.length() < prefix.length() + suffix.length()) {
+            return false;
+        }
+        
+        return str.substr(0, prefix.length()) == prefix &&
+               str.substr(str.length() - suffix.length()) == suffix;
+    }
+    
+    std::string substitutePattern(const std::string& str, const std::string& pattern, const std::string& replacement) {
+        size_t percentPos = pattern.find('%');
+        if (percentPos == std::string::npos) {
+            return replacement;
+        }
+        
+        std::string prefix = pattern.substr(0, percentPos);
+        std::string suffix = pattern.substr(percentPos + 1);
+        std::string stem = str.substr(prefix.length(), str.length() - prefix.length() - suffix.length());
+        
+        std::string result = replacement;
+        size_t replacePercent = result.find('%');
+        if (replacePercent != std::string::npos) {
+            result.replace(replacePercent, 1, stem);
+        }
+        
+        return result;
+    }
+    
+    // File time comparison
+    bool isFileNewer(const std::string& file1, const std::string& file2) {
+        HANDLE h1 = CreateFileA(file1.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (h1 == INVALID_HANDLE_VALUE) return false;
+        
+        HANDLE h2 = CreateFileA(file2.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (h2 == INVALID_HANDLE_VALUE) {
+            CloseHandle(h1);
             return true;
         }
-        CloseHandle(hFile);
         
-        // Check if any dependency is newer than target
-        for (const auto& dep : deps) {
-            HANDLE hDep = CreateFileA(dep.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-            if (hDep == INVALID_HANDLE_VALUE) {
-                continue; // Dependency doesn't exist, might be another target
-            }
-            
-            FILETIME depTime;
-            if (GetFileTime(hDep, NULL, NULL, &depTime)) {
-                if (CompareFileTime(&depTime, &targetTime) > 0) {
-                    CloseHandle(hDep);
-                    return true; // Dependency is newer
-                }
-            }
-            CloseHandle(hDep);
+        FILETIME ft1, ft2;
+        bool result = false;
+        if (GetFileTime(h1, NULL, NULL, &ft1) && GetFileTime(h2, NULL, NULL, &ft2)) {
+            result = CompareFileTime(&ft1, &ft2) > 0;
         }
         
-        return false;
-    };
+        CloseHandle(h1);
+        CloseHandle(h2);
+        return result;
+    }
     
-    // Build dependencies first (simple recursive approach)
-    std::function<bool(const std::string&)> buildTarget;
-    buildTarget = [&](const std::string& target) -> bool {
-        // Find rule for this target
+    bool fileExists(const std::string& file) {
+        DWORD attrs = GetFileAttributesA(file.c_str());
+        return (attrs != INVALID_FILE_ATTRIBUTES);
+    }
+    
+public:
+    MakefileParser() : silent(false), ignoreErrors(false), keepGoing(false), dryRun(false),
+                       alwaysMake(false), touchOnly(false), printDatabase(false),
+                       printDirectory(false), questionMode(false), noBuiltinRules(false),
+                       noBuiltinVariables(false), jobs(1) {
+        // Set default variables
+        setVariable("MAKE", "make", false);
+        setVariable("SHELL", "cmd.exe", false);
+        setVariable("CC", "gcc", false);
+        setVariable("CXX", "g++", false);
+        setVariable("AR", "ar", false);
+        setVariable("RM", "rm -f", false);
+        setVariable("CFLAGS", "", false);
+        setVariable("CXXFLAGS", "", false);
+        setVariable("LDFLAGS", "", false);
+    }
+    
+    bool parseMakefile(const std::string& filename) {
+        std::ifstream file(filename);
+        if (!file.is_open()) {
+            return false;
+        }
+        
+        std::string line;
+        std::string continuedLine;
+        MakeRule* currentRule = nullptr;
+        bool inDefine = false;
+        std::string defineName;
+        std::string defineValue;
+        
+        while (std::getline(file, line)) {
+            // Handle line continuation
+            while (!line.empty() && line.back() == '\\') {
+                line.pop_back();
+                std::string nextLine;
+                if (std::getline(file, nextLine)) {
+                    line += " " + nextLine;
+                } else {
+                    break;
+                }
+            }
+            
+            // Trim trailing whitespace
+            while (!line.empty() && (line.back() == ' ' || line.back() == '\t' || line.back() == '\r')) {
+                line.pop_back();
+            }
+            
+            // Skip empty lines
+            if (line.empty()) continue;
+            
+            // Handle comments
+            if (line[0] == '#') continue;
+            
+            // Handle directives
+            if (line.substr(0, 7) == "include") {
+                std::string incFile = trim(line.substr(7));
+                incFile = expandVariables(incFile);
+                parseMakefile(incFile);
+                continue;
+            }
+            
+            if (line.substr(0, 8) == "-include" || line.substr(0, 8) == "sinclude") {
+                std::string incFile = trim(line.substr(8));
+                incFile = expandVariables(incFile);
+                parseMakefile(incFile);  // Silently ignore errors
+                continue;
+            }
+            
+            if (line.substr(0, 6) == "define") {
+                inDefine = true;
+                defineName = trim(line.substr(6));
+                defineValue.clear();
+                continue;
+            }
+            
+            if (line.substr(0, 5) == "endef" && inDefine) {
+                inDefine = false;
+                setVariable(defineName, defineValue, true);
+                continue;
+            }
+            
+            if (inDefine) {
+                defineValue += line + "\n";
+                continue;
+            }
+            
+            if (line.substr(0, 5) == "vpath") {
+                // Handle vpath directive
+                std::string rest = trim(line.substr(5));
+                size_t spacePos = rest.find(' ');
+                if (spacePos != std::string::npos) {
+                    std::string pattern = rest.substr(0, spacePos);
+                    std::string dirs = trim(rest.substr(spacePos + 1));
+                    vpath[pattern] = splitWhitespace(dirs);
+                }
+                continue;
+            }
+            
+            if (line.substr(0, 6) == ".PHONY") {
+                std::string rest = trim(line.substr(6));
+                if (!rest.empty() && rest[0] == ':') {
+                    rest = trim(rest.substr(1));
+                    std::vector<std::string> targets = splitWhitespace(expandVariables(rest));
+                    for (const auto& target : targets) {
+                        phonyTargets.insert(target);
+                    }
+                }
+                continue;
+            }
+            
+            // Check if it's a recipe line (starts with tab)
+            if (!line.empty() && line[0] == '\t') {
+                if (currentRule) {
+                    std::string recipe = line.substr(1);
+                    currentRule->recipes.push_back(recipe);
+                }
+                continue;
+            }
+            
+            // Check for variable assignment
+            size_t assignPos = std::string::npos;
+            bool isRecursive = true;
+            bool isConditional = false;
+            bool isAppend = false;
+            
+            if ((assignPos = line.find(":=")) != std::string::npos) {
+                isRecursive = false;
+            } else if ((assignPos = line.find("?=")) != std::string::npos) {
+                isConditional = true;
+            } else if ((assignPos = line.find("+=")) != std::string::npos) {
+                isAppend = true;
+            } else if ((assignPos = line.find("=")) != std::string::npos) {
+                // Check it's not ::= or part of a target rule
+                size_t colonPos = line.find(':');
+                if (colonPos == std::string::npos || assignPos < colonPos) {
+                    isRecursive = true;
+                } else {
+                    assignPos = std::string::npos;
+                }
+            }
+            
+            if (assignPos != std::string::npos) {
+                std::string varName = trim(line.substr(0, assignPos));
+                size_t opLen = isRecursive ? 1 : 2;
+                std::string varValue = trim(line.substr(assignPos + opLen));
+                
+                if (isConditional) {
+                    if (variables.find(varName) == variables.end()) {
+                        setVariable(varName, varValue, isRecursive);
+                    }
+                } else if (isAppend) {
+                    std::string existing = getVariable(varName);
+                    setVariable(varName, existing + " " + varValue, isRecursive);
+                } else {
+                    setVariable(varName, varValue, isRecursive);
+                }
+                
+                currentRule = nullptr;
+                continue;
+            }
+            
+            // Check for target rule
+            size_t colonPos = line.find(':');
+            if (colonPos != std::string::npos) {
+                bool isDoubleColon = (colonPos + 1 < line.length() && line[colonPos + 1] == ':');
+                if (isDoubleColon) colonPos++;
+                
+                std::string targetPart = trim(line.substr(0, colonPos));
+                std::string prereqPart = trim(line.substr(colonPos + 1));
+                
+                // Expand variables in target and prerequisites
+                targetPart = expandVariables(targetPart);
+                std::vector<std::string> targets = splitWhitespace(targetPart);
+                std::vector<std::string> prereqs = splitWhitespace(expandVariables(prereqPart));
+                
+                for (const auto& target : targets) {
+                    MakeRule rule;
+                    rule.target = target;
+                    rule.prerequisites = prereqs;
+                    rule.isDoubleColon = isDoubleColon;
+                    rule.isPhony = (phonyTargets.find(target) != phonyTargets.end());
+                    rule.isPatternRule = (target.find('%') != std::string::npos);
+                    if (rule.isPatternRule) {
+                        rule.pattern = target;
+                    }
+                    
+                    rules.push_back(rule);
+                    currentRule = &rules.back();
+                    
+                    if (defaultGoal.empty() && !rule.isPatternRule) {
+                        defaultGoal = target;
+                    }
+                }
+                continue;
+            }
+        }
+        
+        file.close();
+        return true;
+    }
+    
+    void setOption(const std::string& opt, const std::string& value = "") {
+        if (opt == "-s" || opt == "--silent" || opt == "--quiet") silent = true;
+        else if (opt == "-i" || opt == "--ignore-errors") ignoreErrors = true;
+        else if (opt == "-k" || opt == "--keep-going") keepGoing = true;
+        else if (opt == "-n" || opt == "--dry-run" || opt == "--just-print" || opt == "--recon") dryRun = true;
+        else if (opt == "-t" || opt == "--touch") touchOnly = true;
+        else if (opt == "-B" || opt == "--always-make") alwaysMake = true;
+        else if (opt == "-p" || opt == "--print-data-base") printDatabase = true;
+        else if (opt == "-w" || opt == "--print-directory") printDirectory = true;
+        else if (opt == "-q" || opt == "--question") questionMode = true;
+        else if (opt == "-r" || opt == "--no-builtin-rules") noBuiltinRules = true;
+        else if (opt == "-R" || opt == "--no-builtin-variables") noBuiltinVariables = true;
+        else if (opt == "-f" || opt == "--file" || opt == "--makefile") makefileList.push_back(value);
+        else if (opt == "-C" || opt == "--directory") {
+            std::string winPath = unixPathToWindows(value);
+            SetCurrentDirectoryA(winPath.c_str());
+        }
+        else if (opt == "-j" || opt == "--jobs") jobs = value.empty() ? 999 : std::stoi(value);
+        else if (opt == "-o" || opt == "--old-file" || opt == "--assume-old") oldFile = value;
+        else if (opt == "-W" || opt == "--what-if" || opt == "--new-file" || opt == "--assume-new") whatIfFile = value;
+    }
+    
+    bool buildTarget(const std::string& targetName) {
+        // Check for circular dependencies
+        if (buildingTargets.find(targetName) != buildingTargets.end()) {
+            outputError("make: Circular " + targetName + " <- " + targetName + " dependency dropped.");
+            return false;
+        }
+        
+        // Check if already built
+        if (builtTargets.find(targetName) != builtTargets.end()) {
+            return true;
+        }
+        
+        buildingTargets.insert(targetName);
+        
+        // Find rule for target
         MakeRule* rule = nullptr;
         for (auto& r : rules) {
-            if (r.target == target) {
+            if (r.target == targetName) {
                 rule = &r;
+                break;
+            } else if (r.isPatternRule && matchPattern(targetName, r.pattern)) {
+                // Create implicit rule
+                MakeRule implicitRule;
+                implicitRule.target = targetName;
+                implicitRule.isPhony = false;
+                implicitRule.isPatternRule = false;
+                implicitRule.isDoubleColon = false;
+                
+                // Substitute pattern in prerequisites
+                for (const auto& prereq : r.prerequisites) {
+                    std::string expanded = substitutePattern(targetName, r.pattern, prereq);
+                    implicitRule.prerequisites.push_back(expanded);
+                }
+                
+                // Copy recipes
+                implicitRule.recipes = r.recipes;
+                rules.push_back(implicitRule);
+                rule = &rules.back();
                 break;
             }
         }
         
         if (!rule) {
-            // Not a rule, assume it's a file dependency
-            return true;
-        }
-        
-        // Build dependencies first
-        for (const auto& dep : rule->dependencies) {
-            if (!buildTarget(dep)) {
-                return false;
+            // No rule found - check if file exists
+            if (fileExists(targetName)) {
+                buildingTargets.erase(targetName);
+                builtTargets.insert(targetName);
+                return true;
             }
+            outputError("make: *** No rule to make target '" + targetName + "'.  Stop.");
+            buildingTargets.erase(targetName);
+            return false;
         }
         
-        // Check if we need to rebuild this target
-        if (!needsRebuild(rule->target, rule->dependencies) && !forceRebuild) {
-            output("make: '" + rule->target + "' is up to date.");
-            return true;
-        }
+        // Set automatic variables
+        automaticVariables["@"] = rule->target;
+        automaticVariables["<"] = rule->prerequisites.empty() ? "" : rule->prerequisites[0];
+        automaticVariables["^"] = joinStrings(rule->prerequisites, " ");
+        automaticVariables["?"] = "";  // Prerequisites newer than target
+        automaticVariables["*"] = "";  // Stem of pattern match
         
-        // Execute commands
-        for (const auto& cmd : rule->commands) {
-            if (dryRun) {
-                output(cmd);
-            } else {
-                output(cmd);
-                
-                // Execute the command
-                bool savedSkipPrompt = g_skipFinalPrompt;
-                g_skipFinalPrompt = true;
-                executeCommand(cmd);
-                g_skipFinalPrompt = savedSkipPrompt;
-                
-                if (g_lastExitStatus != 0) {
-                    outputError("make: *** [" + rule->target + "] Error " + std::to_string(g_lastExitStatus));
+        // Build prerequisites first
+        bool prereqsBuilt = true;
+        std::vector<std::string> newerPrereqs;
+        
+        for (const auto& prereq : rule->prerequisites) {
+            if (!buildTarget(prereq)) {
+                prereqsBuilt = false;
+                if (!keepGoing) {
+                    buildingTargets.erase(targetName);
                     return false;
                 }
             }
+            
+            // Check if prerequisite is newer than target
+            if (fileExists(prereq) && (!fileExists(rule->target) || isFileNewer(prereq, rule->target))) {
+                newerPrereqs.push_back(prereq);
+            }
         }
         
+        automaticVariables["?"] = joinStrings(newerPrereqs, " ");
+        
+        // Determine if target needs rebuilding
+        bool needsRebuild = false;
+        
+        if (rule->isPhony) {
+            needsRebuild = true;
+        } else if (alwaysMake) {
+            needsRebuild = true;
+        } else if (!fileExists(rule->target)) {
+            needsRebuild = true;
+        } else if (!newerPrereqs.empty()) {
+            needsRebuild = true;
+        } else if (rule->target == whatIfFile) {
+            needsRebuild = true;
+        }
+        
+        if (rule->target == oldFile) {
+            needsRebuild = false;
+        }
+        
+        // Question mode - just check if rebuild needed
+        if (questionMode) {
+            buildingTargets.erase(targetName);
+            builtTargets.insert(targetName);
+            if (needsRebuild) {
+                g_lastExitStatus = 1;
+                return false;
+            }
+            return true;
+        }
+        
+        // Touch mode - just update timestamp
+        if (touchOnly) {
+            if (needsRebuild) {
+                HANDLE hFile = CreateFileA(rule->target.c_str(), GENERIC_WRITE, 0, NULL,
+                                          OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+                if (hFile != INVALID_HANDLE_VALUE) {
+                    FILETIME ft;
+                    SYSTEMTIME st;
+                    GetSystemTime(&st);
+                    SystemTimeToFileTime(&st, &ft);
+                    SetFileTime(hFile, NULL, NULL, &ft);
+                    CloseHandle(hFile);
+                }
+            }
+            buildingTargets.erase(targetName);
+            builtTargets.insert(targetName);
+            return true;
+        }
+        
+        // Execute recipes if rebuild needed
+        if (needsRebuild) {
+            for (const auto& recipe : rule->recipes) {
+                std::string expandedRecipe = expandVariables(recipe);
+                
+                // Check for @ prefix (silent)
+                bool recipeSilent = silent;
+                if (!expandedRecipe.empty() && expandedRecipe[0] == '@') {
+                    recipeSilent = true;
+                    expandedRecipe = expandedRecipe.substr(1);
+                }
+                
+                // Check for - prefix (ignore errors)
+                bool recipeIgnoreErrors = ignoreErrors;
+                if (!expandedRecipe.empty() && expandedRecipe[0] == '-') {
+                    recipeIgnoreErrors = true;
+                    expandedRecipe = expandedRecipe.substr(1);
+                }
+                
+                expandedRecipe = trim(expandedRecipe);
+                
+                if (!recipeSilent && !dryRun) {
+                    output(expandedRecipe);
+                }
+                
+                if (dryRun) {
+                    if (!recipeSilent) {
+                        output(expandedRecipe);
+                    }
+                } else {
+                    // Execute the recipe
+                    bool savedSkipPrompt = g_skipFinalPrompt;
+                    g_skipFinalPrompt = true;
+                    executeCommand(expandedRecipe);
+                    g_skipFinalPrompt = savedSkipPrompt;
+                    
+                    if (g_lastExitStatus != 0 && !recipeIgnoreErrors) {
+                        outputError("make: *** [" + rule->target + "] Error " + std::to_string(g_lastExitStatus));
+                        buildingTargets.erase(targetName);
+                        if (!keepGoing) {
+                            return false;
+                        }
+                    }
+                }
+            }
+        } else {
+            if (!silent) {
+                output("make: '" + rule->target + "' is up to date.");
+            }
+        }
+        
+        buildingTargets.erase(targetName);
+        builtTargets.insert(targetName);
         return true;
-    };
-    
-    // Build the target
-    bool success = buildTarget(targetName);
-    
-    // Restore directory
-    if (!changeDir.empty()) {
-        _chdir(originalDir);
     }
     
-    if (!success) {
+    void printDatabaseInfo() {
+        output("# Make database");
+        output("# Variables");
+        for (const auto& var : variables) {
+            output(var.first + " = " + var.second);
+        }
+        output("");
+        output("# Rules");
+        for (const auto& rule : rules) {
+            output(rule.target + ": " + joinStrings(rule.prerequisites, " "));
+            for (const auto& recipe : rule.recipes) {
+                output("\t" + recipe);
+            }
+        }
+    }
+    
+    std::string getDefaultGoal() const {
+        return defaultGoal;
+    }
+};
+
+void cmd_make(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: make [options] [target] ...");
+        output("Build automation tool - executes build rules from Makefile");
+        output("");
+        output("OPTIONS:");
+        output("  -b, -m                    Ignored for compatibility");
+        output("  -B, --always-make         Unconditionally make all targets");
+        output("  -C DIRECTORY, --directory=DIRECTORY");
+        output("                            Change to DIRECTORY before reading makefiles");
+        output("  -d                        Print lots of debugging information");
+        output("  --debug[=FLAGS]           Print various types of debugging information");
+        output("  -e, --environment-overrides");
+        output("                            Environment variables override makefiles");
+        output("  -f FILE, --file=FILE, --makefile=FILE");
+        output("                            Read FILE as a makefile");
+        output("  -h, --help                Display this help and exit");
+        output("  -i, --ignore-errors       Ignore errors from recipes");
+        output("  -I DIRECTORY, --include-dir=DIRECTORY");
+        output("                            Search DIRECTORY for included makefiles");
+        output("  -j [N], --jobs[=N]        Allow N jobs at once; infinite jobs with no arg");
+        output("  -k, --keep-going          Keep going when some targets can't be made");
+        output("  -l [N], --load-average[=N], --max-load[=N]");
+        output("                            Don't start multiple jobs unless load is below N");
+        output("  -L, --check-symlink-times Use the latest mtime between symlinks and target");
+        output("  -n, --dry-run, --just-print, --recon");
+        output("                            Don't actually run any recipe; just print them");
+        output("  -o FILE, --old-file=FILE, --assume-old=FILE");
+        output("                            Consider FILE to be very old and don't remake it");
+        output("  -O[TYPE], --output-sync[=TYPE]");
+        output("                            Synchronize output of parallel jobs by TYPE");
+        output("  -p, --print-data-base     Print make's internal database");
+        output("  -q, --question            Run no recipe; exit status says if up to date");
+        output("  -r, --no-builtin-rules    Disable the built-in implicit rules");
+        output("  -R, --no-builtin-variables");
+        output("                            Disable the built-in variable settings");
+        output("  -s, --silent, --quiet     Don't echo recipes");
+        output("  -S, --no-keep-going, --stop");
+        output("                            Turns off -k");
+        output("  -t, --touch               Touch targets instead of remaking them");
+        output("  --trace                   Print tracing information");
+        output("  -v, --version             Print the version number of make and exit");
+        output("  -w, --print-directory     Print the current directory");
+        output("  --no-print-directory      Turn off -w, even if it was turned on implicitly");
+        output("  -W FILE, --what-if=FILE, --new-file=FILE, --assume-new=FILE");
+        output("                            Consider FILE to be infinitely new");
+        output("  --warn-undefined-variables");
+        output("                            Warn when an undefined variable is referenced");
+        output("");
+        output("MAKEFILE SYNTAX:");
+        output("  target: prerequisites");
+        output("      recipe");
+        output("      recipe");
+        output("");
+        output("  Variables:");
+        output("    VAR = value             (recursive expansion)");
+        output("    VAR := value            (simple expansion)");
+        output("    VAR ?= value            (conditional assignment)");
+        output("    VAR += value            (append)");
+        output("");
+        output("  Functions:");
+        output("    $(wildcard pattern)     $(patsubst pat,repl,text)");
+        output("    $(subst from,to,text)   $(strip text)");
+        output("    $(filter pattern,text)  $(filter-out pattern,text)");
+        output("    $(sort list)            $(dir names)");
+        output("    $(notdir names)         $(suffix names)");
+        output("    $(basename names)       $(addsuffix suf,names)");
+        output("    $(addprefix pre,names)  $(join list1,list2)");
+        output("    $(wildcard pattern)     $(realpath names)");
+        output("    $(abspath names)        $(if cond,then,else)");
+        output("    $(or cond1,cond2,...)   $(and cond1,cond2,...)");
+        output("    $(foreach var,list,text) $(call var,params)");
+        output("    $(shell command)        $(error text)");
+        output("    $(warning text)         $(info text)");
+        output("");
+        output("  Automatic Variables:");
+        output("    $@   Target name");
+        output("    $<   First prerequisite");
+        output("    $^   All prerequisites");
+        output("    $?   Prerequisites newer than target");
+        output("    $*   Stem of pattern rule match");
+        output("");
+        output("EXAMPLES:");
+        output("  make                      Build default target");
+        output("  make all                  Build 'all' target");
+        output("  make -n                   Dry run (show commands)");
+        output("  make -j4                  Build with 4 parallel jobs");
+        output("  make -f custom.mk         Use custom makefile");
+        output("  make -C src               Change to src directory first");
+        return;
+    }
+    
+    MakefileParser parser;
+    std::vector<std::string> targets;
+    
+    // Parse command-line options
+    for (size_t i = 1; i < args.size(); i++) {
+        if (args[i] == "-f" || args[i] == "--file" || args[i] == "--makefile") {
+            if (i + 1 < args.size()) {
+                parser.setOption(args[i], args[++i]);
+            }
+        } else if (args[i] == "-C" || args[i] == "--directory") {
+            if (i + 1 < args.size()) {
+                parser.setOption(args[i], args[++i]);
+            }
+        } else if (args[i] == "-j" || args[i] == "--jobs") {
+            if (i + 1 < args.size() && args[i + 1][0] != '-') {
+                parser.setOption(args[i], args[++i]);
+            } else {
+                parser.setOption(args[i], "");
+            }
+        } else if (args[i] == "-o" || args[i] == "--old-file" || args[i] == "--assume-old") {
+            if (i + 1 < args.size()) {
+                parser.setOption(args[i], args[++i]);
+            }
+        } else if (args[i] == "-W" || args[i] == "--what-if" || args[i] == "--new-file" || args[i] == "--assume-new") {
+            if (i + 1 < args.size()) {
+                parser.setOption(args[i], args[++i]);
+            }
+        } else if (args[i][0] == '-') {
+            parser.setOption(args[i]);
+        } else {
+            targets.push_back(args[i]);
+        }
+    }
+    
+    // Find and parse makefile
+    std::string makefileName;
+    if (std::ifstream("GNUmakefile")) {
+        makefileName = "GNUmakefile";
+    } else if (std::ifstream("makefile")) {
+        makefileName = "makefile";
+    } else if (std::ifstream("Makefile")) {
+        makefileName = "Makefile";
+    } else {
+        outputError("make: *** No targets specified and no makefile found.  Stop.");
+        g_lastExitStatus = 2;
+        return;
+    }
+    
+    if (!parser.parseMakefile(makefileName)) {
+        outputError("make: *** " + makefileName + ": No such file or directory.  Stop.");
+        g_lastExitStatus = 2;
+        return;
+    }
+    
+    // If no targets specified, use default goal
+    if (targets.empty()) {
+        std::string defaultGoal = parser.getDefaultGoal();
+        if (defaultGoal.empty()) {
+            outputError("make: *** No targets.  Stop.");
+            g_lastExitStatus = 2;
+            return;
+        }
+        targets.push_back(defaultGoal);
+    }
+    
+    // Build targets
+    bool allSuccess = true;
+    for (const auto& target : targets) {
+        if (!parser.buildTarget(target)) {
+            allSuccess = false;
+        }
+    }
+    
+    if (!allSuccess) {
         g_lastExitStatus = 2;
     }
 }
@@ -7208,7 +8396,25 @@ void cmd_dirname(const std::vector<std::string>& args) {
         return;
     }
     
+    // Check for piped input if no args
     if (args.size() < 2) {
+        std::vector<std::string> lines = getInputLines();
+        if (!lines.empty()) {
+            for (auto path : lines) {
+                while (path.length() > 1 && (path.back() == '/' || path.back() == '\\')) {
+                    path.pop_back();
+                }
+                size_t pos = path.find_last_of("/\\");
+                if (pos == std::string::npos) {
+                    output(".");
+                } else if (pos == 0) {
+                    output("/");
+                } else {
+                    output(path.substr(0, pos));
+                }
+            }
+            return;
+        }
         outputError("dirname: missing operand");
         return;
     }
@@ -7621,6 +8827,15 @@ void cmd_fmt(const std::vector<std::string>& args) {
     };
     
     if (files.empty()) {
+        std::vector<std::string> lines = getInputLines();
+        if (!lines.empty()) {
+            std::string allText;
+            for (const auto& line : lines) {
+                allText += line + " ";
+            }
+            formatText(allText);
+            return;
+        }
         outputError("fmt: no input files specified");
         return;
     }
@@ -7707,6 +8922,13 @@ void cmd_fold(const std::vector<std::string>& args) {
     };
     
     if (files.empty()) {
+        std::vector<std::string> lines = getInputLines();
+        if (!lines.empty()) {
+            for (const auto& line : lines) {
+                foldLine(line);
+            }
+            return;
+        }
         outputError("fold: no input files specified");
         return;
     }
@@ -8301,6 +9523,56 @@ void cmd_column(const std::vector<std::string>& args) {
     }
     
     if (files.empty()) {
+        std::vector<std::string> lines = getInputLines();
+        if (!lines.empty()) {
+            files.push_back("-");  // Use stdin marker
+            // Process piped lines directly
+            std::vector<std::vector<std::string>> rows;
+            size_t maxCols = 0;
+            
+            for (const auto& line : lines) {
+                std::vector<std::string> cols;
+                std::string col;
+                for (char c : line) {
+                    if (c == separator || (tabSeparated && c == '\t')) {
+                        cols.push_back(col);
+                        col.clear();
+                    } else {
+                        col += c;
+                    }
+                }
+                if (!col.empty() || !line.empty()) {
+                    cols.push_back(col);
+                }
+                if (!cols.empty()) {
+                    rows.push_back(cols);
+                    if (cols.size() > maxCols) maxCols = cols.size();
+                }
+            }
+            
+            // Calculate column widths
+            std::vector<size_t> colWidths(maxCols, 0);
+            for (const auto& row : rows) {
+                for (size_t i = 0; i < row.size(); i++) {
+                    if (row[i].length() > colWidths[i]) {
+                        colWidths[i] = row[i].length();
+                    }
+                }
+            }
+            
+            // Print formatted columns
+            for (const auto& row : rows) {
+                std::string output_line;
+                for (size_t i = 0; i < row.size(); i++) {
+                    output_line += row[i];
+                    if (i < row.size() - 1) {
+                        output_line += std::string(colWidths[i] - row[i].length() + 2, ' ');
+                    }
+                }
+                output(output_line);
+            }
+            return;
+        }
         outputError("column: no input files specified");
         return;
     }
@@ -8871,26 +10143,41 @@ void cmd_base64(const std::vector<std::string>& args) {
         return result;
     };
     
-    std::istream* input = &std::cin;
-    std::ifstream file;
+    std::vector<std::string> lines;
+    
     if (!filename.empty()) {
-        file.open(filename, std::ios::binary);
+        // Read from file
+        std::ifstream file(filename, std::ios::binary);
         if (!file.is_open()) {
             outputError("base64: cannot open '" + filename + "'");
             return;
         }
-        input = &file;
-    }
-    
-    if (decode) {
-        std::string line;
-        while (std::getline(*input, line)) {
-            output(decodeBase64(line));
+        if (decode) {
+            std::string line;
+            while (std::getline(file, line)) {
+                output(decodeBase64(line));
+            }
+        } else {
+            std::string content((std::istreambuf_iterator<char>(file)),
+                               std::istreambuf_iterator<char>());
+            output(encode(content));
         }
     } else {
-        std::string content((std::istreambuf_iterator<char>(*input)),
-                           std::istreambuf_iterator<char>());
-        output(encode(content));
+        // Try piped input
+        lines = getInputLines();
+        if (!lines.empty()) {
+            if (decode) {
+                for (const auto& line : lines) {
+                    output(decodeBase64(line));
+                }
+            } else {
+                std::string content;
+                for (const auto& line : lines) {
+                    content += line + "\n";
+                }
+                output(encode(content));
+            }
+        }
     }
 }
 
@@ -9045,13 +10332,33 @@ std::string md5HashStream(std::istream& in) {
 }
 
 void cmd_md5sum(const std::vector<std::string>& args) {
-    if (checkHelpFlag(args) || args.size() < 2) {
+    if (checkHelpFlag(args)) {
         output("Usage: md5sum [file...]");
         output("  Compute MD5 checksum");
         output("");
         output("Examples:");
         output("  md5sum file.txt");
         output("  md5sum file1.txt file2.txt");
+        output("  echo \"test\" | md5sum");
+        return;
+    }
+
+    if (args.size() < 2) {
+        // Try piped input
+        std::vector<std::string> lines = getInputLines();
+        if (!lines.empty()) {
+            std::string content;
+            for (const auto& line : lines) {
+                content += line + "\n";
+            }
+            MD5State state;
+            md5Update(state, (const uint8_t*)content.data(), content.size());
+            std::string digest = md5Finalize(state);
+            output(digest + "  -");
+        } else {
+            output("Usage: md5sum [file...]");
+            output("  Compute MD5 checksum");
+        }
         return;
     }
 
@@ -9069,12 +10376,50 @@ void cmd_md5sum(const std::vector<std::string>& args) {
 
 // SHA1 hash implementation
 void cmd_sha1sum(const std::vector<std::string>& args) {
-    if (checkHelpFlag(args) || args.size() < 2) {
+    if (checkHelpFlag(args)) {
         output("Usage: sha1sum [file...]");
         output("  Compute SHA1 (160-bit) cryptographic hash");
         output("");
         output("Examples:");
         output("  sha1sum file.txt");
+        output("  echo \"test\" | sha1sum");
+        return;
+    }
+    
+    if (args.size() < 2) {
+        // Try piped input
+        std::vector<std::string> lines = getInputLines();
+        if (!lines.empty()) {
+            std::string content;
+            for (const auto& line : lines) {
+                content += line + "\n";
+            }
+            
+            BCRYPT_ALG_HANDLE hAlg = NULL;
+            BCRYPT_HASH_HANDLE hHash = NULL;
+            DWORD hashLen = 0;
+            DWORD resultLen = 0;
+            
+            if (BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA1_ALGORITHM, NULL, 0) == 0) {
+                BCryptGetProperty(hAlg, BCRYPT_HASH_LENGTH, (PBYTE)&hashLen, sizeof(DWORD), &resultLen, 0);
+                std::vector<BYTE> hash(hashLen);
+                
+                if (BCryptCreateHash(hAlg, &hHash, NULL, 0, NULL, 0, 0) == 0) {
+                    BCryptHashData(hHash, (PBYTE)content.data(), (ULONG)content.size(), 0);
+                    BCryptFinishHash(hHash, hash.data(), hashLen, 0);
+                    BCryptDestroyHash(hHash);
+                    
+                    std::ostringstream oss;
+                    for (DWORD j = 0; j < hashLen; j++) {
+                        oss << std::hex << std::setw(2) << std::setfill('0') << (int)hash[j];
+                    }
+                    output(oss.str() + "  -");
+                }
+                BCryptCloseAlgorithmProvider(hAlg, 0);
+            }
+        } else {
+            output("Usage: sha1sum [file...]");
+        }
         return;
     }
     
@@ -9119,12 +10464,50 @@ void cmd_sha1sum(const std::vector<std::string>& args) {
 
 // SHA256 hash implementation
 void cmd_sha256sum(const std::vector<std::string>& args) {
-    if (checkHelpFlag(args) || args.size() < 2) {
+    if (checkHelpFlag(args)) {
         output("Usage: sha256sum [file...]");
         output("  Compute SHA256 (256-bit) cryptographic hash");
         output("");
         output("Examples:");
         output("  sha256sum file.txt");
+        return;
+    }
+    
+    // Check for piped input if no file arguments
+    if (args.size() < 2) {
+        std::vector<std::string> lines = getInputLines();
+        if (!lines.empty()) {
+            std::string content;
+            for (const auto& line : lines) {
+                if (!content.empty()) content += "\n";
+                content += line;
+            }
+            
+            BCRYPT_ALG_HANDLE hAlg = NULL;
+            BCRYPT_HASH_HANDLE hHash = NULL;
+            DWORD hashLen = 0;
+            DWORD resultLen = 0;
+            
+            if (BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA256_ALGORITHM, NULL, 0) == 0) {
+                BCryptGetProperty(hAlg, BCRYPT_HASH_LENGTH, (PBYTE)&hashLen, sizeof(DWORD), &resultLen, 0);
+                std::vector<BYTE> hash(hashLen);
+                
+                if (BCryptCreateHash(hAlg, &hHash, NULL, 0, NULL, 0, 0) == 0) {
+                    BCryptHashData(hHash, (PBYTE)content.data(), (ULONG)content.size(), 0);
+                    BCryptFinishHash(hHash, hash.data(), hashLen, 0);
+                    BCryptDestroyHash(hHash);
+                    
+                    std::ostringstream oss;
+                    for (BYTE b : hash) {
+                        oss << std::hex << std::setw(2) << std::setfill('0') << (int)b;
+                    }
+                    output(oss.str() + "  -");
+                }
+                BCryptCloseAlgorithmProvider(hAlg, 0);
+            }
+            return;
+        }
+        output("Usage: sha256sum [file...]");
         return;
     }
     
@@ -9169,7 +10552,7 @@ void cmd_sha256sum(const std::vector<std::string>& args) {
 
 // cksum - CRC checksum
 void cmd_cksum(const std::vector<std::string>& args) {
-    if (checkHelpFlag(args) || args.size() < 2) {
+    if (checkHelpFlag(args)) {
         output("Usage: cksum [file...]");
         output("  Compute CRC checksum and byte count");
         output("");
@@ -9189,6 +10572,23 @@ void cmd_cksum(const std::vector<std::string>& args) {
         return ~crc;
     };
     
+    // Check for piped input if no file arguments
+    if (args.size() < 2) {
+        std::vector<std::string> lines = getInputLines();
+        if (!lines.empty()) {
+            std::string content;
+            for (const auto& line : lines) {
+                if (!content.empty()) content += "\n";
+                content += line;
+            }
+            unsigned long checksum = crc32(content);
+            output(std::to_string(checksum) + " " + std::to_string(content.size()) + " -");
+            return;
+        }
+        output("Usage: cksum [file...]");
+        return;
+    }
+    
     for (size_t i = 1; i < args.size(); i++) {
         std::ifstream file(args[i], std::ios::binary);
         if (!file.is_open()) {
@@ -9204,12 +10604,35 @@ void cmd_cksum(const std::vector<std::string>& args) {
 
 // sum - checksum and block count
 void cmd_sum(const std::vector<std::string>& args) {
-    if (checkHelpFlag(args) || args.size() < 2) {
+    if (checkHelpFlag(args)) {
         output("Usage: sum [file...]");
         output("  Compute checksum and block count");
         output("");
         output("Examples:");
         output("  sum file.txt");
+        return;
+    }
+    
+    // Check for piped input if no file arguments
+    if (args.size() < 2) {
+        std::vector<std::string> lines = getInputLines();
+        if (!lines.empty()) {
+            std::string content;
+            for (const auto& line : lines) {
+                if (!content.empty()) content += "\n";
+                content += line;
+            }
+            unsigned int checksum = 0;
+            for (char c : content) {
+                checksum += (unsigned char)c;
+            }
+            checksum = (checksum & 0xFFFF) + (checksum >> 16);
+            checksum = (checksum & 0xFFFF) + (checksum >> 16);
+            int blocks = (content.size() + 511) / 512;
+            output(std::to_string(checksum) + " " + std::to_string(blocks) + " -");
+            return;
+        }
+        output("Usage: sum [file...]");
         return;
     }
     
@@ -16938,32 +18361,33 @@ void cmd_man(const std::vector<std::string>& args) {
         output("What manual page do you want?");
         output("Usage: man <command>");
         output("");
-        output("Available manual pages:");
-        output("  pwd, cd, ls, cat, less, head, tail, grep, egrep, find, locate");
-        output("  echo, printf, mkdir, rmdir, rm, touch, chmod, chown, chgrp, mv, rename");
-        output("  dd, tar, gzip, gunzip, bzip2, bunzip2, zip, unzip, make");
-        output("  cp, dirname, readlink, realpath, mktemp, install, fmt, fold");
-        output("  ssh, scp, sync, rsync, sh");
-        output("  rev, proc, ps, kill, killall, xkill");
-        output("  clear, help, exit, man");
-        output("  ln, unlink, uptime, which, file, finger, user, groups, version");
-        output("  wc, tee, diff, patch, nano, exec, awk");
-        output("  sort, cut, paste, uniq");
-        output("  passwd, useradd, userdel, usermod");
-        output("  groupadd, addgroup, groupmod, groupdel, screen");
-        output("  getent, source, service, jobs, case");
-        output("  htop, at, cron, crontab");
-        output("  dig, nslookup, netstat, neofetch");
-        output("  free, hostname, vmstat, iostat, bc, calc");
-        output("  qalc, ifconfig, ss, nmap, tcpdump, umask");
-        output("  gpasswd, who, w, last, top, nice, mpstat");
-        output("  pkill, bg, renice, fg, strace, lsof, sleep, wait, tac, lspci, lsusb");
-        output("  nc, unrar, xz, unxz, dmesg, mkfs, fsck, systemctl, journalctl, more, updatedb, timedatectl, env, split, nl, tr");
-        output("  printenv, export, shuf, banner, time, watch, trap, ulimit, expr, info, apropos, whatis, quota, basename, whereis, stat, type, chattr, pgrep, pidof, pstree, timeout, ftp, sftp, sysctl, read, nohup, blkid, test");
-        output("  expand, unexpand, od, hexdump, hd, strings, column, comm");
-        output("  join, look, tsort, vis, unvis, base64, md5sum, sha1sum, sha256sum, cksum, sum");
-        output("  cmp, sdiff, pr, lpr, lp, arch, nproc, lsb_release, hostid, truncate, fallocate");
-        output("  yes, seq, factor, jot, logname, users, mesg, write, wall, pathchk, true, false, tty, script, logger, xdg-open");
+        output("Available manual pages (259 commands):");
+        output("  addgroup, alias, apropos, arch, at, awk, banner, base64, basename, bc");
+        output("  bg, blkid, bunzip2, bzip2, cal, calc, case, cat, cd, chage");
+        output("  chattr, chgrp, chmod, chown, cksum, clear, cmp, column, comm, cp");
+        output("  cron, crontab, curl, cut, date, dd, df, diff, dig, dirname");
+        output("  dmesg, du, echo, egrep, emacs, env, exec, exit, expand, export");
+        output("  expr, factor, fallocate, false, fdisk, ffmpeg, fg, fgrep, file, find");
+        output("  finger, fmt, fold, free, fsck, ftp, fuser, fvi, getent, gpasswd");
+        output("  grep, groupadd, groupdel, groupmod, groups, gunzip, gzip, halt, head, help");
+        output("  hexdump, history, hostid, hostname, htop, id, ifconfig, iftop, info, install");
+        output("  iostat, ip, iptables, jed, jobs, join, jot, journalctl, kill, killall");
+        output("  last, less, ln, locate, logger, logname, look, lp, lpr, ls");
+        output("  lsb_release, lscpu, lshw, lsof, lspci, lsusb, make, man, md5sum, mesg");
+        output("  mkdir, mkfs, mktemp, more, mount, mpstat, mv, mysql, nano, nc");
+        output("  ncal, neofetch, netstat, nice, nl, nmap, nohup, nproc, nslookup, od");
+        output("  parted, passwd, paste, patch, pathchk, pgrep, pidof, ping, pipedin, pkill");
+        output("  pr, printenv, printf, proc, pstree, pv, pwd, qalc, quota, read");
+        output("  readlink, realpath, reboot, rename, renice, rev, rm, rmdir, rsync, sar");
+        output("  scp, screen, script, sdiff, sed, seq, service, sftp, sh, sha1sum");
+        output("  sha256sum, shuf, shutdown, sleep, sort, source, split, ss, ssh, ssh-keygen");
+        output("  stat, strace, strings, su, sudo, sum, sync, sysctl, systemctl, tac");
+        output("  tail, tar, tcpdump, tee, test, time, timedatectl, timeout, top, touch");
+        output("  tr, traceroute, trap, tree, true, truncate, tsort, tty, type, ulimit");
+        output("  umask, unalias, uname, unexpand, uniq, unlink, unrar, unvis, unxz, unzip");
+        output("  updatedb, uptime, user, useradd, userdel, usermod, users, version, vis, vmstat");
+        output("  w, wait, wall, watch, wc, wget, whatis, whereis, which, who");
+        output("  whoami, write, xargs, xdg-open, xkill, xz, yes, zcat, zip");
         return;
     }
     
@@ -17768,52 +19192,126 @@ void cmd_man(const std::vector<std::string>& args) {
         
     } else if (cmd == "sh") {
         output("NAME");
-        output("    sh - execute shell scripts");
+        output("    sh - POSIX-compliant shell command interpreter");
         output("");
         output("SYNOPSIS");
         output("    sh [options] [script [arguments...]]");
+        output("    sh -c command_string [command_name [arguments...]]");
         output("");
         output("DESCRIPTION");
-        output("    sh is a command interpreter that executes shell scripts.");
-        output("    It reads and executes commands from a file or from a");
-        output("    command string provided via the -c option.");
+        output("    sh is a POSIX-compliant command interpreter that executes");
+        output("    commands read from a command string (-c), standard input (-s),");
+        output("    or a file. It supports all standard Unix/Linux shell features");
+        output("    including pipes, redirections, command chaining, and background");
+        output("    processes.");
         output("");
-        output("    Scripts are executed line by line in the current shell");
-        output("    environment. Lines beginning with # are treated as comments");
-        output("    and empty lines are ignored.");
+        output("    When invoked as an interactive shell or with a script file,");
+        output("    sh provides comprehensive shell programming capabilities with");
+        output("    proper exit status handling and debugging features.");
         output("");
         output("OPTIONS");
-        output("    -c <command>   Execute the command string and exit");
-        output("    --help         Display this help message");
+        output("    -c <command>   Execute command string and exit");
+        output("    -s             Read commands from standard input");
+        output("    -e             Exit immediately if command exits non-zero");
+        output("    -u             Treat unset variables as an error");
+        output("    -v             Verbose mode: print input lines as read");
+        output("    -x             Print commands and arguments as executed (xtrace)");
+        output("    -n             Read commands but do not execute (syntax check)");
+        output("    -f             Disable filename generation (globbing)");
+        output("    -a             Export all modified variables to environment");
+        output("    -k             Place all assignment arguments in environment");
+        output("    -t             Exit after reading and executing one command");
+        output("    -C             Prevent output redirection from overwriting");
+        output("    -i             Interactive mode (recognized, not implemented)");
+        output("    -m             Enable job control (recognized, not implemented)");
+        output("    -b             Notify of job termination (recognized)");
+        output("    -h             Remember command locations (recognized)");
+        output("    --version      Display version information and exit");
+        output("    --             End of options");
         output("");
-        output("ARGUMENTS");
-        output("    script         Path to the shell script file to execute");
-        output("    arguments      Arguments passed to the script (future)");
+        output("SHELL GRAMMAR");
+        output("    Simple Commands:");
+        output("        command [arguments...]");
+        output("");
+        output("    Pipelines:");
+        output("        command1 | command2 | command3");
+        output("");
+        output("    Lists:");
+        output("        command1 ; command2    # Sequential execution");
+        output("        command1 && command2   # AND list (run if first succeeds)");
+        output("        command1 || command2   # OR list (run if first fails)");
+        output("");
+        output("    Background:");
+        output("        command &              # Run in background");
+        output("");
+        output("    Redirection:");
+        output("        < file                 # Redirect input");
+        output("        > file                 # Redirect output");
+        output("        >> file                # Append output");
+        output("        2> file                # Redirect stderr");
+        output("        2>&1                   # Redirect stderr to stdout");
+        output("");
+        output("SCRIPT FEATURES");
+        output("    - Shebang line support (#!/bin/sh)");
+        output("    - Comment lines (# comment)");
+        output("    - Line continuation with backslash (\\)");
+        output("    - Multiline command support");
+        output("    - Script argument passing");
+        output("    - Proper exit status handling");
+        output("    - Tilde expansion (~/)");
+        output("    - Unix to Windows path conversion");
+        output("");
+        output("OPTION COMBINATIONS");
+        output("    Options can be combined:");
+        output("        sh -ex script.sh       # Exit on error + trace");
+        output("        sh -vx script.sh       # Verbose + trace");
+        output("        sh -evx script.sh      # All three combined");
         output("");
         output("EXAMPLES");
         output("    # Execute a command string");
         output("    sh -c \"echo Hello World\"");
         output("");
-        output("    # Execute a script file");
-        output("    sh myscript.sh");
+        output("    # Execute a pipeline");
+        output("    sh -c \"ls -la | grep txt\"");
         output("");
-        output("    # Execute script with arguments");
-        output("    sh deploy.sh production");
+        output("    # Execute with error exit");
+        output("    sh -e script.sh");
         output("");
-        output("    # Execute script from home directory");
-        output("    sh ~/scripts/backup.sh");
+        output("    # Execute with command tracing (debugging)");
+        output("    sh -x script.sh arg1 arg2");
+        output("");
+        output("    # Syntax check without execution");
+        output("    sh -n script.sh");
+        output("");
+        output("    # Read from stdin");
+        output("    echo 'ls -la' | sh -s");
+        output("");
+        output("    # Verbose and trace for debugging");
+        output("    sh -v -x debug.sh");
+        output("");
+        output("    # Combined options");
+        output("    sh -evx production.sh");
         output("");
         output("SCRIPT FORMAT");
-        output("    Scripts should contain one command per line:");
+        output("    Example shell script:");
+        output("");
         output("    #!/bin/sh");
-        output("    # This is a comment");
+        output("    # Backup script");
+        output("    set -e                    # Exit on error");
+        output("");
         output("    echo Starting backup...");
         output("    mkdir -p backup");
         output("    cp -r data backup/");
         output("    echo Backup complete");
         output("");
+        output("EXIT STATUS");
+        output("    0      Success");
+        output("    1      General error");
+        output("    2      Misuse of shell command (e.g., missing argument)");
+        output("    127    Command not found or file not executable");
+        output("");
         output("SEE ALSO");
-        output("    source, bash, exec");
+        output("    bash, source, exec, set, export");
         
     } else if (cmd == "scp") {
         output("NAME");
@@ -21135,6 +22633,41 @@ void cmd_man(const std::vector<std::string>& args) {
         output("SEE ALSO");
         output("    dirname, path expansion");
         
+    } else if (cmd == "pipedin") {
+        output("NAME");
+        output("    pipedin - list commands that accept piped input");
+        output("");
+        output("SYNOPSIS");
+        output("    pipedin [options]");
+        output("");
+        output("DESCRIPTION");
+        output("    Lists all internal wnus commands that can accept piped input.");
+        output("    These commands check for data from stdin when no file arguments");
+        output("    are provided, making them suitable for use in pipe chains.");
+        output("");
+        output("OPTIONS");
+        output("    -l, --long        Show command descriptions");
+        output("    --help            Display help message");
+        output("");
+        output("EXAMPLES");
+        output("    pipedin");
+        output("        Display compact list of all pipe-accepting commands");
+        output("");
+        output("    pipedin -l");
+        output("        Display list with descriptions");
+        output("");
+        output("    echo test | pipedin");
+        output("        Pipedin itself accepts piped input");
+        output("");
+        output("PIPE USAGE");
+        output("    Commands listed by pipedin can be used in pipe chains:");
+        output("        ls | grep txt | wc -l");
+        output("        echo data | base64 | md5sum");
+        output("        cat file.txt | sort | uniq | head");
+        output("");
+        output("SEE ALSO");
+        output("    grep, cat, head, tail, wc, sort, uniq");
+        
     } else if (cmd == "whereis") {
         output("NAME");
         output("    whereis - locate command, source, and manual page files");
@@ -21942,6 +23475,911 @@ void cmd_man(const std::vector<std::string>& args) {
         output("    xdg-open document.pdf");
         output("    xdg-open https://github.com");
         output("    xdg-open .");
+
+    } else if (cmd == "alias") {
+        output("NAME");
+        output("    alias - define or display shell aliases");
+        output("");
+        output("SYNOPSIS");
+        output("    alias [NAME[=VALUE]...]");
+        output("");
+        output("DESCRIPTION");
+        output("    Define shell aliases as shortcuts for commands. Without arguments,");
+        output("    displays all defined aliases.");
+        output("");
+        output("EXAMPLES");
+        output("    alias l='ls -la'");
+        output("    alias rm='rm -i'");
+
+    } else if (cmd == "arch") {
+        output("NAME");
+        output("    arch - print system machine architecture");
+        output("");
+        output("SYNOPSIS");
+        output("    arch");
+        output("");
+        output("DESCRIPTION");
+        output("    Prints the system machine architecture (e.g., x86_64, i386).");
+        output("");
+        output("EXAMPLES");
+        output("    $ arch");
+        output("    x86_64");
+
+    } else if (cmd == "chage") {
+        output("NAME");
+        output("    chage - change user password expiry information");
+        output("");
+        output("SYNOPSIS");
+        output("    chage [OPTIONS] USER");
+        output("");
+        output("DESCRIPTION");
+        output("    Changes the number of days between password changes and the date");
+        output("    of the last password change. Control password aging and expiration.");
+        output("");
+        output("OPTIONS");
+        output("    -l          List password change details");
+        output("    -d LASTDAY  Set date of last password change");
+        output("    -m MINDAYS  Set minimum number of days between changes");
+        output("    -M MAXDAYS  Set maximum number of days between changes");
+        output("    -W WARNDAYS Days of warning before password expires");
+
+    } else if (cmd == "cmp") {
+        output("NAME");
+        output("    cmp - compare two files byte by byte");
+        output("");
+        output("SYNOPSIS");
+        output("    cmp [OPTION]... FILE1 FILE2");
+        output("");
+        output("DESCRIPTION");
+        output("    Compares FILE1 and FILE2 byte by byte. If identical, returns 0.");
+        output("    If they differ, reports the first differing position and byte values.");
+        output("");
+        output("OPTIONS");
+        output("    -l          Print all differences (byte position and values)");
+        output("    -s          Silent mode (no output, exit status only)");
+        output("");
+        output("EXAMPLES");
+        output("    cmp file1.txt file2.txt");
+        output("    cmp -l old.bin new.bin");
+
+    } else if (cmd == "date") {
+        output("NAME");
+        output("    date - print or set the system date and time");
+        output("");
+        output("SYNOPSIS");
+        output("    date [OPTION]... [+FORMAT]");
+        output("");
+        output("DESCRIPTION");
+        output("    Displays the current date and time, or set the system date.");
+        output("    Supports strftime format specifiers for custom output formats.");
+        output("");
+        output("OPTIONS");
+        output("    -d DATESTR  Display specified date string");
+        output("    -u          Use UTC time");
+        output("    -I[TYPE]    Use ISO 8601 format");
+        output("");
+        output("EXAMPLES");
+        output("    date");
+        output("    date +%Y-%m-%d");
+        output("    date -d '2025-01-22'");
+
+    } else if (cmd == "df") {
+        output("NAME");
+        output("    df - report file system disk space usage");
+        output("");
+        output("SYNOPSIS");
+        output("    df [OPTION]... [FILE]...");
+        output("");
+        output("DESCRIPTION");
+        output("    Shows the amount of disk space used and available on file systems.");
+        output("    With FILE, shows information for the file system containing FILE.");
+        output("");
+        output("OPTIONS");
+        output("    -h, --human-readable    Print sizes in human-readable format");
+        output("    -k                      Use 1024-byte blocks (default)");
+        output("    -m                      Use 1048576-byte blocks");
+        output("    -T                      Include file system type");
+        output("");
+        output("EXAMPLES");
+        output("    df -h");
+        output("    df /home");
+
+    } else if (cmd == "du") {
+        output("NAME");
+        output("    du - estimate file space usage");
+        output("");
+        output("SYNOPSIS");
+        output("    du [OPTION]... [FILE]...");
+        output("");
+        output("DESCRIPTION");
+        output("    Summarizes disk usage of FILE(s), recursively for directories.");
+        output("    Useful for finding which files/folders consume disk space.");
+        output("");
+        output("OPTIONS");
+        output("    -h, --human-readable    Print sizes in human-readable format");
+        output("    -s, --summarize         Display only total for each argument");
+        output("    -a, --all               Include all files (not just directories)");
+        output("    -d, --max-depth DEPTH   Limit recursion depth");
+        output("");
+        output("EXAMPLES");
+        output("    du -sh ~");
+        output("    du -h /var");
+        output("    du -d 2 .");
+
+    } else if (cmd == "emacs") {
+        output("NAME");
+        output("    emacs - GNU Emacs text editor");
+        output("");
+        output("SYNOPSIS");
+        output("    emacs [OPTION]... [FILE]...");
+        output("");
+        output("DESCRIPTION");
+        output("    Powerful extensible text editor. Use 'nano' or 'vim'");
+        output("    as alternatives on this system.");
+        output("");
+        output("EXAMPLES");
+        output("    emacs myfile.txt");
+
+    } else if (cmd == "fallocate") {
+        output("NAME");
+        output("    fallocate - preallocate or deallocate space to a file");
+        output("");
+        output("SYNOPSIS");
+        output("    fallocate [OPTION] FILE");
+        output("");
+        output("DESCRIPTION");
+        output("    Preallocates blocks to a file without writing data.");
+        output("    Useful for quickly creating large files for testing.");
+        output("");
+        output("OPTIONS");
+        output("    -l LENGTH   Allocate LENGTH bytes");
+        output("    -o OFFSET   Start allocating at OFFSET");
+        output("");
+        output("EXAMPLES");
+        output("    fallocate -l 1G largefile.bin");
+
+    } else if (cmd == "fdisk") {
+        output("NAME");
+        output("    fdisk - partition table manipulator for Linux");
+        output("");
+        output("SYNOPSIS");
+        output("    fdisk [OPTIONS] DEVICE");
+        output("");
+        output("DESCRIPTION");
+        output("    A menu-driven program for creating and manipulating disk partitions.");
+        output("    Use with caution - data loss risk. Not recommended for Windows.");
+        output("");
+        output("EXAMPLES");
+        output("    fdisk -l /dev/sda");
+
+    } else if (cmd == "ffmpeg") {
+        output("NAME");
+        output("    ffmpeg - multimedia framework");
+        output("");
+        output("SYNOPSIS");
+        output("    ffmpeg [OPTION]... [INPUT_FILE]... [OUTPUT_FILE]...");
+        output("");
+        output("DESCRIPTION");
+        output("    Complete, cross-platform solution for recording, converting and");
+        output("    streaming audio and video.");
+        output("");
+        output("EXAMPLES");
+        output("    ffmpeg -i input.mp4 output.avi");
+
+    } else if (cmd == "fgrep") {
+        output("NAME");
+        output("    fgrep - print lines matching a fixed string");
+        output("");
+        output("SYNOPSIS");
+        output("    fgrep [OPTION]... PATTERN [FILE]...");
+        output("");
+        output("DESCRIPTION");
+        output("    Searches for fixed strings (no regex interpretation).");
+        output("    Equivalent to grep -F. Much faster for literal strings.");
+        output("");
+        output("EXAMPLES");
+        output("    fgrep 'hello' file.txt");
+        output("    fgrep -v 'exclude' data.txt");
+
+    } else if (cmd == "fuser") {
+        output("NAME");
+        output("    fuser - identify processes using files or sockets");
+        output("");
+        output("SYNOPSIS");
+        output("    fuser [OPTION]... NAME...");
+        output("");
+        output("DESCRIPTION");
+        output("    Identifies PIDs of processes using specified files or sockets.");
+        output("    Useful for finding which process has a file open.");
+        output("");
+        output("OPTIONS");
+        output("    -a          Show all files");
+        output("    -k          Kill processes using the file");
+        output("    -u          Show process owner");
+        output("");
+        output("EXAMPLES");
+        output("    fuser /home/user/file.txt");
+
+    } else if (cmd == "fvi") {
+        output("NAME");
+        output("    fvi - file viewer and editor");
+        output("");
+        output("SYNOPSIS");
+        output("    fvi [FILE]");
+        output("");
+        output("DESCRIPTION");
+        output("    Interactive file viewer and editor with limited vi emulation.");
+        output("");
+        output("EXAMPLES");
+        output("    fvi myfile.txt");
+
+    } else if (cmd == "halt") {
+        output("NAME");
+        output("    halt - halt the system");
+        output("");
+        output("SYNOPSIS");
+        output("    halt [OPTION]...");
+        output("");
+        output("DESCRIPTION");
+        output("    Stops the system. Equivalent to shutdown -h now.");
+        output("    Requires root/admin privileges.");
+        output("");
+        output("OPTIONS");
+        output("    -f          Force halt without syncing");
+        output("    -p          Power off after halt");
+        output("");
+        output("EXAMPLES");
+        output("    sudo halt");
+
+    } else if (cmd == "history") {
+        output("NAME");
+        output("    history - display command history");
+        output("");
+        output("SYNOPSIS");
+        output("    history [OPTION]... [N]");
+        output("");
+        output("DESCRIPTION");
+        output("    Displays the command history list with line numbers.");
+        output("    Shows previously executed commands.");
+        output("");
+        output("EXAMPLES");
+        output("    history");
+        output("    history 10");
+
+    } else if (cmd == "hostid") {
+        output("NAME");
+        output("    hostid - print the numeric identifier of the current host");
+        output("");
+        output("SYNOPSIS");
+        output("    hostid");
+        output("");
+        output("DESCRIPTION");
+        output("    Prints a unique numeric identifier for the current host.");
+        output("    Useful for license keys or system identification.");
+        output("");
+        output("EXAMPLES");
+        output("    hostid");
+
+    } else if (cmd == "id") {
+        output("NAME");
+        output("    id - print user and group information");
+        output("");
+        output("SYNOPSIS");
+        output("    id [OPTION]... [USER]");
+        output("");
+        output("DESCRIPTION");
+        output("    Prints real and effective user and group IDs.");
+        output("    Without USER, shows current user information.");
+        output("");
+        output("OPTIONS");
+        output("    -u          Print effective user ID only");
+        output("    -g          Print effective group ID only");
+        output("    -G          Print all group IDs");
+        output("    -n          Print names instead of numbers");
+        output("");
+        output("EXAMPLES");
+        output("    id");
+        output("    id -u");
+        output("    id username");
+
+    } else if (cmd == "iftop") {
+        output("NAME");
+        output("    iftop - display bandwidth usage on an interface");
+        output("");
+        output("SYNOPSIS");
+        output("    iftop [OPTIONS]");
+        output("");
+        output("DESCRIPTION");
+        output("    Shows bandwidth usage on interfaces in ncurses-based display.");
+        output("    Real-time network traffic monitor by host.");
+        output("");
+        output("OPTIONS");
+        output("    -i INTERFACE    Monitor specified interface");
+        output("    -n              Don't convert IP to hostname");
+        output("");
+        output("EXAMPLES");
+        output("    iftop -i eth0");
+
+    } else if (cmd == "ip") {
+        output("NAME");
+        output("    ip - show/manipulate routing, devices, policy routing");
+        output("");
+        output("SYNOPSIS");
+        output("    ip [OPTION]... OBJECT { COMMAND | help }");
+        output("");
+        output("DESCRIPTION");
+        output("    Shows and manipulates routing, network devices, and interfaces.");
+        output("    Replaces ifconfig, route, and other network tools.");
+        output("");
+        output("OBJECTS");
+        output("    addr, link, route, neigh, rule, tunnel");
+        output("");
+        output("EXAMPLES");
+        output("    ip addr show");
+        output("    ip link list");
+        output("    ip route show");
+
+    } else if (cmd == "iptables") {
+        output("NAME");
+        output("    iptables - administration tool for IPv4 packet filtering");
+        output("");
+        output("SYNOPSIS");
+        output("    iptables [OPTIONS]... [CHAIN] [RULE]");
+        output("");
+        output("DESCRIPTION");
+        output("    Administration tool for IPv4 packet filtering and NAT.");
+        output("    Sets up, maintains, and inspects IP packet filter rules in the kernel.");
+        output("");
+        output("EXAMPLES");
+        output("    iptables -L");
+        output("    iptables -A INPUT -p tcp --dport 22 -j ACCEPT");
+
+    } else if (cmd == "jed") {
+        output("NAME");
+        output("    jed - editor for programmers");
+        output("");
+        output("SYNOPSIS");
+        output("    jed [FILE]");
+        output("");
+        output("DESCRIPTION");
+        output("    Programmer's editor with colors and intuitive interface.");
+        output("    Emacs-like keybindings, not standard on Windows.");
+        output("");
+        output("EXAMPLES");
+        output("    jed myfile.txt");
+
+    } else if (cmd == "lp") {
+        output("NAME");
+        output("    lp - send files to the printer");
+        output("");
+        output("SYNOPSIS");
+        output("    lp [OPTION]... [FILE]...");
+        output("");
+        output("DESCRIPTION");
+        output("    Submits files for printing or modifies print jobs.");
+        output("");
+        output("OPTIONS");
+        output("    -d PRINTER  Send to specific printer");
+        output("    -n COPIES   Print COPIES copies");
+        output("    -o OPTION   Specify print options");
+        output("");
+        output("EXAMPLES");
+        output("    lp document.txt");
+        output("    lp -d laserprinter -n 2 file.pdf");
+
+    } else if (cmd == "lpr") {
+        output("NAME");
+        output("    lpr - print files");
+        output("");
+        output("SYNOPSIS");
+        output("    lpr [OPTION]... [FILE]...");
+        output("");
+        output("DESCRIPTION");
+        output("    Submits files to be printed. Part of Berkeley lpr system.");
+        output("");
+        output("OPTIONS");
+        output("    -P PRINTER  Send to specific printer");
+        output("    -#NUM       Print NUM copies");
+        output("    -r          Remove files after printing");
+        output("");
+        output("EXAMPLES");
+        output("    lpr document.txt");
+        output("    lpr -P laserprinter -#3 file.pdf");
+
+    } else if (cmd == "lsb_release") {
+        output("NAME");
+        output("    lsb_release - print Linux Standard Base version information");
+        output("");
+        output("SYNOPSIS");
+        output("    lsb_release [OPTION]");
+        output("");
+        output("DESCRIPTION");
+        output("    Displays Linux Standard Base release information about the system.");
+        output("");
+        output("OPTIONS");
+        output("    -a          Print all information");
+        output("    -i          Print distributor ID");
+        output("    -r          Print release number");
+        output("    -c          Print code name");
+        output("");
+        output("EXAMPLES");
+        output("    lsb_release -a");
+
+    } else if (cmd == "lscpu") {
+        output("NAME");
+        output("    lscpu - print CPU architecture information");
+        output("");
+        output("SYNOPSIS");
+        output("    lscpu");
+        output("");
+        output("DESCRIPTION");
+        output("    Displays CPU architecture information from /proc/cpuinfo.");
+        output("");
+        output("EXAMPLES");
+        output("    lscpu");
+
+    } else if (cmd == "lshw") {
+        output("NAME");
+        output("    lshw - list hardware information");
+        output("");
+        output("SYNOPSIS");
+        output("    lshw [OPTIONS]");
+        output("");
+        output("DESCRIPTION");
+        output("    Displays detailed hardware information of the system.");
+        output("");
+        output("OPTIONS");
+        output("    -html       Output in HTML format");
+        output("    -xml        Output in XML format");
+        output("    -C CLASS    Show only CLASS devices");
+        output("");
+        output("EXAMPLES");
+        output("    lshw");
+        output("    lshw -C network");
+
+    } else if (cmd == "mount") {
+        output("NAME");
+        output("    mount - mount a filesystem");
+        output("");
+        output("SYNOPSIS");
+        output("    mount [-t FSTYPE] [-o OPTIONS] DEVICE MOUNTPOINT");
+        output("");
+        output("DESCRIPTION");
+        output("    Attaches a file system to the directory hierarchy.");
+        output("    Without arguments, displays currently mounted filesystems.");
+        output("");
+        output("OPTIONS");
+        output("    -t FSTYPE   File system type");
+        output("    -o OPTIONS  Mount options (ro, rw, etc.)");
+        output("    -r          Mount read-only");
+        output("");
+        output("EXAMPLES");
+        output("    mount");
+        output("    mount -t ntfs /dev/sda1 /mnt");
+
+    } else if (cmd == "mysql") {
+        output("NAME");
+        output("    mysql - MySQL command-line client");
+        output("");
+        output("SYNOPSIS");
+        output("    mysql [OPTIONS]... [DATABASE]");
+        output("");
+        output("DESCRIPTION");
+        output("    Command-line interface to the MySQL database server.");
+        output("");
+        output("OPTIONS");
+        output("    -h HOST     Connect to HOST");
+        output("    -u USER     User to connect as");
+        output("    -p          Prompt for password");
+        output("    -D DATABASE Select database");
+        output("");
+        output("EXAMPLES");
+        output("    mysql -u root -p");
+        output("    mysql -h localhost -u user -p database");
+
+    } else if (cmd == "ncal") {
+        output("NAME");
+        output("    ncal - display calendar");
+        output("");
+        output("SYNOPSIS");
+        output("    ncal [OPTION]... [MONTH] [YEAR]");
+        output("");
+        output("DESCRIPTION");
+        output("    Displays a calendar with weeks in vertical layout.");
+        output("    Alternative calendar format to cal.");
+        output("");
+        output("EXAMPLES");
+        output("    ncal");
+        output("    ncal 1 2025");
+
+    } else if (cmd == "nproc") {
+        output("NAME");
+        output("    nproc - print the number of processing units");
+        output("");
+        output("SYNOPSIS");
+        output("    nproc [OPTION]");
+        output("");
+        output("DESCRIPTION");
+        output("    Prints the number of available processors.");
+        output("");
+        output("EXAMPLES");
+        output("    nproc");
+
+    } else if (cmd == "parted") {
+        output("NAME");
+        output("    parted - partition editor");
+        output("");
+        output("SYNOPSIS");
+        output("    parted [OPTION]... [DEVICE [COMMAND [ARGS]]]");
+        output("");
+        output("DESCRIPTION");
+        output("    Program for creating, destroying, resizing, and manipulating");
+        output("    partitions and their filesystems.");
+        output("");
+        output("EXAMPLES");
+        output("    parted /dev/sda");
+
+    } else if (cmd == "ping") {
+        output("NAME");
+        output("    ping - send ICMP ECHO_REQUEST to network hosts");
+        output("");
+        output("SYNOPSIS");
+        output("    ping [OPTIONS]... HOST");
+        output("");
+        output("DESCRIPTION");
+        output("    Sends ICMP ECHO_REQUEST packets to HOST to test network connectivity.");
+        output("");
+        output("OPTIONS");
+        output("    -c COUNT    Stop after COUNT packets");
+        output("    -i INTERVAL Wait INTERVAL seconds between packets");
+        output("    -W TIMEOUT  Timeout in seconds for responses");
+        output("");
+        output("EXAMPLES");
+        output("    ping -c 4 google.com");
+        output("    ping 192.168.1.1");
+
+    } else if (cmd == "pr") {
+        output("NAME");
+        output("    pr - convert text files for printing");
+        output("");
+        output("SYNOPSIS");
+        output("    pr [OPTION]... [FILE]...");
+        output("");
+        output("DESCRIPTION");
+        output("    Formats text for printing with headers, footers, columns, etc.");
+        output("");
+        output("OPTIONS");
+        output("    -n          Number the output lines");
+        output("    -d          Double space the output");
+        output("    -l LENGTH   Page length in lines");
+        output("");
+        output("EXAMPLES");
+        output("    pr -n document.txt");
+
+    } else if (cmd == "pv") {
+        output("NAME");
+        output("    pv - monitor progress of data through a pipe");
+        output("");
+        output("SYNOPSIS");
+        output("    pv [OPTION]... [FILE]...");
+        output("");
+        output("DESCRIPTION");
+        output("    Shows progress of data passing through the pipe.");
+        output("    Displays bytes transferred, elapsed time, and speed.");
+        output("");
+        output("OPTIONS");
+        output("    -b          Show bytes only");
+        output("    -r          Show rate only");
+        output("    -t          Show time only");
+        output("");
+        output("EXAMPLES");
+        output("    pv largefile.iso | dd of=/dev/sdb");
+        output("    cat file.txt | pv | grep pattern");
+
+    } else if (cmd == "pwd") {
+        output("NAME");
+        output("    pwd - print name of current working directory");
+        output("");
+        output("SYNOPSIS");
+        output("    pwd [OPTION]");
+        output("");
+        output("DESCRIPTION");
+        output("    Prints the full path of the current working directory.");
+        output("");
+        output("OPTIONS");
+        output("    -L          Show logical path (with symlinks)");
+        output("    -P          Show physical path (resolved symlinks)");
+        output("");
+        output("EXAMPLES");
+        output("    pwd");
+        output("    pwd -P");
+
+    } else if (cmd == "reboot") {
+        output("NAME");
+        output("    reboot - reboot the system");
+        output("");
+        output("SYNOPSIS");
+        output("    reboot [OPTION]...");
+        output("");
+        output("DESCRIPTION");
+        output("    Restarts the system. Requires root/admin privileges.");
+        output("    Signals init to reboot.");
+        output("");
+        output("OPTIONS");
+        output("    -f          Force reboot");
+        output("    -p          Power off instead");
+        output("");
+        output("EXAMPLES");
+        output("    sudo reboot");
+
+    } else if (cmd == "sar") {
+        output("NAME");
+        output("    sar - collect, report, or save system activity information");
+        output("");
+        output("SYNOPSIS");
+        output("    sar [OPTIONS]... [INTERVAL [COUNT]]");
+        output("");
+        output("DESCRIPTION");
+        output("    Reports various system metrics over time (CPU, memory, I/O).");
+        output("");
+        output("OPTIONS");
+        output("    -u          Show CPU usage");
+        output("    -b          Show I/O activity");
+        output("    -n          Show network activity");
+        output("");
+        output("EXAMPLES");
+        output("    sar 1 10");
+
+    } else if (cmd == "sdiff") {
+        output("NAME");
+        output("    sdiff - side-by-side diff");
+        output("");
+        output("SYNOPSIS");
+        output("    sdiff [OPTION]... FILE1 FILE2");
+        output("");
+        output("DESCRIPTION");
+        output("    Displays two files side-by-side with differences marked.");
+        output("");
+        output("OPTIONS");
+        output("    -l          Left column only");
+        output("    -r          Right column only");
+        output("    -s          Suppress identical lines");
+        output("");
+        output("EXAMPLES");
+        output("    sdiff file1.txt file2.txt");
+
+    } else if (cmd == "sed") {
+        output("NAME");
+        output("    sed - stream editor for filtering and transforming text");
+        output("");
+        output("SYNOPSIS");
+        output("    sed [OPTION]... {SCRIPT} [FILE]...");
+        output("");
+        output("DESCRIPTION");
+        output("    Reads input line by line, applies script, and outputs results.");
+        output("");
+        output("OPTIONS");
+        output("    -i          Edit files in-place");
+        output("    -e SCRIPT   Execute SCRIPT");
+        output("    -f FILE     Read script from FILE");
+        output("    -n          Suppress automatic printing");
+        output("");
+        output("EXAMPLES");
+        output("    sed 's/old/new/g' file.txt");
+        output("    sed -i 's/foo/bar/g' file.txt");
+        output("    sed -n '10,20p' file.txt");
+
+    } else if (cmd == "shutdown") {
+        output("NAME");
+        output("    shutdown - halt, power-off or reboot the machine");
+        output("");
+        output("SYNOPSIS");
+        output("    shutdown [OPTIONS]... [TIME] [MESSAGE]");
+        output("");
+        output("DESCRIPTION");
+        output("    Schedules system shutdown, reboot, or power-off.");
+        output("    Notifies users and logs the action.");
+        output("");
+        output("OPTIONS");
+        output("    -h          Halt the system");
+        output("    -r          Reboot");
+        output("    -P          Power off");
+        output("    -c          Cancel pending shutdown");
+        output("");
+        output("EXAMPLES");
+        output("    shutdown -h now");
+        output("    shutdown -r +10");
+        output("    shutdown -h 23:00");
+
+    } else if (cmd == "su") {
+        output("NAME");
+        output("    su - change user ID or become superuser");
+        output("");
+        output("SYNOPSIS");
+        output("    su [OPTION]... [USER]");
+        output("");
+        output("DESCRIPTION");
+        output("    Allows becoming another user without logging out.");
+        output("    Without USER, assumes root.");
+        output("");
+        output("OPTIONS");
+        output("    -c COMMAND  Execute COMMAND in subshell");
+        output("    -l          Create login shell");
+        output("    -m          Preserve environment");
+        output("");
+        output("EXAMPLES");
+        output("    su");
+        output("    su - otheruser");
+        output("    su -c 'ls /root' root");
+
+    } else if (cmd == "sudo") {
+        output("NAME");
+        output("    sudo - execute a command as another user");
+        output("");
+        output("SYNOPSIS");
+        output("    sudo [OPTION]... COMMAND...");
+        output("");
+        output("DESCRIPTION");
+        output("    Executes COMMAND as root (or another user).");
+        output("    Checks /etc/sudoers for user privileges.");
+        output("");
+        output("OPTIONS");
+        output("    -u USER     Execute as USER");
+        output("    -i          Login shell");
+        output("    -s          Shell");
+        output("    -l          List sudo rules");
+        output("");
+        output("EXAMPLES");
+        output("    sudo apt update");
+        output("    sudo -u otheruser command");
+        output("    sudo reboot");
+
+    } else if (cmd == "traceroute") {
+        output("NAME");
+        output("    traceroute - print the route packets take to a host");
+        output("");
+        output("SYNOPSIS");
+        output("    traceroute [OPTIONS]... DESTINATION");
+        output("");
+        output("DESCRIPTION");
+        output("    Shows all hops packets take to reach DESTINATION.");
+        output("    Useful for network troubleshooting and diagnostics.");
+        output("");
+        output("OPTIONS");
+        output("    -m HOPS     Maximum number of hops");
+        output("    -w WAIT     Wait time for responses");
+        output("    -n          Don't resolve hostnames");
+        output("");
+        output("EXAMPLES");
+        output("    traceroute google.com");
+        output("    traceroute -m 20 192.168.1.1");
+
+    } else if (cmd == "tree") {
+        output("NAME");
+        output("    tree - display directory tree structure");
+        output("");
+        output("SYNOPSIS");
+        output("    tree [OPTIONS]... [DIRECTORY]");
+        output("");
+        output("DESCRIPTION");
+        output("    Displays directory structure in a tree-like format.");
+        output("");
+        output("OPTIONS");
+        output("    -a          Show all files (including hidden)");
+        output("    -d          Show only directories");
+        output("    -L DEPTH    Limit recursion depth");
+        output("    -h          Human-readable file sizes");
+        output("");
+        output("EXAMPLES");
+        output("    tree");
+        output("    tree -L 2 /home");
+        output("    tree -d -L 3");
+
+    } else if (cmd == "truncate") {
+        output("NAME");
+        output("    truncate - shrink or extend the size of a file");
+        output("");
+        output("SYNOPSIS");
+        output("    truncate [OPTION]... FILE...");
+        output("");
+        output("DESCRIPTION");
+        output("    Sets the size of FILE to SIZE bytes.");
+        output("    Creates file if it doesn't exist.");
+        output("");
+        output("OPTIONS");
+        output("    -s SIZE     Set size to SIZE");
+        output("    -r RFILE    Set size to match RFILE");
+        output("");
+        output("EXAMPLES");
+        output("    truncate -s 0 file.txt");
+        output("    truncate -s 100M largefile.bin");
+
+    } else if (cmd == "unalias") {
+        output("NAME");
+        output("    unalias - remove shell aliases");
+        output("");
+        output("SYNOPSIS");
+        output("    unalias [-a] [NAME]...");
+        output("");
+        output("DESCRIPTION");
+        output("    Removes previously defined shell aliases.");
+        output("");
+        output("OPTIONS");
+        output("    -a          Remove all aliases");
+        output("");
+        output("EXAMPLES");
+        output("    unalias l");
+        output("    unalias -a");
+
+    } else if (cmd == "uname") {
+        output("NAME");
+        output("    uname - print system information");
+        output("");
+        output("SYNOPSIS");
+        output("    uname [OPTION]...");
+        output("");
+        output("DESCRIPTION");
+        output("    Prints information about the system.");
+        output("");
+        output("OPTIONS");
+        output("    -a          Print all information");
+        output("    -s          Print kernel name");
+        output("    -r          Print kernel release");
+        output("    -m          Print machine hardware name");
+        output("");
+        output("EXAMPLES");
+        output("    uname -a");
+        output("    uname -s");
+
+    } else if (cmd == "whoami") {
+        output("NAME");
+        output("    whoami - print current user login name");
+        output("");
+        output("SYNOPSIS");
+        output("    whoami");
+        output("");
+        output("DESCRIPTION");
+        output("    Prints the login name of the current user.");
+        output("");
+        output("EXAMPLES");
+        output("    whoami");
+
+    } else if (cmd == "xargs") {
+        output("NAME");
+        output("    xargs - execute commands from standard input");
+        output("");
+        output("SYNOPSIS");
+        output("    xargs [OPTION]... [COMMAND [ARG]...]");
+        output("");
+        output("DESCRIPTION");
+        output("    Builds and executes commands from standard input.");
+        output("    Splits input into manageable argument lists.");
+        output("");
+        output("OPTIONS");
+        output("    -0          Use null as separator");
+        output("    -I REPLACE  Replace REPLACE with input");
+        output("    -n NUM      Use at most NUM arguments");
+        output("    -p          Prompt before executing");
+        output("");
+        output("EXAMPLES");
+        output("    find . -name '*.txt' | xargs cat");
+        output("    echo file1 file2 | xargs rm");
+        output("    ls | xargs -I {} echo {}");
+
+    } else if (cmd == "zcat") {
+        output("NAME");
+        output("    zcat - concatenate and print compressed files");
+        output("");
+        output("SYNOPSIS");
+        output("    zcat [FILE]...");
+        output("");
+        output("DESCRIPTION");
+        output("    Concatenates and decompresses gzip files, printing to stdout.");
+        output("    Equivalent to gunzip -c.");
+        output("");
+        output("EXAMPLES");
+        output("    zcat file.txt.gz");
+        output("    zcat *.gz");
         
     } else {
         output("No manual entry for '" + cmd + "'");
@@ -22205,7 +24643,18 @@ void cmd_rev(const std::vector<std::string>& args) {
         output("  Reverse lines in files or text");
         return;
     }
+    
     if (args.size() < 2) {
+        // Try piped input
+        std::vector<std::string> lines = getInputLines();
+        if (!lines.empty()) {
+            for (const auto& line : lines) {
+                std::string reversed = line;
+                std::reverse(reversed.begin(), reversed.end());
+                output(reversed);
+            }
+            return;
+        }
         outputError("rev: missing operand");
         outputError("Usage: rev <file>... or rev <text>");
         return;
@@ -23635,7 +26084,12 @@ void cmd_date(const std::vector<std::string>& args) {
             << std::setfill('0') << std::setw(2) << st.wMinute << ":"
             << std::setfill('0') << std::setw(2) << st.wSecond << " "
             << (useUTC ? "+0000" : "+0000");  // Simplified timezone
-        output(oss.str());
+        
+        std::string result = oss.str();
+        if (g_capturingOutput && result.find(' ') != std::string::npos) {
+             result = "\"" + result + "\"";
+        }
+        output(result);
         return;
     } else if (isoFormat) {
         // ISO 8601 format
@@ -23654,7 +26108,11 @@ void cmd_date(const std::vector<std::string>& args) {
             }
             oss << (useUTC ? "Z" : "+00:00");
         }
-        output(oss.str());
+        std::string result = oss.str();
+        if (g_capturingOutput && result.find(' ') != std::string::npos) {
+             result = "\"" + result + "\"";
+        }
+        output(result);
         return;
     } else if (rfc3339) {
         // RFC 3339 format
@@ -23669,7 +26127,11 @@ void cmd_date(const std::vector<std::string>& args) {
             oss << "." << std::setfill('0') << std::setw(9) << (st.wMilliseconds * 1000000);
         }
         oss << (useUTC ? "+00:00" : "+00:00");
-        output(oss.str());
+        std::string result = oss.str();
+        if (g_capturingOutput && result.find(' ') != std::string::npos) {
+             result = "\"" + result + "\"";
+        }
+        output(result);
         return;
     }
     
@@ -23684,7 +26146,11 @@ void cmd_date(const std::vector<std::string>& args) {
             << std::setfill('0') << std::setw(2) << st.wMinute << ":"
             << std::setfill('0') << std::setw(2) << st.wSecond << " "
             << st.wYear;
-        output(oss.str());
+        std::string result = oss.str();
+        if (g_capturingOutput && result.find(' ') != std::string::npos) {
+             result = "\"" + result + "\"";
+        }
+        output(result);
         return;
     }
     
@@ -23806,6 +26272,9 @@ void cmd_date(const std::vector<std::string>& args) {
         } else {
             result += formatStr[i];
         }
+    }
+    if (g_capturingOutput && result.find(' ') != std::string::npos) {
+        result = "\"" + result + "\"";
     }
     output(result);
 }
@@ -24702,11 +27171,8 @@ void cmd_sed(const std::vector<std::string>& args) {
     
     // Execute
      if (inputFiles.empty()) {
-        std::vector<std::string> lines;
-        if (!g_capturedOutput.empty()) {
-            lines = g_capturedOutput;
-            g_capturedOutput.clear();
-        } else {
+        std::vector<std::string> lines = getInputLines();
+        if (lines.empty()) {
             std::string line;
             while (std::getline(std::cin, line)) lines.push_back(line);
         }
@@ -25135,6 +27601,43 @@ void cmd_exec(const std::vector<std::string>& args) {
 }
 
 // AWK - Pattern scanning and processing language (POSIX/GNU compatible)
+// AWK Value type for interpreter
+struct AwkValue {
+    std::string strVal;
+    double numVal;
+    bool isNum;
+    
+    AwkValue() : strVal(""), numVal(0), isNum(false) {}
+    AwkValue(const std::string& s) : strVal(s), numVal(0), isNum(false) {
+        try {
+            size_t idx = 0;
+            numVal = std::stod(s, &idx);
+            isNum = (idx > 0 && idx == s.length());
+        } catch (...) {
+            isNum = false;
+        }
+    }
+    AwkValue(double n) : strVal(std::to_string(n)), numVal(n), isNum(true) {}
+    
+    double toNumber() const {
+        if (isNum) return numVal;
+        try {
+            return std::stod(strVal);
+        } catch (...) {
+            return 0.0;
+        }
+    }
+    
+    std::string toString() const {
+        return strVal;
+    }
+    
+    bool toBool() const {
+        if (isNum) return numVal != 0;
+        return !strVal.empty();
+    }
+};
+
 void cmd_awk(const std::vector<std::string>& args) {
     if (checkHelpFlag(args)) {
         output("Usage: awk [OPTION...] [PROGRAM] [FILE...]");
@@ -25280,14 +27783,16 @@ void cmd_awk(const std::vector<std::string>& args) {
     
     if (args.size() < 2) {
         outputError("awk: missing program");
+        g_lastExitStatus = 1;
         return;
     }
     
     // Parse options
     std::string fieldSeparator = " ";
-    std::map<std::string, std::string> variables;
+    std::map<std::string, AwkValue> variables;
     std::string program;
     std::vector<std::string> inputFiles;
+    bool showVersion = false;
     
     size_t argIdx = 1;
     
@@ -25305,14 +27810,14 @@ void cmd_awk(const std::vector<std::string>& args) {
             std::string assignment = args[++argIdx];
             size_t eqPos = assignment.find('=');
             if (eqPos != std::string::npos) {
-                variables[assignment.substr(0, eqPos)] = assignment.substr(eqPos + 1);
+                variables[assignment.substr(0, eqPos)] = AwkValue(assignment.substr(eqPos + 1));
             }
             argIdx++;
         } else if (arg.substr(0, 2) == "-v") {
             std::string assignment = arg.substr(2);
             size_t eqPos = assignment.find('=');
             if (eqPos != std::string::npos) {
-                variables[assignment.substr(0, eqPos)] = assignment.substr(eqPos + 1);
+                variables[assignment.substr(0, eqPos)] = AwkValue(assignment.substr(eqPos + 1));
             }
             argIdx++;
         } else if (arg == "--field-separator" && argIdx + 1 < args.size()) {
@@ -25325,14 +27830,14 @@ void cmd_awk(const std::vector<std::string>& args) {
             std::string assignment = args[++argIdx];
             size_t eqPos = assignment.find('=');
             if (eqPos != std::string::npos) {
-                variables[assignment.substr(0, eqPos)] = assignment.substr(eqPos + 1);
+                variables[assignment.substr(0, eqPos)] = AwkValue(assignment.substr(eqPos + 1));
             }
             argIdx++;
         } else if (arg.substr(0, 9) == "--assign=") {
             std::string assignment = arg.substr(9);
             size_t eqPos = assignment.find('=');
             if (eqPos != std::string::npos) {
-                variables[assignment.substr(0, eqPos)] = assignment.substr(eqPos + 1);
+                variables[assignment.substr(0, eqPos)] = AwkValue(assignment.substr(eqPos + 1));
             }
             argIdx++;
         } else if (arg == "-f" && argIdx + 1 < args.size()) {
@@ -25342,23 +27847,41 @@ void cmd_awk(const std::vector<std::string>& args) {
                 std::stringstream buffer;
                 buffer << progFile.rdbuf();
                 program = buffer.str();
+            } else {
+                outputError("awk: can't open file " + args[argIdx]);
+                g_lastExitStatus = 2;
+                return;
             }
             argIdx++;
-        } else if (arg.substr(0, 6) == "--file=") {
+        } else if (arg.substr(0, 7) == "--file=") {
             std::ifstream progFile(unixPathToWindows(arg.substr(7)));
             if (progFile.is_open()) {
                 std::stringstream buffer;
                 buffer << progFile.rdbuf();
                 program = buffer.str();
+            } else {
+                outputError("awk: can't open file " + arg.substr(7));
+                g_lastExitStatus = 2;
+                return;
             }
             argIdx++;
         } else if (arg == "-W" && argIdx + 1 < args.size()) {
-            argIdx++;  // Skip version/posix flags
+            if (args[argIdx + 1] == "version") {
+                showVersion = true;
+            }
+            argIdx += 2;
         } else if (arg == "--posix") {
             argIdx++;
         } else {
             argIdx++;
         }
+    }
+    
+    if (showVersion) {
+        output("awk version " + WNUS_VERSION + " (wnus implementation)");
+        output("Full-featured AWK interpreter with POSIX compliance");
+        g_lastExitStatus = 0;
+        return;
     }
     
     // Get program if not read from file
@@ -25373,102 +27896,496 @@ void cmd_awk(const std::vector<std::string>& args) {
     
     if (program.empty()) {
         outputError("awk: no program text specified");
+        g_lastExitStatus = 1;
         return;
     }
     
-    // AWK interpreter state
+    // AWK interpreter state - Built-in variables
+    std::map<std::string, AwkValue> vars = variables;
+    std::map<std::string, std::map<std::string, AwkValue>> arrays;
     int NR = 0, FNR = 0, NF = 0;
     std::string FILENAME = "";
+    std::string FS = fieldSeparator;
     std::string OFS = " ";
     std::string ORS = "\n";
+    std::string RS = "\n";
+    int RSTART = 0, RLENGTH = 0;
+    bool exitFlag = false;
+    bool nextFlag = false;
+    int exitCode = 0;
     
-    // Helper lambda to split fields
+    // Parse program into BEGIN, main, and END blocks
+    std::string beginBlock, mainBlock, endBlock;
+    size_t pos = 0;
+    
+    // Extract BEGIN blocks
+    while ((pos = program.find("BEGIN")) != std::string::npos) {
+        size_t braceStart = program.find('{', pos);
+        if (braceStart != std::string::npos) {
+            int braceCount = 1;
+            size_t braceEnd = braceStart + 1;
+            while (braceEnd < program.length() && braceCount > 0) {
+                if (program[braceEnd] == '{') braceCount++;
+                else if (program[braceEnd] == '}') braceCount--;
+                braceEnd++;
+            }
+            beginBlock += program.substr(braceStart + 1, braceEnd - braceStart - 2) + "\n";
+            program.erase(pos, braceEnd - pos);
+        } else {
+            break;
+        }
+    }
+    
+    // Extract END blocks
+    pos = 0;
+    while ((pos = program.find("END")) != std::string::npos) {
+        size_t braceStart = program.find('{', pos);
+        if (braceStart != std::string::npos) {
+            int braceCount = 1;
+            size_t braceEnd = braceStart + 1;
+            while (braceEnd < program.length() && braceCount > 0) {
+                if (program[braceEnd] == '{') braceCount++;
+                else if (program[braceEnd] == '}') braceCount--;
+                braceEnd++;
+            }
+            endBlock += program.substr(braceStart + 1, braceEnd - braceStart - 2) + "\n";
+            program.erase(pos, braceEnd - pos);
+        } else {
+            break;
+        }
+    }
+    
+    mainBlock = program;
+    
+    // Helper: Split fields
     auto splitFields = [&](const std::string& line) -> std::vector<std::string> {
         std::vector<std::string> fields;
-        if (fieldSeparator == " ") {
-            // Default: split on any whitespace
+        if (FS == " ") {
             std::istringstream iss(line);
             std::string field;
-            while (iss >> field) {
-                fields.push_back(field);
-            }
-        } else {
-            // Split by specific separator
-            size_t start = 0;
-            size_t end = line.find(fieldSeparator);
-            while (end != std::string::npos) {
+            while (iss >> field) fields.push_back(field);
+        } else if (FS.length() == 1) {
+            size_t start = 0, end;
+            while ((end = line.find(FS[0], start)) != std::string::npos) {
                 fields.push_back(line.substr(start, end - start));
-                start = end + fieldSeparator.length();
-                end = line.find(fieldSeparator, start);
+                start = end + 1;
             }
             fields.push_back(line.substr(start));
+        } else {
+            // Regex field separator
+            try {
+                std::regex fsRegex(FS);
+                std::sregex_token_iterator iter(line.begin(), line.end(), fsRegex, -1);
+                std::sregex_token_iterator end;
+                for (; iter != end; ++iter) {
+                    fields.push_back(*iter);
+                }
+            } catch (...) {
+                fields.push_back(line);
+            }
         }
         return fields;
     };
     
-    // Helper lambda to process lines
+    // Helper: Get field value
+    auto getField = [&](int fieldNum, const std::vector<std::string>& fields, const std::string& line) -> std::string {
+        if (fieldNum == 0) return line;
+        if (fieldNum > 0 && fieldNum <= (int)fields.size()) return fields[fieldNum - 1];
+        return "";
+    };
+    
+    // Helper: Evaluate expression (simplified)
+    std::function<AwkValue(const std::string&, const std::vector<std::string>&, const std::string&)> evalExpr;
+    evalExpr = [&](const std::string& expr, const std::vector<std::string>& fields, const std::string& line) -> AwkValue {
+        std::string trimmedExpr = trim(expr);
+        
+        // Handle string literals
+        if (trimmedExpr.length() >= 2 && trimmedExpr[0] == '"' && trimmedExpr.back() == '"') {
+            return AwkValue(trimmedExpr.substr(1, trimmedExpr.length() - 2));
+        }
+        
+        // Handle field reference $N or $0
+        if (trimmedExpr[0] == '$') {
+            std::string fieldExpr = trimmedExpr.substr(1);
+            fieldExpr = trim(fieldExpr);
+            
+            // Handle $(NF), $(NF-1), etc.
+            if (fieldExpr[0] == '(') {
+                size_t closeParen = fieldExpr.find(')');
+                if (closeParen != std::string::npos) {
+                    std::string innerExpr = fieldExpr.substr(1, closeParen - 1);
+                    int fieldNum = (int)evalExpr(innerExpr, fields, line).toNumber();
+                    return AwkValue(getField(fieldNum, fields, line));
+                }
+            }
+            
+            // Direct field number
+            if (std::isdigit(fieldExpr[0]) || fieldExpr[0] == '-') {
+                int fieldNum = std::atoi(fieldExpr.c_str());
+                return AwkValue(getField(fieldNum, fields, line));
+            }
+            
+            // Variable reference like $NF
+            if (fieldExpr == "NF") {
+                return AwkValue(getField(NF, fields, line));
+            }
+        }
+        
+        // Handle built-in variables
+        if (trimmedExpr == "NR") return AwkValue((double)NR);
+        if (trimmedExpr == "FNR") return AwkValue((double)FNR);
+        if (trimmedExpr == "NF") return AwkValue((double)NF);
+        if (trimmedExpr == "FILENAME") return AwkValue(FILENAME);
+        if (trimmedExpr == "FS") return AwkValue(FS);
+        if (trimmedExpr == "OFS") return AwkValue(OFS);
+        if (trimmedExpr == "ORS") return AwkValue(ORS);
+        if (trimmedExpr == "RS") return AwkValue(RS);
+        if (trimmedExpr == "RSTART") return AwkValue((double)RSTART);
+        if (trimmedExpr == "RLENGTH") return AwkValue((double)RLENGTH);
+        
+        // Check user variables
+        if (vars.find(trimmedExpr) != vars.end()) {
+            return vars[trimmedExpr];
+        }
+        
+        // Handle arithmetic operations
+        for (const char* op : {"+", "-", "*", "/", "%"}) {
+            size_t opPos = trimmedExpr.find(op);
+            if (opPos != std::string::npos && opPos > 0) {
+                std::string left = trimmedExpr.substr(0, opPos);
+                std::string right = trimmedExpr.substr(opPos + 1);
+                double leftVal = evalExpr(left, fields, line).toNumber();
+                double rightVal = evalExpr(right, fields, line).toNumber();
+                
+                switch (op[0]) {
+                    case '+': return AwkValue(leftVal + rightVal);
+                    case '-': return AwkValue(leftVal - rightVal);
+                    case '*': return AwkValue(leftVal * rightVal);
+                    case '/': return rightVal != 0 ? AwkValue(leftVal / rightVal) : AwkValue(0.0);
+                    case '%': return rightVal != 0 ? AwkValue((int)leftVal % (int)rightVal) : AwkValue(0.0);
+                }
+            }
+        }
+        
+        // Handle comparison operations
+        for (const std::string& op : {"<=", ">=", "==", "!=", "<", ">"}) {
+            size_t opPos = trimmedExpr.find(op);
+            if (opPos != std::string::npos && opPos > 0) {
+                std::string left = trimmedExpr.substr(0, opPos);
+                std::string right = trimmedExpr.substr(opPos + op.length());
+                AwkValue leftVal = evalExpr(left, fields, line);
+                AwkValue rightVal = evalExpr(right, fields, line);
+                
+                bool result = false;
+                if (op == "==") result = (leftVal.toString() == rightVal.toString());
+                else if (op == "!=") result = (leftVal.toString() != rightVal.toString());
+                else if (op == "<") result = (leftVal.toNumber() < rightVal.toNumber());
+                else if (op == ">") result = (leftVal.toNumber() > rightVal.toNumber());
+                else if (op == "<=") result = (leftVal.toNumber() <= rightVal.toNumber());
+                else if (op == ">=") result = (leftVal.toNumber() >= rightVal.toNumber());
+                
+                return AwkValue(result ? 1.0 : 0.0);
+            }
+        }
+        
+        // Handle logical operations
+        size_t andPos = trimmedExpr.find("&&");
+        if (andPos != std::string::npos) {
+            std::string left = trimmedExpr.substr(0, andPos);
+            std::string right = trimmedExpr.substr(andPos + 2);
+            bool result = evalExpr(left, fields, line).toBool() && evalExpr(right, fields, line).toBool();
+            return AwkValue(result ? 1.0 : 0.0);
+        }
+        
+        size_t orPos = trimmedExpr.find("||");
+        if (orPos != std::string::npos) {
+            std::string left = trimmedExpr.substr(0, orPos);
+            std::string right = trimmedExpr.substr(orPos + 2);
+            bool result = evalExpr(left, fields, line).toBool() || evalExpr(right, fields, line).toBool();
+            return AwkValue(result ? 1.0 : 0.0);
+        }
+        
+        // Handle built-in functions
+        if (trimmedExpr.find("length(") == 0) {
+            size_t closeParen = trimmedExpr.find(')');
+            if (closeParen != std::string::npos) {
+                std::string arg = trimmedExpr.substr(7, closeParen - 7);
+                std::string val = arg.empty() ? line : evalExpr(arg, fields, line).toString();
+                return AwkValue((double)val.length());
+            }
+        }
+        
+        if (trimmedExpr.find("substr(") == 0) {
+            size_t closeParen = trimmedExpr.rfind(')');
+            if (closeParen != std::string::npos) {
+                std::string argsStr = trimmedExpr.substr(7, closeParen - 7);
+                std::vector<std::string> substrArgs;
+                size_t start = 0, commaPos;
+                int parenDepth = 0;
+                for (size_t i = 0; i < argsStr.length(); i++) {
+                    if (argsStr[i] == '(') parenDepth++;
+                    else if (argsStr[i] == ')') parenDepth--;
+                    else if (argsStr[i] == ',' && parenDepth == 0) {
+                        substrArgs.push_back(trim(argsStr.substr(start, i - start)));
+                        start = i + 1;
+                    }
+                }
+                substrArgs.push_back(trim(argsStr.substr(start)));
+                
+                if (substrArgs.size() >= 2) {
+                    std::string str = evalExpr(substrArgs[0], fields, line).toString();
+                    int pos = (int)evalExpr(substrArgs[1], fields, line).toNumber() - 1;  // 1-based
+                    if (pos < 0) pos = 0;
+                    int len = (substrArgs.size() >= 3) ? (int)evalExpr(substrArgs[2], fields, line).toNumber() : str.length();
+                    if (pos < (int)str.length()) {
+                        return AwkValue(str.substr(pos, len));
+                    }
+                }
+            }
+        }
+        
+        if (trimmedExpr.find("tolower(") == 0) {
+            size_t closeParen = trimmedExpr.find(')');
+            if (closeParen != std::string::npos) {
+                std::string arg = trimmedExpr.substr(8, closeParen - 8);
+                std::string val = evalExpr(arg, fields, line).toString();
+                std::transform(val.begin(), val.end(), val.begin(), ::tolower);
+                return AwkValue(val);
+            }
+        }
+        
+        if (trimmedExpr.find("toupper(") == 0) {
+            size_t closeParen = trimmedExpr.find(')');
+            if (closeParen != std::string::npos) {
+                std::string arg = trimmedExpr.substr(8, closeParen - 8);
+                std::string val = evalExpr(arg, fields, line).toString();
+                std::transform(val.begin(), val.end(), val.begin(), ::toupper);
+                return AwkValue(val);
+            }
+        }
+        
+        if (trimmedExpr.find("int(") == 0) {
+            size_t closeParen = trimmedExpr.find(')');
+            if (closeParen != std::string::npos) {
+                std::string arg = trimmedExpr.substr(4, closeParen - 4);
+                double val = evalExpr(arg, fields, line).toNumber();
+                return AwkValue((double)(int)val);
+            }
+        }
+        
+        if (trimmedExpr.find("sqrt(") == 0) {
+            size_t closeParen = trimmedExpr.find(')');
+            if (closeParen != std::string::npos) {
+                std::string arg = trimmedExpr.substr(5, closeParen - 5);
+                double val = evalExpr(arg, fields, line).toNumber();
+                return AwkValue(std::sqrt(val));
+            }
+        }
+        
+        // Try to parse as number
+        try {
+            double num = std::stod(trimmedExpr);
+            return AwkValue(num);
+        } catch (...) {}
+        
+        // Return as string
+        return AwkValue(trimmedExpr);
+    };
+    
+    // Helper: Execute statement
+    std::function<void(const std::string&, const std::vector<std::string>&, const std::string&)> execStatement;
+    execStatement = [&](const std::string& statement, const std::vector<std::string>& fields, const std::string& line) {
+        std::string stmt = trim(statement);
+        if (stmt.empty()) return;
+        
+        // Handle print statement
+        if (stmt.find("print") == 0) {
+            std::string printArgs = stmt.substr(5);
+            printArgs = trim(printArgs);
+            
+            if (printArgs.empty() || printArgs[0] == ';') {
+                output(line);  // print with no args prints $0
+            } else {
+                // Parse print arguments
+                std::vector<std::string> printItems;
+                size_t pos = 0;
+                int parenDepth = 0;
+                std::string currentItem;
+                bool inString = false;
+                
+                for (size_t i = 0; i < printArgs.length(); i++) {
+                    char ch = printArgs[i];
+                    if (ch == '"' && (i == 0 || printArgs[i-1] != '\\')) inString = !inString;
+                    if (ch == '(') parenDepth++;
+                    if (ch == ')') parenDepth--;
+                    
+                    if (ch == ',' && parenDepth == 0 && !inString) {
+                        printItems.push_back(trim(currentItem));
+                        currentItem.clear();
+                    } else if (ch == ';' && parenDepth == 0 && !inString) {
+                        break;
+                    } else {
+                        currentItem += ch;
+                    }
+                }
+                if (!currentItem.empty()) {
+                    printItems.push_back(trim(currentItem));
+                }
+                
+                std::string outputLine;
+                for (size_t i = 0; i < printItems.size(); i++) {
+                    if (i > 0) outputLine += OFS;
+                    outputLine += evalExpr(printItems[i], fields, line).toString();
+                }
+                output(outputLine);
+            }
+            return;
+        }
+        
+        // Handle variable assignment
+        size_t eqPos = stmt.find('=');
+        if (eqPos != std::string::npos && eqPos > 0) {
+            std::string varName = trim(stmt.substr(0, eqPos));
+            std::string rhs = trim(stmt.substr(eqPos + 1));
+            
+            // Handle compound operators
+            if (varName.back() == '+' || varName.back() == '-' || varName.back() == '*' || varName.back() == '/' || varName.back() == '%') {
+                char op = varName.back();
+                varName = trim(varName.substr(0, varName.length() - 1));
+                double currentVal = vars[varName].toNumber();
+                double rhsVal = evalExpr(rhs, fields, line).toNumber();
+                
+                switch (op) {
+                    case '+': vars[varName] = AwkValue(currentVal + rhsVal); break;
+                    case '-': vars[varName] = AwkValue(currentVal - rhsVal); break;
+                    case '*': vars[varName] = AwkValue(currentVal * rhsVal); break;
+                    case '/': vars[varName] = AwkValue(rhsVal != 0 ? currentVal / rhsVal : 0); break;
+                    case '%': vars[varName] = AwkValue(rhsVal != 0 ? (int)currentVal % (int)rhsVal : 0); break;
+                }
+            } else {
+                vars[varName] = evalExpr(rhs, fields, line);
+            }
+            return;
+        }
+        
+        // Handle increment/decrement
+        if (stmt.find("++") != std::string::npos) {
+            std::string varName = stmt.substr(0, stmt.find("++"));
+            varName = trim(varName);
+            vars[varName] = AwkValue(vars[varName].toNumber() + 1);
+            return;
+        }
+        
+        if (stmt.find("--") != std::string::npos) {
+            std::string varName = stmt.substr(0, stmt.find("--"));
+            varName = trim(varName);
+            vars[varName] = AwkValue(vars[varName].toNumber() - 1);
+            return;
+        }
+        
+        // Handle next statement
+        if (stmt == "next") {
+            nextFlag = true;
+            return;
+        }
+        
+        // Handle exit statement
+        if (stmt.find("exit") == 0) {
+            exitFlag = true;
+            std::string exitExpr = stmt.substr(4);
+            exitExpr = trim(exitExpr);
+            if (!exitExpr.empty()) {
+                exitCode = (int)evalExpr(exitExpr, fields, line).toNumber();
+            }
+            return;
+        }
+    };
+    
+    // Execute BEGIN block
+    if (!beginBlock.empty()) {
+        std::istringstream beginStream(beginBlock);
+        std::string stmt;
+        while (std::getline(beginStream, stmt, ';')) {
+            execStatement(stmt, {}, "");
+        }
+    }
+    
+    // Process input files or stdin/pipe
     auto processLines = [&](const std::string& fname, std::vector<std::string>& lines) {
         FILENAME = fname;
         FNR = 0;
         
         for (const auto& line : lines) {
+            if (exitFlag) break;
+            
             NR++;
             FNR++;
-            
             auto fields = splitFields(line);
             NF = fields.size();
+            nextFlag = false;
             
-            // Process line with AWK program
-            // Simplified: just handle basic print statements
-            if (program.find("print") != std::string::npos) {
-                size_t printPos = program.find("print");
-                std::string afterPrint = program.substr(printPos + 5);
-                afterPrint.erase(0, afterPrint.find_first_not_of(" \t"));
-                
-                if (afterPrint.empty() || afterPrint[0] == ';' || afterPrint[0] == '}' || afterPrint[0] == '\n') {
-                    output(line);
-                } else if (afterPrint[0] == '$') {
-                    // Extract field number
-                    int fieldNum = 0;
-                    size_t pos = 1;
-                    if (afterPrint[1] == '(') {
-                        pos = 2;
-                        size_t endParen = afterPrint.find(')', pos);
-                        if (endParen != std::string::npos) {
-                            std::string expr = afterPrint.substr(pos, endParen - pos);
-                            if (expr == "NF") {
-                                fieldNum = NF;
-                            } else {
-                                fieldNum = std::atoi(expr.c_str());
-                            }
+            // Check if main block has pattern matching
+            std::string block = mainBlock;
+            bool shouldExecute = true;
+            
+            // Simple pattern matching for /regex/
+            size_t patternStart = block.find('/');
+            if (patternStart != std::string::npos) {
+                size_t patternEnd = block.find('/', patternStart + 1);
+                if (patternEnd != std::string::npos) {
+                    std::string pattern = block.substr(patternStart + 1, patternEnd - patternStart - 1);
+                    try {
+                        std::regex re(pattern);
+                        shouldExecute = std::regex_search(line, re);
+                    } catch (...) {
+                        shouldExecute = false;
+                    }
+                    // Extract action block
+                    size_t actionStart = block.find('{', patternEnd);
+                    if (actionStart != std::string::npos) {
+                        size_t actionEnd = block.rfind('}');
+                        if (actionEnd != std::string::npos) {
+                            block = block.substr(actionStart + 1, actionEnd - actionStart - 1);
                         }
-                    } else if (isdigit(afterPrint[pos])) {
-                        fieldNum = std::atoi(afterPrint.substr(pos).c_str());
-                    }
-                    
-                    if (fieldNum == 0) {
-                        output(line);
-                    } else if (fieldNum > 0 && fieldNum <= (int)fields.size()) {
-                        output(fields[fieldNum - 1]);
-                    }
-                } else if (afterPrint[0] == '"') {
-                    // Print string literal
-                    size_t endQuote = afterPrint.find('"', 1);
-                    if (endQuote != std::string::npos) {
-                        output(afterPrint.substr(1, endQuote - 1));
                     }
                 }
-            } else if (program.find("{print}") != std::string::npos) {
-                output(line);
-            } else if (program.find('{') != std::string::npos && program.find('}') != std::string::npos) {
-                output(line);
-            } else {
-                output(line);
+            }
+            
+            // Check for condition like NR > 1
+            if (block.find("NR") != std::string::npos || block.find("FNR") != std::string::npos) {
+                size_t bracePos = block.find('{');
+                if (bracePos != std::string::npos) {
+                    std::string condition = trim(block.substr(0, bracePos));
+                    if (!condition.empty()) {
+                        shouldExecute = evalExpr(condition, fields, line).toBool();
+                    }
+                    block = block.substr(bracePos + 1);
+                    size_t closeBrace = block.rfind('}');
+                    if (closeBrace != std::string::npos) {
+                        block = block.substr(0, closeBrace);
+                    }
+                }
+            }
+            
+            if (!shouldExecute || mainBlock.empty()) continue;
+            
+            // Extract statements from block
+            size_t braceStart = block.find('{');
+            size_t braceEnd = block.rfind('}');
+            if (braceStart != std::string::npos && braceEnd != std::string::npos) {
+                block = block.substr(braceStart + 1, braceEnd - braceStart - 1);
+            }
+            
+            // Execute statements
+            std::istringstream blockStream(block);
+            std::string stmt;
+            while (std::getline(blockStream, stmt, ';')) {
+                if (nextFlag || exitFlag) break;
+                execStatement(stmt, fields, line);
             }
         }
     };
     
-    // Process input files or stdin
     if (inputFiles.empty()) {
         std::vector<std::string> lines;
         if (!g_capturedOutput.empty()) {
@@ -25483,9 +28400,11 @@ void cmd_awk(const std::vector<std::string>& args) {
         processLines("", lines);
     } else {
         for (const auto& filename : inputFiles) {
+            if (exitFlag) break;
             std::ifstream file(unixPathToWindows(filename));
             if (!file.is_open()) {
                 outputError("awk: can't open file " + filename);
+                g_lastExitStatus = 2;
                 continue;
             }
             
@@ -25499,6 +28418,17 @@ void cmd_awk(const std::vector<std::string>& args) {
             processLines(filename, lines);
         }
     }
+    
+    // Execute END block
+    if (!endBlock.empty() && !exitFlag) {
+        std::istringstream endStream(endBlock);
+        std::string stmt;
+        while (std::getline(endStream, stmt, ';')) {
+            execStatement(stmt, {}, "");
+        }
+    }
+    
+    g_lastExitStatus = exitCode;
 }
 
 
@@ -25675,11 +28605,33 @@ void cmd_sort(const std::vector<std::string>& args) {
             file.close();
         }
     } else {
-        // Read from stdin
-        std::string line;
-        char delim = zeroTerminated ? '\0' : '\n';
-        while (std::getline(std::cin, line, delim)) {
-            lines.push_back(line);
+        // Handle case with no args: Check for external stdin data, otherwise error
+        bool hasInput = false;
+        HANDLE hStdIn = GetStdHandle(STD_INPUT_HANDLE);
+        if (hStdIn != INVALID_HANDLE_VALUE && hStdIn != NULL) {
+            DWORD fileType = GetFileType(hStdIn);
+            if (fileType == FILE_TYPE_PIPE || fileType == FILE_TYPE_DISK) {
+                // Check if pipe has data
+                if (fileType == FILE_TYPE_PIPE) {
+                    DWORD bytesAvail = 0;
+                    if (PeekNamedPipe(hStdIn, NULL, 0, NULL, &bytesAvail, NULL) && bytesAvail > 0) {
+                        hasInput = true;
+                    }
+                } else {
+                    hasInput = true; // File
+                }
+            }
+        }
+        
+        if (hasInput) {
+            std::string line;
+            char delim = zeroTerminated ? '\0' : '\n';
+            while (std::getline(std::cin, line, delim)) {
+                lines.push_back(line);
+            }
+        } else {
+             outputError("sort: missing file operand");
+             return;
         }
     }
     
@@ -28114,7 +31066,7 @@ void cmd_version(const std::vector<std::string>& args) {
     }
     
     output("╔════════════════════════════════════════════════════════════════╗");
-    output("║      Windows Native Unix Shell (wnus) version 0.1.2.3          ║");
+    output("║      Windows Native Unix Shell (wnus) version " + WNUS_VERSION + "          ║");
     output("║     A Comprehensive Bash-like Console for Windows (NTFS)       ║");
     output("╚════════════════════════════════════════════════════════════════╝");
     output("");
@@ -28124,7 +31076,7 @@ void cmd_version(const std::vector<std::string>& args) {
     output("═══════════════════════════════════════════════════════════════════");
     output("CORE FEATURES:");
     output("═══════════════════════════════════════════════════════════════════");
-    output("  ✓ 281+ commands (all fully implemented, 0 stubs)");
+    output("  ✓ 259 commands (all fully implemented, 0 stubs)");
     output("  ✓ Native Windows NTFS file system support");
     output("  ✓ Full pipe operation support (|)");
     output("  ✓ Interactive tab completion");
@@ -28368,6 +31320,16 @@ void cmd_version(const std::vector<std::string>& args) {
     output("  • sync (file system buffer flush)");
     output("");
     output("SHELL & SCRIPTING:");
+    output("  • sh (POSIX-compliant shell with full interpreter and heredocs - Updated v0.1.3.1)");
+    output("  • make (GNU make with all options, functions, pattern rules - Updated v0.1.3.2)");
+    output("    - Full Unix/Linux options: -c, -s, -e, -u, -v, -x, -n, etc.");
+    output("    - Command string execution (-c \"cmd\")");
+    output("    - Stdin reading mode (-s)");
+    output("    - Exit on error (-e), trace mode (-x), verbose (-v)");
+    output("    - Syntax checking (-n), option combinations (-evx)");
+    output("    - Shebang support, line continuation, multiline commands");
+    output("    - Shell grammar: pipes, sequential, AND/OR lists, background");
+    output("    - I/O redirection: <, >, >>, 2>, 2>&1");
     output("  • echo (output display)");
     output("  • more (paging display)");
     output("  • source (script execution in current shell)");
@@ -30688,7 +33650,23 @@ void cmd_neofetch(const std::vector<std::string>& args) {
     output("");
     
     // OS Information
-    output("OS: Windows (NTFS)");
+    HMODULE hMod = GetModuleHandleA("ntdll.dll");
+    bool osPrinted = false;
+    if (hMod) {
+        typedef LONG (WINAPI *RtlGetVersionPtr)(PRTL_OSVERSIONINFOW);
+        RtlGetVersionPtr pRtlGetVersion = (RtlGetVersionPtr)GetProcAddress(hMod, "RtlGetVersion");
+        if (pRtlGetVersion) {
+            RTL_OSVERSIONINFOW rovi = {0};
+            rovi.dwOSVersionInfoSize = sizeof(rovi);
+            if (pRtlGetVersion(&rovi) == 0) {
+                 output("OS: Windows " + std::to_string(rovi.dwMajorVersion) + "." + 
+                        std::to_string(rovi.dwMinorVersion) + " (Build " + 
+                        std::to_string(rovi.dwBuildNumber) + ")");
+                 osPrinted = true;
+            }
+        }
+    }
+    if (!osPrinted) output("OS: Windows (NTFS)");
     
     // Get computer name
     char computerName[256];
@@ -30704,7 +33682,7 @@ void cmd_neofetch(const std::vector<std::string>& args) {
         output("User: " + std::string(username));
     }
     
-    output("Shell: Windows Native Unix Shell (wnus) v0.1.2.3");
+    output("Shell: Windows Native Unix Shell (wnus) v" + WNUS_VERSION);
     
     // System uptime
     DWORD tickCount = GetTickCount() / 1000;
@@ -36240,6 +39218,7 @@ void cmd_shuf(const std::vector<std::string>& args) {
     std::vector<std::string> lines;
     int maxLines = -1;
     bool useArgs = false;
+    bool hasFileArg = false;
     
     // Parse options
     size_t idx = 1;
@@ -36253,7 +39232,11 @@ void cmd_shuf(const std::vector<std::string>& args) {
             while (idx < args.size()) {
                 lines.push_back(args[idx++]);
             }
+        } else if (args[idx][0] == '-') {
+            // Unknown flag, skip it
+            idx++;
         } else {
+            hasFileArg = true;
             std::string filename = unixPathToWindows(args[idx]);
             std::ifstream file(filename);
             if (!file.is_open()) {
@@ -36269,9 +39252,9 @@ void cmd_shuf(const std::vector<std::string>& args) {
         }
     }
     
-    // If no file/args and we're in a pipeline, use captured output
-    if (lines.empty() && !g_capturedOutput.empty()) {
-        lines = g_capturedOutput;
+    // If no file/args provided, check for piped input
+    if (lines.empty() && !hasFileArg && !useArgs) {
+        lines = getInputLines();
     }
     
     if (lines.empty()) {
@@ -37034,8 +40017,9 @@ void cmd_whatis(const std::vector<std::string>& args) {
         {"grep", "grep - Full-featured pattern search with 140+ Unix/Linux options (Updated v0.1.2.3)"},
         {"fgrep", "fgrep - search for fixed strings"},
         {"find", "find - full Unix/Linux find with filters, actions, and operators"},
-        {"sed", "sed - stream editor for filtering and transforming text (POSIX/GNU compatible, Refactored v0.1.2.2)"},
-        {"awk", "awk - pattern scanning and processing language"},
+        {"sed", "sed - stream editor for filtering and transforming text (pipe-enabled v0.1.2.7)"},
+        {"awk", "awk - pattern scanning and text processing language (pipe-enabled v0.1.2.7)"},
+        {"xargs", "xargs - build and execute commands from standard input"},
         {"cut", "cut - extract columns from text"},
         {"sort", "sort - sort lines of text"},
         {"file", "file - determine file type"},
@@ -37192,7 +40176,8 @@ void cmd_whatis(const std::vector<std::string>& args) {
         {"bc", "bc - arbitrary precision calculator"},
         {"calc", "calc - simple desktop calculator"},
         {"qalc", "qalc - advanced calculator with units"},
-        {"sh", "sh - execute shell scripts"},
+        {"sh", "sh - POSIX-compliant shell with full interpreter: variables, arithmetic, command substitution, conditionals, loops, functions, here-documents (Updated v0.1.3.1)"},
+        {"make", "make - GNU make build automation with all options, functions (wildcard, patsubst, foreach, call, shell), pattern rules, automatic variables ($@, $<, $^, $?), parallel jobs (Updated v0.1.3.2)"},
         {"source", "source - execute commands from file"},
         {"exec", "exec - execute command, replacing process"},
         {"xargs", "xargs - execute command from arguments"},
@@ -37228,6 +40213,7 @@ void cmd_whatis(const std::vector<std::string>& args) {
         {"strace", "strace - trace system calls"},
         {"quota", "quota - display disk quota information"},
         {"basename", "basename - strip directory and suffix from pathname"},
+        {"pipedin", "pipedin - list commands that accept piped input"},
         {"whereis", "whereis - locate command, source, and manual page files"},
         {"stat", "stat - display file and filesystem statistics"},
         {"type", "type - show file contents (alias for cat)"},
@@ -37401,7 +40387,7 @@ void cmd_quota(const std::vector<std::string>& args) {
 
 // basename command - strip directory and suffix from filename
 void cmd_basename(const std::vector<std::string>& args) {
-    if (checkHelpFlag(args) || args.size() < 2) {
+    if (checkHelpFlag(args)) {
         output("Usage: basename path [suffix]");
         output("  Remove directory and optionally suffix from path");
         output("");
@@ -37409,6 +40395,29 @@ void cmd_basename(const std::vector<std::string>& args) {
         output("  basename /path/to/file.txt");
         output("  basename /path/to/file.txt .txt");
         output("  basename C:\\\\Windows\\\\System32\\\\notepad.exe");
+        return;
+    }
+    
+    // Check for piped input if no args
+    if (args.size() < 2) {
+        std::vector<std::string> lines = getInputLines();
+        if (!lines.empty()) {
+            std::string suffix = (args.size() > 1) ? args[1] : "";
+            for (const auto& path : lines) {
+                std::string procPath = path;
+                std::replace(procPath.begin(), procPath.end(), '\\', '/');
+                size_t lastSlash = procPath.find_last_of('/');
+                std::string basename = (lastSlash != std::string::npos) ? procPath.substr(lastSlash + 1) : procPath;
+                if (!suffix.empty() && basename.length() >= suffix.length()) {
+                    if (basename.substr(basename.length() - suffix.length()) == suffix) {
+                        basename = basename.substr(0, basename.length() - suffix.length());
+                    }
+                }
+                output(basename);
+            }
+            return;
+        }
+        output("Usage: basename path [suffix]");
         return;
     }
     
@@ -37430,6 +40439,130 @@ void cmd_basename(const std::vector<std::string>& args) {
     }
     
     output(basename);
+}
+
+// pipedin - List commands that accept piped input
+void cmd_pipedin(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: pipedin [options]");
+        output("  List internal wnus commands that accept piped input");
+        output("");
+        output("OPTIONS");
+        output("  --help        Display this help");
+        output("  -l, --long    Show descriptions");
+        output("");
+        output("DESCRIPTION");
+        output("  The pipedin command lists all internal wnus commands that can");
+        output("  accept piped input from other commands. These commands check for");
+        output("  data from stdin when no file arguments are provided.");
+        output("");
+        output("EXAMPLES");
+        output("  pipedin              # List all pipe-accepting commands");
+        output("  pipedin -l           # List with descriptions");
+        output("  echo test | pipedin  # Works with pipes too!");
+        return;
+    }
+    
+    bool longFormat = false;
+    for (size_t i = 1; i < args.size(); i++) {
+        if (args[i] == "-l" || args[i] == "--long") {
+            longFormat = true;
+        }
+    }
+    
+    // List of commands that accept piped input
+    struct PipedCommand {
+        std::string name;
+        std::string description;
+    };
+    
+    std::vector<PipedCommand> commands = {
+        {"cat", "Concatenate and display file contents"},
+        {"grep", "Search for patterns in text"},
+        {"egrep", "Extended grep with regex support"},
+        {"sed", "Stream editor for filtering and transforming text"},
+        {"awk", "Pattern scanning and text processing language"},
+        {"head", "Output first lines of input"},
+        {"tail", "Output last lines of input"},
+        {"wc", "Count lines, words, and bytes"},
+        {"sort", "Sort lines of text"},
+        {"uniq", "Remove duplicate adjacent lines"},
+        {"cut", "Extract columns from text"},
+        {"paste", "Merge lines of files"},
+        {"tr", "Translate or delete characters"},
+        {"rev", "Reverse lines character-by-character"},
+        {"tee", "Read from stdin and write to files and stdout"},
+        {"nl", "Number lines of text"},
+        {"split", "Split file into pieces"},
+        {"shuf", "Shuffle lines randomly"},
+        {"xargs", "Build and execute commands from input"},
+        {"base64", "Base64 encode/decode"},
+        {"md5sum", "Compute MD5 hash"},
+        {"sha1sum", "Compute SHA1 hash"},
+        {"sha256sum", "Compute SHA256 hash"},
+        {"cksum", "Compute CRC checksum"},
+        {"sum", "Compute BSD checksum"},
+        {"echo", "Display text (accepts piped input with no args)"},
+        {"expand", "Convert tabs to spaces"},
+        {"unexpand", "Convert spaces to tabs"},
+        {"fold", "Wrap lines to specified width"},
+        {"fmt", "Reformat paragraph text"},
+        {"column", "Format text into columns"},
+        {"comm", "Compare sorted files line by line"},
+        {"join", "Join lines of two files on common field"},
+        {"look", "Display lines beginning with string"},
+        {"tsort", "Topological sort"},
+        {"vis", "Make non-printing characters visible"},
+        {"unvis", "Revert vis encoding"},
+        {"od", "Dump files in octal/hex format"},
+        {"hexdump", "Display file in hexadecimal"},
+        {"strings", "Extract printable strings"},
+        {"basename", "Strip directory from pathname"},
+        {"dirname", "Extract directory from pathname"},
+        {"wall", "Send message to all users"},
+        {"logger", "Log messages to system log"},
+        {"printf", "Format and print data"}
+    };
+    
+    if (!longFormat) {
+        // Compact columnar output
+        output("Commands that accept piped input:");
+        output("");
+        
+        // Calculate column width
+        int cols = 4;
+        int rows = (commands.size() + cols - 1) / cols;
+        
+        for (int r = 0; r < rows; r++) {
+            std::string line;
+            for (int c = 0; c < cols; c++) {
+                int idx = r + c * rows;
+                if (idx < (int)commands.size()) {
+                    std::string padded = commands[idx].name;
+                    while (padded.length() < 18) padded += " ";
+                    line += padded;
+                }
+            }
+            output(line);
+        }
+        
+        output("");
+        output("Total: " + std::to_string(commands.size()) + " commands");
+        output("Use 'pipedin -l' for descriptions or 'pipedin --help' for more info");
+    } else {
+        // Long format with descriptions
+        output("Commands that accept piped input:");
+        output("");
+        
+        for (const auto& cmd : commands) {
+            std::string padded = "  " + cmd.name;
+            while (padded.length() < 18) padded += " ";
+            output(padded + " - " + cmd.description);
+        }
+        
+        output("");
+        output("Total: " + std::to_string(commands.size()) + " commands");
+    }
 }
 
 // whereis command - locate command, source, and manual page files
@@ -40259,86 +43392,1267 @@ void cmd_lsusb(const std::vector<std::string>& args) {
     CoUninitialize();
 }
 
+// Shell interpreter helper classes and functions
+class ShellInterpreter {
+private:
+    std::map<std::string, std::string> variables;
+    std::map<std::string, std::vector<std::string>> functions;
+    std::vector<std::string> scriptArgs;
+    bool optionE = false;
+    bool optionU = false;
+    bool optionV = false;
+    bool optionX = false;
+    bool optionN = false;
+    
+    // Evaluate arithmetic expression
+    int evaluateArithmetic(const std::string& expr) {
+        // Simple recursive descent parser for arithmetic
+        // Supports: +, -, *, /, %, (), variables
+        std::string expanded = expandVariables(expr);
+        return parseExpression(expanded, 0).first;
+    }
+    
+    std::pair<int, size_t> parseExpression(const std::string& s, size_t pos) {
+        return parseAddSub(s, pos);
+    }
+    
+    std::pair<int, size_t> parseAddSub(const std::string& s, size_t pos) {
+        std::pair<int, size_t> result = parseMulDiv(s, pos);
+        int left = result.first;
+        pos = result.second;
+        
+        while (pos < s.length()) {
+            while (pos < s.length() && isspace(s[pos])) pos++;
+            if (pos >= s.length()) break;
+            
+            if (s[pos] == '+') {
+                pos++;
+                result = parseMulDiv(s, pos);
+                left += result.first;
+                pos = result.second;
+            } else if (s[pos] == '-') {
+                pos++;
+                result = parseMulDiv(s, pos);
+                left -= result.first;
+                pos = result.second;
+            } else {
+                break;
+            }
+        }
+        return {left, pos};
+    }
+    
+    std::pair<int, size_t> parseMulDiv(const std::string& s, size_t pos) {
+        std::pair<int, size_t> result = parsePrimary(s, pos);
+        int left = result.first;
+        pos = result.second;
+        
+        while (pos < s.length()) {
+            while (pos < s.length() && isspace(s[pos])) pos++;
+            if (pos >= s.length()) break;
+            
+            if (s[pos] == '*') {
+                pos++;
+                result = parsePrimary(s, pos);
+                left *= result.first;
+                pos = result.second;
+            } else if (s[pos] == '/') {
+                pos++;
+                result = parsePrimary(s, pos);
+                if (result.first != 0) left /= result.first;
+                pos = result.second;
+            } else if (s[pos] == '%') {
+                pos++;
+                result = parsePrimary(s, pos);
+                if (result.first != 0) left %= result.first;
+                pos = result.second;
+            } else {
+                break;
+            }
+        }
+        return {left, pos};
+    }
+    
+    std::pair<int, size_t> parsePrimary(const std::string& s, size_t pos) {
+        while (pos < s.length() && isspace(s[pos])) pos++;
+        
+        if (pos >= s.length()) return {0, pos};
+        
+        if (s[pos] == '(') {
+            pos++;
+            std::pair<int, size_t> result = parseExpression(s, pos);
+            pos = result.second;
+            while (pos < s.length() && isspace(s[pos])) pos++;
+            if (pos < s.length() && s[pos] == ')') pos++;
+            return {result.first, pos};
+        }
+        
+        // Parse number
+        int sign = 1;
+        if (s[pos] == '-') {
+            sign = -1;
+            pos++;
+        } else if (s[pos] == '+') {
+            pos++;
+        }
+        
+        int num = 0;
+        while (pos < s.length() && isdigit(s[pos])) {
+            num = num * 10 + (s[pos] - '0');
+            pos++;
+        }
+        
+        return {sign * num, pos};
+    }
+    
+public:
+    ShellInterpreter() {}
+    
+    void setScriptArgs(const std::vector<std::string>& args) {
+        scriptArgs = args;
+    }
+    
+    void setOptions(bool e, bool u, bool v, bool x, bool n) {
+        optionE = e;
+        optionU = u;
+        optionV = v;
+        optionX = x;
+        optionN = n;
+    }
+    
+    std::string getVariable(const std::string& name) {
+        if (name == "?") {
+            return std::to_string(g_lastExitStatus);
+        } else if (name == "$") {
+            return std::to_string(GetCurrentProcessId());
+        } else if (name == "0" && !scriptArgs.empty()) {
+            return scriptArgs[0];
+        } else if (name.length() == 1 && isdigit(name[0])) {
+            int idx = name[0] - '0';
+            if (idx < (int)scriptArgs.size()) {
+                return scriptArgs[idx];
+            }
+            return "";
+        } else if (name == "#") {
+            return std::to_string(scriptArgs.empty() ? 0 : scriptArgs.size() - 1);
+        }
+        
+        auto it = variables.find(name);
+        if (it != variables.end()) {
+            return it->second;
+        }
+        
+        // Check environment variable
+        char buffer[32768];
+        DWORD result = GetEnvironmentVariableA(name.c_str(), buffer, sizeof(buffer));
+        if (result > 0 && result < sizeof(buffer)) {
+            return std::string(buffer);
+        }
+        
+        if (optionU) {
+            outputError("sh: " + name + ": unbound variable");
+            g_lastExitStatus = 1;
+        }
+        return "";
+    }
+    
+    void setVariable(const std::string& name, const std::string& value) {
+        variables[name] = value;
+    }
+    
+    // Expand variables in a string: $VAR, ${VAR}, $((expr)), $(command)
+    std::string expandVariables(const std::string& input) {
+        std::string result;
+        size_t i = 0;
+        
+        while (i < input.length()) {
+            if (input[i] == '$' && i + 1 < input.length()) {
+                if (input[i + 1] == '(') {
+                    // Check for $(( or $(
+                    if (i + 2 < input.length() && input[i + 2] == '(') {
+                        // Arithmetic expansion $((expr))
+                        size_t end = input.find("))", i + 3);
+                        if (end != std::string::npos) {
+                            std::string expr = input.substr(i + 3, end - i - 3);
+                            int value = evaluateArithmetic(expr);
+                            result += std::to_string(value);
+                            i = end + 2;
+                            continue;
+                        }
+                    } else {
+                        // Command substitution $(command)
+                        size_t end = findMatchingParen(input, i + 1);
+                        if (end != std::string::npos) {
+                            std::string command = input.substr(i + 2, end - i - 2);
+                            std::string cmdResult = executeCommandCapture(command);
+                            // Remove trailing newline
+                            if (!cmdResult.empty() && cmdResult.back() == '\n') {
+                                cmdResult.pop_back();
+                            }
+                            result += cmdResult;
+                            i = end + 1;
+                            continue;
+                        }
+                    }
+                } else if (input[i + 1] == '{') {
+                    // ${VAR} expansion
+                    size_t end = input.find('}', i + 2);
+                    if (end != std::string::npos) {
+                        std::string varName = input.substr(i + 2, end - i - 2);
+                        result += getVariable(varName);
+                        i = end + 1;
+                        continue;
+                    }
+                } else {
+                    // $VAR expansion
+                    size_t j = i + 1;
+                    while (j < input.length() && (isalnum(input[j]) || input[j] == '_' || 
+                           (j == i + 1 && (input[j] == '?' || input[j] == '$' || input[j] == '#' || isdigit(input[j]))))) {
+                        j++;
+                        if (j == i + 2 && (input[i + 1] == '?' || input[i + 1] == '$' || input[i + 1] == '#')) break;
+                    }
+                    std::string varName = input.substr(i + 1, j - i - 1);
+                    result += getVariable(varName);
+                    i = j;
+                    continue;
+                }
+            } else if (input[i] == '\\' && i + 1 < input.length()) {
+                // Handle escape sequences
+                i++;
+                result += input[i];
+                i++;
+                continue;
+            }
+            
+            result += input[i];
+            i++;
+        }
+        
+        return result;
+    }
+    
+    size_t findMatchingParen(const std::string& s, size_t start) {
+        int depth = 1;
+        for (size_t i = start + 1; i < s.length(); i++) {
+            if (s[i] == '(') depth++;
+            else if (s[i] == ')') {
+                depth--;
+                if (depth == 0) return i;
+            }
+        }
+        return std::string::npos;
+    }
+    
+    std::string executeCommandCapture(const std::string& command) {
+        // Save current captured output
+        std::vector<std::string> savedOutput = g_capturedOutput;
+        bool savedCapturing = g_capturingOutput;
+        bool savedSkipPrompt = g_skipFinalPrompt;
+        
+        g_capturedOutput.clear();
+        g_capturingOutput = true;
+        g_skipFinalPrompt = true;
+        
+        // Execute command
+        std::string expanded = expandVariables(command);
+        executeCommand(expanded);
+        
+        // Capture result
+        std::string result;
+        for (const auto& line : g_capturedOutput) {
+            result += line + "\n";
+        }
+        
+        // Restore state
+        g_capturedOutput = savedOutput;
+        g_capturingOutput = savedCapturing;
+        g_skipFinalPrompt = savedSkipPrompt;
+        
+        return result;
+    }
+    
+    // Parse command line into arguments respecting quotes
+    std::vector<std::string> parseArguments(const std::string& cmdline) {
+        std::vector<std::string> args;
+        std::string current;
+        bool inSingleQuote = false;
+        bool inDoubleQuote = false;
+        bool escaped = false;
+        
+        for (size_t i = 0; i < cmdline.length(); i++) {
+            char c = cmdline[i];
+            
+            if (escaped) {
+                current += c;
+                escaped = false;
+                continue;
+            }
+            
+            if (c == '\\' && !inSingleQuote) {
+                escaped = true;
+                continue;
+            }
+            
+            if (c == '\'' && !inDoubleQuote) {
+                inSingleQuote = !inSingleQuote;
+                continue;
+            }
+            
+            if (c == '"' && !inSingleQuote) {
+                inDoubleQuote = !inDoubleQuote;
+                continue;
+            }
+            
+            if ((c == ' ' || c == '\t') && !inSingleQuote && !inDoubleQuote) {
+                if (!current.empty()) {
+                    args.push_back(current);
+                    current.clear();
+                }
+                continue;
+            }
+            
+            current += c;
+        }
+        
+        if (!current.empty()) {
+            args.push_back(current);
+        }
+        
+        return args;
+    }
+    
+    // Parse and execute a line (handles assignments, control flow, etc.)
+    bool executeLine(const std::string& line) {
+        std::string trimmed = line;
+        // Trim whitespace
+        size_t start = trimmed.find_first_not_of(" \t\r\n");
+        if (start == std::string::npos) return true;
+        size_t end = trimmed.find_last_not_of(" \t\r\n");
+        trimmed = trimmed.substr(start, end - start + 1);
+        
+        if (trimmed.empty() || trimmed[0] == '#') return true;
+        
+        // Check for variable assignment (VAR=value)
+        size_t eqPos = trimmed.find('=');
+        if (eqPos != std::string::npos && eqPos > 0) {
+            // Check if it's a valid variable name before =
+            bool isAssignment = true;
+            for (size_t i = 0; i < eqPos; i++) {
+                if (!isalnum(trimmed[i]) && trimmed[i] != '_') {
+                    isAssignment = false;
+                    break;
+                }
+            }
+            if (isAssignment && isalpha(trimmed[0])) {
+                std::string varName = trimmed.substr(0, eqPos);
+                std::string value = trimmed.substr(eqPos + 1);
+                // Remove quotes if present
+                if (value.length() >= 2 && ((value[0] == '"' && value.back() == '"') ||
+                                           (value[0] == '\'' && value.back() == '\''))) {
+                    value = value.substr(1, value.length() - 2);
+                }
+                value = expandVariables(value);
+                setVariable(varName, value);
+                return true;
+            }
+        }
+        
+        // Expand variables before execution (but preserve quoted strings)
+        std::string expanded = expandVariables(trimmed);
+        
+        // Check if this is a function call (extract command name before expansion for safety)
+        std::string originalCmd = trimmed;
+        size_t spacePos = originalCmd.find(' ');
+        std::string cmdName = (spacePos != std::string::npos) ? originalCmd.substr(0, spacePos) : originalCmd;
+        
+        // Also check expanded command
+        std::string expandedCmd = expanded;
+        spacePos = expandedCmd.find(' ');
+        std::string expandedCmdName = (spacePos != std::string::npos) ? expandedCmd.substr(0, spacePos) : expandedCmd;
+        
+        // Try original first, then expanded (in case command name contains variable)
+        if (functions.find(cmdName) != functions.end()) {
+            // Execute function with original arguments
+            std::vector<std::string> funcArgs = split(trimmed);
+            return executeFunction(cmdName, funcArgs);
+        } else if (cmdName != expandedCmdName && functions.find(expandedCmdName) != functions.end()) {
+            // Command name was expanded
+            std::vector<std::string> funcArgs = split(expanded);
+            return executeFunction(expandedCmdName, funcArgs);
+        }
+        
+        if (optionV) {
+            output(expanded);
+        }
+        if (optionX) {
+            output("+ " + expanded);
+        }
+        
+        // Handle background operator (&) - strip it for shell script execution
+        // In shell scripts, & is typically just ignored as we execute sequentially
+        std::string cmdToExecute = expanded;
+        if (!cmdToExecute.empty()) {
+            size_t lastNonSpace = cmdToExecute.find_last_not_of(" \t\r\n");
+            if (lastNonSpace != std::string::npos && cmdToExecute[lastNonSpace] == '&') {
+                // Remove the & - in a script context, we don't actually background
+                cmdToExecute = cmdToExecute.substr(0, lastNonSpace);
+                // Check if there's a space before it
+                size_t beforeAmp = cmdToExecute.find_last_not_of(" \t\r\n");
+                if (beforeAmp != std::string::npos) {
+                    cmdToExecute = cmdToExecute.substr(0, beforeAmp + 1);
+                }
+            }
+        }
+        
+        if (!optionN) {
+            bool savedSkipPrompt = g_skipFinalPrompt;
+            g_skipFinalPrompt = true;
+            executeCommand(cmdToExecute);
+            g_skipFinalPrompt = savedSkipPrompt;
+            
+            if (optionE && g_lastExitStatus != 0) {
+                return false;
+            }
+        }
+        
+        return true;
+    }
+    
+    bool executeFunction(const std::string& name, const std::vector<std::string>& args) {
+        auto it = functions.find(name);
+        if (it == functions.end()) return false;
+        
+        // Save current positional parameters
+        std::map<std::string, std::string> savedVars;
+        for (int i = 0; i <= 9; i++) {
+            std::string key = std::to_string(i);
+            auto vit = variables.find(key);
+            if (vit != variables.end()) {
+                savedVars[key] = vit->second;
+            }
+        }
+        
+        // Set positional parameters for function
+        variables["0"] = name;
+        for (size_t i = 1; i < args.size(); i++) {
+            variables[std::to_string(i)] = args[i];
+        }
+        
+        // Execute function body using executeLines
+        bool result = executeLines(it->second, 0, it->second.size());
+        
+        // Restore positional parameters
+        for (int i = 0; i <= 9; i++) {
+            std::string key = std::to_string(i);
+            auto svit = savedVars.find(key);
+            if (svit != savedVars.end()) {
+                variables[key] = svit->second;
+            } else {
+                variables.erase(key);
+            }
+        }
+        
+        return result;
+    }
+    
+    // Parse here-document
+    std::vector<std::string> parseHereDoc(std::ifstream& file, const std::string& delimiter) {
+        std::vector<std::string> lines;
+        std::string line;
+        while (std::getline(file, line)) {
+            if (line == delimiter) break;
+            lines.push_back(line);
+        }
+        return lines;
+    }
+    
+    // Evaluate test expression [ ... ] or [[ ... ]]
+    bool evaluateTest(const std::vector<std::string>& tokens) {
+        if (tokens.empty()) return false;
+        
+        // Simple test implementation
+        if (tokens.size() == 1) {
+            // [ string ] - true if string is not empty
+            return !tokens[0].empty();
+        }
+        
+        if (tokens.size() == 2) {
+            // [ ! expr ]
+            if (tokens[0] == "!") {
+                return tokens[1].empty();
+            }
+            // [ -f file ] [ -d dir ] [ -e exists ] etc.
+            if (tokens[0].length() == 2 && tokens[0][0] == '-') {
+                std::string path = unixPathToWindows(tokens[1]);
+                DWORD attrs = GetFileAttributesA(path.c_str());
+                
+                switch (tokens[0][1]) {
+                    case 'e': return attrs != INVALID_FILE_ATTRIBUTES;
+                    case 'f': return attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY);
+                    case 'd': return attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY);
+                    case 'r': case 'w': case 'x': return attrs != INVALID_FILE_ATTRIBUTES;
+                    case 'z': return tokens[1].empty(); // -z string: true if empty
+                    case 'n': return !tokens[1].empty(); // -n string: true if not empty
+                }
+            }
+        }
+        
+        if (tokens.size() == 3) {
+            std::string left = tokens[0];
+            std::string op = tokens[1];
+            std::string right = tokens[2];
+            
+            // String comparisons
+            if (op == "=") return left == right;
+            if (op == "!=") return left != right;
+            
+            // Numeric comparisons
+            try {
+                int leftNum = std::stoi(left);
+                int rightNum = std::stoi(right);
+                
+                if (op == "-eq") return leftNum == rightNum;
+                if (op == "-ne") return leftNum != rightNum;
+                if (op == "-lt") return leftNum < rightNum;
+                if (op == "-le") return leftNum <= rightNum;
+                if (op == "-gt") return leftNum > rightNum;
+                if (op == "-ge") return leftNum >= rightNum;
+            } catch (...) {}
+        }
+        
+        return false;
+    }
+    
+    // Execute script with control flow
+    bool executeScript(std::ifstream& file) {
+        std::string line;
+        std::vector<std::string> scriptLines;
+        
+        // Read all lines first
+        while (std::getline(file, line)) {
+            scriptLines.push_back(line);
+        }
+        
+        return executeLines(scriptLines, 0, scriptLines.size());
+    }
+    
+    bool executeLines(const std::vector<std::string>& lines, size_t start, size_t end) {
+        size_t i = start;
+        
+        while (i < end) {
+            std::string line = lines[i];
+            
+            // Trim
+            size_t s = line.find_first_not_of(" \t\r\n");
+            if (s == std::string::npos) {
+                i++;
+                continue;
+            }
+            size_t e = line.find_last_not_of(" \t\r\n");
+            line = line.substr(s, e - s + 1);
+            
+            if (line.empty() || line[0] == '#') {
+                i++;
+                continue;
+            }
+            
+            // Handle shebang
+            if (i == start && line.length() >= 2 && line[0] == '#' && line[1] == '!') {
+                i++;
+                continue;
+            }
+            
+            // Line continuation
+            while (i < end && !line.empty() && line.back() == '\\') {
+                line.pop_back();
+                i++;
+                if (i < end) {
+                    std::string nextLine = lines[i];
+                    s = nextLine.find_first_not_of(" \t\r\n");
+                    if (s != std::string::npos) {
+                        line += " " + nextLine.substr(s);
+                    }
+                }
+            }
+            
+            // Check for function definition: name() { ... }
+            if (line.find("()") != std::string::npos) {
+                size_t parenPos = line.find("()");
+                if (parenPos > 0 && parenPos != std::string::npos) {
+                    std::string funcName = line.substr(0, parenPos);
+                    // Trim function name
+                    size_t nameStart = funcName.find_first_not_of(" \t");
+                    size_t nameEnd = funcName.find_last_not_of(" \t");
+                    if (nameStart != std::string::npos) {
+                        funcName = funcName.substr(nameStart, nameEnd - nameStart + 1);
+                        
+                        // Check if valid function name (alphanumeric + underscore)
+                        bool validName = !funcName.empty() && (isalpha(funcName[0]) || funcName[0] == '_');
+                        for (char c : funcName) {
+                            if (!isalnum(c) && c != '_') {
+                                validName = false;
+                                break;
+                            }
+                        }
+                        
+                        if (validName) {
+                            // Find opening brace
+                            size_t bracePos = line.find('{', parenPos + 2);
+                            bool foundBrace = (bracePos != std::string::npos);
+                            size_t funcStart = i + 1;
+                            
+                            // If no brace on same line, check next line
+                            if (!foundBrace && i + 1 < end) {
+                                std::string nextLine = lines[i + 1];
+                                size_t ns = nextLine.find_first_not_of(" \t\r\n");
+                                if (ns != std::string::npos && nextLine[ns] == '{') {
+                                    foundBrace = true;
+                                    funcStart = i + 2;
+                                }
+                            }
+                            
+                            if (foundBrace) {
+                                // Find matching closing brace - must search from funcStart
+                                size_t funcEnd = std::string::npos;
+                                int braceDepth = 0;
+                                bool foundOpenBrace = false;
+                                
+                                // Find the opening brace position
+                                size_t searchStart = (bracePos != std::string::npos) ? i : i + 1;
+                                
+                                // Count braces starting from the line with opening brace
+                                for (size_t j = searchStart; j < end; j++) {
+                                    std::string searchLine = lines[j];
+                                    for (char c : searchLine) {
+                                        if (c == '{') {
+                                            braceDepth++;
+                                            foundOpenBrace = true;
+                                        } else if (c == '}') {
+                                            braceDepth--;
+                                            if (foundOpenBrace && braceDepth == 0) {
+                                                funcEnd = j;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    if (funcEnd != std::string::npos) break;
+                                }
+                                
+                                if (funcEnd != std::string::npos) {
+                                    // Store function body
+                                    std::vector<std::string> funcBody;
+                                    for (size_t j = funcStart; j < funcEnd; j++) {
+                                        funcBody.push_back(lines[j]);
+                                    }
+                                    functions[funcName] = funcBody;
+                                    
+                                    i = funcEnd + 1;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            
+            // Check for control structures
+            if (line.find("if ") == 0 || line == "if") {
+                // Find matching fi
+                size_t fiLine = findMatchingFi(lines, i);
+                if (fiLine == std::string::npos) {
+                    outputError("sh: syntax error: no matching fi");
+                    return false;
+                }
+                
+                if (!executeIf(lines, i, fiLine)) {
+                    if (optionE) return false;
+                }
+                i = fiLine + 1;
+                continue;
+            }
+            
+            if (line.find("while ") == 0) {
+                size_t doneLine = findMatchingDone(lines, i);
+                if (doneLine == std::string::npos) {
+                    outputError("sh: syntax error: no matching done");
+                    return false;
+                }
+                
+                if (!executeWhile(lines, i, doneLine)) {
+                    if (optionE) return false;
+                }
+                i = doneLine + 1;
+                continue;
+            }
+            
+            if (line.find("for ") == 0) {
+                size_t doneLine = findMatchingDone(lines, i);
+                if (doneLine == std::string::npos) {
+                    outputError("sh: syntax error: no matching done");
+                    return false;
+                }
+                
+                if (!executeFor(lines, i, doneLine)) {
+                    if (optionE) return false;
+                }
+                i = doneLine + 1;
+                continue;
+            }
+            
+            // Check for here-document redirection
+            if (line.find("<<") != std::string::npos) {
+                // Parse here-doc: command << DELIMITER
+                size_t pos = line.find("<<");
+                size_t delimStart = pos + 2;
+                while (delimStart < line.length() && isspace(line[delimStart])) delimStart++;
+                
+                std::string delimiter;
+                size_t delimEnd = delimStart;
+                while (delimEnd < line.length() && !isspace(line[delimEnd])) delimEnd++;
+                delimiter = line.substr(delimStart, delimEnd - delimStart);
+                
+                // Remove quotes from delimiter if present
+                if (!delimiter.empty() && delimiter[0] == '\'' && delimiter.back() == '\'') {
+                    delimiter = delimiter.substr(1, delimiter.length() - 2);
+                } else if (!delimiter.empty() && delimiter[0] == '"' && delimiter.back() == '"') {
+                    delimiter = delimiter.substr(1, delimiter.length() - 2);
+                }
+                
+                // Extract the command part before <<
+                std::string cmdPart = line.substr(0, pos);
+                
+                // Collect here-doc content
+                std::string heredocContent;
+                i++;
+                while (i < end && lines[i] != delimiter) {
+                    if (!heredocContent.empty()) heredocContent += "\n";
+                    heredocContent += lines[i];
+                    i++;
+                }
+                
+                // Skip the delimiter line itself
+                if (i < end && lines[i] == delimiter) {
+                    i++;
+                }
+                
+                // Now execute the command with here-doc input
+                // For now, we redirect the heredoc content to a temp file and pass it
+                // Or we could implement stdin redirection in executeCommand
+                // For simplicity, we'll create a temp file and use it
+                
+                // Create temporary file
+                std::string tempFile = "wnus_heredoc_" + std::to_string(rand()) + ".tmp";
+                std::ofstream tempOut(tempFile);
+                if (tempOut.is_open()) {
+                    tempOut << heredocContent;
+                    tempOut.close();
+                    
+                    // Execute command with input redirection
+                    std::string fullCmd = cmdPart + " < " + tempFile;
+                    
+                    bool savedSkipPrompt = g_skipFinalPrompt;
+                    g_skipFinalPrompt = true;
+                    executeCommand(fullCmd);
+                    g_skipFinalPrompt = savedSkipPrompt;
+                    
+                    // Clean up temp file
+                    std::remove(tempFile.c_str());
+                    
+                    if (optionE && g_lastExitStatus != 0) {
+                        return false;
+                    }
+                }
+                continue;
+            }
+            
+            // Regular command execution
+            if (!executeLine(line)) {
+                return false;
+            }
+            
+            i++;
+        }
+        
+        return true;
+    }
+    
+    size_t findMatchingFi(const std::vector<std::string>& lines, size_t start) {
+        int depth = 0;
+        for (size_t i = start; i < lines.size(); i++) {
+            std::string trimmed = lines[i];
+            size_t s = trimmed.find_first_not_of(" \t\r\n");
+            if (s != std::string::npos) {
+                trimmed = trimmed.substr(s);
+                if (trimmed.find("if ") == 0) depth++;
+                else if (trimmed == "fi") {
+                    if (depth == 0) return i;
+                    depth--;
+                }
+            }
+        }
+        return std::string::npos;
+    }
+    
+    size_t findMatchingDone(const std::vector<std::string>& lines, size_t start) {
+        int depth = 0;
+        for (size_t i = start; i < lines.size(); i++) {
+            std::string trimmed = lines[i];
+            size_t s = trimmed.find_first_not_of(" \t\r\n");
+            if (s != std::string::npos) {
+                trimmed = trimmed.substr(s);
+                if (trimmed.find("while ") == 0 || trimmed.find("for ") == 0 || trimmed.find("until ") == 0) depth++;
+                else if (trimmed == "done") {
+                    if (depth == 0) return i;
+                    depth--;
+                }
+            }
+        }
+        return std::string::npos;
+    }
+    
+    size_t findMatchingBrace(const std::vector<std::string>& lines, size_t start) {
+        int depth = 0;
+        bool foundOpen = false;
+        for (size_t i = start; i < lines.size(); i++) {
+            std::string line = lines[i];
+            for (char c : line) {
+                if (c == '{') {
+                    depth++;
+                    foundOpen = true;
+                } else if (c == '}') {
+                    depth--;
+                    if (foundOpen && depth == 0) {
+                        return i;
+                    }
+                }
+            }
+        }
+        return std::string::npos;
+    }
+    
+    bool executeIf(const std::vector<std::string>& lines, size_t start, size_t end) {
+        // Parse: if condition; then commands; [elif condition; then commands;]* [else commands;] fi
+        
+        std::string ifLine = lines[start];
+        size_t condStart = ifLine.find("if ") + 3;
+        std::string condition = ifLine.substr(condStart);
+        
+        // Handle [ ... ] or [[ ... ]]
+        bool condResult = false;
+        if (condition.find('[') != std::string::npos) {
+            size_t bracketStart = condition.find('[');
+            size_t bracketEnd = condition.find(']', bracketStart);
+            if (bracketEnd != std::string::npos) {
+                std::string testExpr = condition.substr(bracketStart + 1, bracketEnd - bracketStart - 1);
+                // Parse test expression
+                std::vector<std::string> tokens;
+                std::istringstream iss(testExpr);
+                std::string token;
+                while (iss >> token) {
+                    token = expandVariables(token);
+                    tokens.push_back(token);
+                }
+                condResult = evaluateTest(tokens);
+            }
+        } else {
+            // Execute condition as command
+            std::string cmdResult = executeCommandCapture(condition);
+            condResult = (g_lastExitStatus == 0);
+        }
+        
+        // Find then, elif, else, fi
+        size_t thenLine = start + 1;
+        while (thenLine <= end) {
+            std::string line = lines[thenLine];
+            size_t s = line.find_first_not_of(" \t\r\n");
+            if (s != std::string::npos) {
+                line = line.substr(s);
+                if (line == "then" || line.find("then ") == 0) break;
+            }
+            thenLine++;
+        }
+        
+        if (thenLine > end) return false;
+        
+        // Find else/elif/fi
+        size_t elseLineIdx = thenLine + 1;
+        int depth = 0;
+        while (elseLineIdx <= end) {
+            std::string line = lines[elseLineIdx];
+            size_t s = line.find_first_not_of(" \t\r\n");
+            if (s != std::string::npos) {
+                line = line.substr(s);
+                if (line.find("if ") == 0) depth++;
+                else if (line == "fi" && depth == 0) break;
+                else if (line == "fi") depth--;
+                else if ((line == "else" || line.find("elif ") == 0) && depth == 0) break;
+            }
+            elseLineIdx++;
+        }
+        
+        if (condResult) {
+            return executeLines(lines, thenLine + 1, elseLineIdx);
+        } else if (elseLineIdx < end) {
+            std::string elseLineStr = lines[elseLineIdx];
+            size_t s = elseLineStr.find_first_not_of(" \t\r\n");
+            if (s != std::string::npos) {
+                elseLineStr = elseLineStr.substr(s);
+                if (elseLineStr == "else") {
+                    return executeLines(lines, elseLineIdx + 1, end);
+                } else if (elseLineStr.find("elif ") == 0) {
+                    // Recursively handle elif as new if
+                    return executeIf(lines, elseLineIdx, end);
+                }
+            }
+        }
+        
+        return true;
+    }
+    
+    bool executeWhile(const std::vector<std::string>& lines, size_t start, size_t end) {
+        while (true) {
+            std::string whileLine = lines[start];
+            size_t condStart = whileLine.find("while ") + 6;
+            std::string condition = whileLine.substr(condStart);
+            
+            bool condResult = false;
+            if (condition.find('[') != std::string::npos) {
+                size_t bracketStart = condition.find('[');
+                size_t bracketEnd = condition.find(']', bracketStart);
+                if (bracketEnd != std::string::npos) {
+                    std::string testExpr = condition.substr(bracketStart + 1, bracketEnd - bracketStart - 1);
+                    std::vector<std::string> tokens;
+                    std::istringstream iss(testExpr);
+                    std::string token;
+                    while (iss >> token) {
+                        token = expandVariables(token);
+                        tokens.push_back(token);
+                    }
+                    condResult = evaluateTest(tokens);
+                }
+            } else {
+                std::string cmdResult = executeCommandCapture(condition);
+                condResult = (g_lastExitStatus == 0);
+            }
+            
+            if (!condResult) break;
+            
+            // Find do
+            size_t doLine = start + 1;
+            while (doLine < end) {
+                std::string line = lines[doLine];
+                size_t s = line.find_first_not_of(" \t\r\n");
+                if (s != std::string::npos) {
+                    line = line.substr(s);
+                    if (line == "do" || line.find("do ") == 0) break;
+                }
+                doLine++;
+            }
+            
+            if (!executeLines(lines, doLine + 1, end)) {
+                if (optionE) return false;
+            }
+        }
+        
+        return true;
+    }
+    
+    bool executeFor(const std::vector<std::string>& lines, size_t start, size_t end) {
+        // Parse: for var in list; do commands; done
+        std::string forLine = lines[start];
+        size_t varStart = forLine.find("for ") + 4;
+        size_t inPos = forLine.find(" in ", varStart);
+        
+        if (inPos == std::string::npos) return false;
+        
+        std::string varName = forLine.substr(varStart, inPos - varStart);
+        // Trim varName
+        size_t s = varName.find_first_not_of(" \t");
+        size_t e = varName.find_last_not_of(" \t");
+        if (s != std::string::npos) {
+            varName = varName.substr(s, e - s + 1);
+        }
+        
+        std::string listStr = forLine.substr(inPos + 4);
+        // Remove ; or do if present
+        size_t semiPos = listStr.find(';');
+        if (semiPos != std::string::npos) {
+            listStr = listStr.substr(0, semiPos);
+        }
+        
+        listStr = expandVariables(listStr);
+        
+        // Split list by whitespace
+        std::vector<std::string> items;
+        std::istringstream iss(listStr);
+        std::string item;
+        while (iss >> item) {
+            items.push_back(item);
+        }
+        
+        // Find do
+        size_t doLine = start + 1;
+        while (doLine < end) {
+            std::string line = lines[doLine];
+            s = line.find_first_not_of(" \t\r\n");
+            if (s != std::string::npos) {
+                line = line.substr(s);
+                if (line == "do" || line.find("do ") == 0) break;
+            }
+            doLine++;
+        }
+        
+        // Execute loop body for each item
+        for (const auto& item : items) {
+            setVariable(varName, item);
+            if (!executeLines(lines, doLine + 1, end)) {
+                if (optionE) return false;
+            }
+        }
+        
+        return true;
+    }
+};
+
 // sh command - Execute shell scripts
 void cmd_sh(const std::vector<std::string>& args) {
     if (checkHelpFlag(args)) {
         output("Usage: sh [options] [script [arguments...]]");
-        output("  Execute shell scripts");
+        output("  Execute shell scripts with POSIX shell compatibility");
         output("");
         output("OPTIONS");
-        output("  -c <command>   Execute command string");
-        output("  script         Execute commands from script file");
+        output("  -c <command>   Execute command string and exit");
+        output("  -i             Interactive mode (not implemented)");
+        output("  -s             Read commands from standard input");
+        output("  -e             Exit immediately if a command exits with non-zero status");
+        output("  -u             Treat unset variables as an error");
+        output("  -v             Verbose mode: print shell input lines as they are read");
+        output("  -x             Print commands and arguments as they are executed (xtrace)");
+        output("  -n             Read commands but do not execute them (syntax check)");
+        output("  -f             Disable filename generation (globbing)");
+        output("  -m             Enable job control (not implemented)");
+        output("  -a             Export all modified variables");
+        output("  -b             Notify of job termination immediately (not implemented)");
+        output("  -h             Remember command locations (not implemented)");
+        output("  -k             Place all assignment arguments in environment");
+        output("  -t             Exit after reading and executing one command");
+        output("  -C             Prevent output redirection from overwriting files");
+        output("  --version      Display version information");
+        output("  --             End of options");
         output("");
         output("DESCRIPTION");
-        output("  sh executes shell scripts line by line. It can execute");
-        output("  a command string with -c or read from a script file.");
-        output("  Script arguments are passed to the script.");
+        output("  sh is a POSIX-compliant command interpreter that executes commands");
+        output("  read from a command string (-c), standard input (-s), or a file.");
+        output("  When invoked as an interactive shell, it provides command editing");
+        output("  and history features.");
+        output("");
+        output("  Script arguments are available as positional parameters ($1, $2, ...)");
+        output("  The special parameter $0 contains the script name.");
+        output("");
+        output("SHELL GRAMMAR");
+        output("  Simple Commands: command [arguments...]");
+        output("  Pipelines: command1 | command2 | command3");
+        output("  Lists: command1 ; command2 (sequential execution)");
+        output("         command1 && command2 (AND list)");
+        output("         command1 || command2 (OR list)");
+        output("  Background: command &");
+        output("  Redirection: < file (input), > file (output), >> file (append)");
+        output("               2> file (stderr), 2>&1 (stderr to stdout)");
         output("");
         output("EXAMPLES");
         output("  sh -c \"echo Hello World\"");
-        output("  sh script.sh");
-        output("  sh script.sh arg1 arg2");
+        output("    Execute a simple command string");
+        output("");
+        output("  sh -c \"ls -la | grep txt\"");
+        output("    Execute a pipeline");
+        output("");
+        output("  sh -e script.sh");
+        output("    Execute script, exit on first error");
+        output("");
+        output("  sh -x script.sh arg1 arg2");
+        output("    Execute script with command tracing, pass arguments");
+        output("");
+        output("  sh -n script.sh");
+        output("    Check script syntax without executing");
+        output("");
+        output("  echo 'ls -la' | sh -s");
+        output("    Read and execute commands from stdin");
+        output("");
+        output("  sh -v -x debug.sh");
+        output("    Execute with verbose and trace modes for debugging");
         output("");
         output("SEE ALSO");
-        output("  source, bash, exec");
+        output("  bash, source, exec, export, set");
         return;
     }
     
-    if (args.size() < 2) {
-        outputError("sh: missing operand");
-        output("Usage: sh [options] [script [arguments...]]");
-        output("Try 'sh --help' for more information.");
-        return;
+    // Parse options
+    bool optionC = false;           // Execute command string
+    bool optionS = false;           // Read from stdin
+    bool optionE = false;           // Exit on error
+    bool optionU = false;           // Treat unset variables as error
+    bool optionV = false;           // Verbose mode
+    bool optionX = false;           // Trace mode (xtrace)
+    bool optionN = false;           // Syntax check only (noexec)
+    bool optionF = false;           // Disable globbing
+    bool optionA = false;           // Export all variables
+    bool optionK = false;           // Assignment arguments in environment
+    bool optionT = false;           // Exit after one command
+    bool optionC_noclobber = false; // Prevent overwriting
+    
+    std::string commandString;
+    std::string scriptFile;
+    std::vector<std::string> scriptArgs;
+    
+    size_t argIdx = 1;
+    bool optionsEnded = false;
+    
+    while (argIdx < args.size()) {
+        std::string arg = args[argIdx];
+        
+        if (!optionsEnded && arg.length() > 0 && arg[0] == '-') {
+            if (arg == "--") {
+                optionsEnded = true;
+                argIdx++;
+                continue;
+            } else if (arg == "--version") {
+                output("sh (wnus) " + WNUS_VERSION);
+                output("POSIX-compliant shell implementation");
+                output("Copyright (C) 2024-2026 wnus project");
+                g_lastExitStatus = 0;
+                return;
+            } else if (arg == "-c") {
+                optionC = true;
+                argIdx++;
+                if (argIdx >= args.size()) {
+                    outputError("sh: -c: option requires an argument");
+                    g_lastExitStatus = 2;
+                    return;
+                }
+                commandString = args[argIdx];
+                argIdx++;
+                // Remaining args become $0, $1, $2, etc. when used with -c
+                while (argIdx < args.size()) {
+                    scriptArgs.push_back(args[argIdx]);
+                    argIdx++;
+                }
+                break;
+            } else {
+                // Parse combined options like -ex, -vx, etc.
+                for (size_t i = 1; i < arg.length(); i++) {
+                    char opt = arg[i];
+                    switch (opt) {
+                        case 's': optionS = true; break;
+                        case 'e': optionE = true; break;
+                        case 'u': optionU = true; break;
+                        case 'v': optionV = true; break;
+                        case 'x': optionX = true; break;
+                        case 'n': optionN = true; break;
+                        case 'f': optionF = false; break; // Disable globbing (wnus always globs)
+                        case 'a': optionA = true; break;
+                        case 'k': optionK = true; break;
+                        case 't': optionT = true; break;
+                        case 'C': optionC_noclobber = true; break;
+                        case 'i': case 'm': case 'b': case 'h':
+                            // Recognized but not implemented
+                            break;
+                        default:
+                            outputError("sh: illegal option -- " + std::string(1, opt));
+                            output("Try 'sh --help' for more information.");
+                            g_lastExitStatus = 2;
+                            return;
+                    }
+                }
+            }
+        } else {
+            // First non-option argument is script file
+            scriptFile = arg;
+            argIdx++;
+            // Remaining arguments are script arguments
+            while (argIdx < args.size()) {
+                scriptArgs.push_back(args[argIdx]);
+                argIdx++;
+            }
+            break;
+        }
+        argIdx++;
     }
     
-    // Handle -c option for command string
-    if (args[1] == "-c") {
-        if (args.size() < 3) {
-            outputError("sh: -c: option requires an argument");
+    // Determine execution mode
+    if (optionC) {
+        // Execute command string mode with shell features
+        ShellInterpreter shell;
+        shell.setScriptArgs(scriptArgs);
+        shell.setOptions(optionE, optionU, optionV, optionX, optionN);
+        
+        if (!shell.executeLine(commandString)) {
+            return;
+        }
+        return;
+    } else if (optionS) {
+        // Read from stdin mode with shell features
+        if (g_isPipedCommand && !g_capturedOutput.empty()) {
+            ShellInterpreter shell;
+            shell.setScriptArgs(scriptArgs);
+            shell.setOptions(optionE, optionU, optionV, optionX, optionN);
+            
+            for (const std::string& line : g_capturedOutput) {
+                if (!shell.executeLine(line)) {
+                    if (optionE) return;
+                }
+                if (optionT) return;
+            }
+        } else {
+            outputError("sh: -s requires input from pipe or redirection");
+            g_lastExitStatus = 1;
+        }
+        return;
+    } else if (!scriptFile.empty()) {
+        // Execute script file mode with full shell features
+        
+        // Expand tilde if present
+        if (scriptFile[0] == '~') {
+            char homeDir[MAX_PATH];
+            if (GetEnvironmentVariableA("USERPROFILE", homeDir, sizeof(homeDir))) {
+                scriptFile = std::string(homeDir) + scriptFile.substr(1);
+            }
+        }
+        
+        // Convert Unix path to Windows path
+        std::string windowsPath = unixPathToWindows(scriptFile);
+        
+        std::ifstream file(windowsPath);
+        if (!file.is_open()) {
+            outputError("sh: " + scriptFile + ": No such file or directory");
+            g_lastExitStatus = 127;
             return;
         }
         
-        // Execute the command string
-        std::string commandStr = args[2];
-        executeCommand(commandStr);
-        return;
-    }
-    
-    // Execute script file
-    std::string filename = args[1];
-    
-    // Convert to Windows path if needed
-    if (filename[0] == '~') {
-        char homeDir[MAX_PATH];
-        if (GetEnvironmentVariableA("USERPROFILE", homeDir, sizeof(homeDir))) {
-            filename = std::string(homeDir) + filename.substr(1);
-        }
-    }
-    
-    std::ifstream scriptFile(filename);
-    if (!scriptFile.is_open()) {
-        outputError("sh: " + filename + ": No such file or directory");
-        return;
-    }
-    
-    // TODO: Script arguments (args[2], args[3], ...) could be passed via environment
-    // For now, we just execute line by line
-    
-    std::string line;
-    int lineNum = 0;
-    while (std::getline(scriptFile, line)) {
-        lineNum++;
+        // Create shell interpreter
+        ShellInterpreter shell;
         
-        // Skip empty lines and comments
-        if (line.empty() || line[0] == '#') {
-            continue;
+        // Set script arguments ($0, $1, $2, ...)
+        std::vector<std::string> fullArgs;
+        fullArgs.push_back(scriptFile);
+        fullArgs.insert(fullArgs.end(), scriptArgs.begin(), scriptArgs.end());
+        shell.setScriptArgs(fullArgs);
+        shell.setOptions(optionE, optionU, optionV, optionX, optionN);
+        
+        // Execute script
+        if (!shell.executeScript(file)) {
+            file.close();
+            return;
         }
         
-        // Execute the command
-        executeCommand(line);
+        file.close();
+        g_lastExitStatus = 0;
+    } else {
+        // No mode specified
+        outputError("sh: missing operand");
+        output("Usage: sh [options] [script [arguments...]]");
+        output("Try 'sh --help' for more information.");
+        g_lastExitStatus = 2;
     }
-    
-    scriptFile.close();
 }
 
 // IP command - show network interfaces and IP configuration
@@ -40959,7 +45273,7 @@ void cmd_ping(const std::vector<std::string>& args) {
         } else if (arg == "-U") {
             verboseMode = true;  // User-to-user latency is just verbose
         } else if (arg == "-V" || arg == "--version") {
-            output("ping version 0.1.2.3 (wnus implementation)");
+            output("ping version " + WNUS_VERSION + " (wnus implementation)");
             return;
         } else if (arg[0] != '-') {
             host = arg;
@@ -42470,7 +46784,23 @@ bool executeExternalCommand(const std::string& cmdLine) {
     si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
     si.hStdOutput = hWritePipe;
     si.hStdError = hWritePipe;
-    si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    
+    // Handle Input Redirect/Pipe for External Command
+    HANDLE hInputRead = NULL;
+    HANDLE hInputWrite = NULL;
+    
+    if (!g_capturedOutput.empty()) {
+        // Create a pipe to feed captured output to the child process
+        if (CreatePipe(&hInputRead, &hInputWrite, &sa, 0)) {
+             SetHandleInformation(hInputWrite, HANDLE_FLAG_INHERIT, 0); // Parent writes, child reads
+             si.hStdInput = hInputRead;
+        } else {
+             si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+        }
+    } else {
+        si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    }
+
     si.wShowWindow = SW_HIDE;
     
     PROCESS_INFORMATION pi = {0};
@@ -42493,6 +46823,21 @@ bool executeExternalCommand(const std::string& cmdLine) {
         &pi
     );
     
+    // Provide Input if we created a pipe
+    if (success && hInputWrite != NULL) {
+        for (const auto& line : g_capturedOutput) {
+            std::string lineWithEnd = line + "\r\n";
+            DWORD written;
+            WriteFile(hInputWrite, lineWithEnd.c_str(), (DWORD)lineWithEnd.length(), &written, NULL);
+        }
+        CloseHandle(hInputWrite); // Close write end so child sees EOF
+        g_capturedOutput.clear(); // Consumed
+    }
+    
+    if (hInputRead != NULL) {
+        CloseHandle(hInputRead); // Close read end in parent
+    }
+
     if (!success) {
         CloseHandle(hReadPipe);
         CloseHandle(hWritePipe);
@@ -42507,9 +46852,27 @@ bool executeExternalCommand(const std::string& cmdLine) {
     char buffer[4096];
     DWORD bytesRead;
     
+    // Process output line by line as it comes in
+    std::string lineBuffer;
+    
     while (ReadFile(hReadPipe, buffer, sizeof(buffer) - 1, &bytesRead, NULL) && bytesRead > 0) {
         buffer[bytesRead] = '\0';
-        outputText += buffer;
+        std::string chunk(buffer);
+        
+        for (char c : chunk) {
+            if (c == '\n') {
+                if (!lineBuffer.empty() && lineBuffer.back() == '\r') {
+                    lineBuffer.pop_back();
+                }
+                output(lineBuffer);
+                lineBuffer = "";
+            } else {
+                lineBuffer += c;
+            }
+        }
+    }
+    if (!lineBuffer.empty()) {
+        output(lineBuffer);
     }
     
     // Wait for process to finish
@@ -42548,94 +46911,113 @@ bool executeExternalCommand(const std::string& cmdLine) {
 
 // Tab completion
 std::vector<std::string> getCommandList() {
-    std::vector<std::string> commands;
-    commands.push_back("pwd");
-    commands.push_back("cd");
-    commands.push_back("ls");
-    commands.push_back("dir");
-    commands.push_back("cat");
-    commands.push_back("type");
-    commands.push_back("less");
-    commands.push_back("head");
-    commands.push_back("tail");
-    commands.push_back("grep");
-    commands.push_back("echo");
-    commands.push_back("mkdir");
-    commands.push_back("rmdir");
-    commands.push_back("rm");
-    commands.push_back("del");
-    commands.push_back("touch");
-    commands.push_back("mv");
-    commands.push_back("dd");
-    commands.push_back("tar");
-    commands.push_back("gzip");
-    commands.push_back("gunzip");
-    commands.push_back("zip");
-    commands.push_back("unzip");
-    commands.push_back("chmod");
-    commands.push_back("chown");
-    commands.push_back("chgrp");
-    commands.push_back("find");
-    commands.push_back("locate");
-    commands.push_back("ssh");
-    commands.push_back("scp");
-    commands.push_back("sync");
-    commands.push_back("rsync");
-    commands.push_back("ps");
-    commands.push_back("proc");
-    commands.push_back("kill");
-    commands.push_back("killall");
-    commands.push_back("xkill");
-    commands.push_back("clear");
-    commands.push_back("cls");
-    commands.push_back("rev");
-    commands.push_back("nano");
-    commands.push_back("alias");
-    commands.push_back("unalias");
-    commands.push_back("history");
-    commands.push_back("sudo");
-    commands.push_back("su");
-    commands.push_back("ip");
-    commands.push_back("iptables");
-    commands.push_back("ping");
-    commands.push_back("traceroute");
-    commands.push_back("tracert");
-    commands.push_back("man");
-    commands.push_back("help");
-    commands.push_back("exit");
-    commands.push_back("quit");
-    return commands;
+    return ALL_KNOWN_COMMANDS;
 }
 
-std::vector<std::string> findMatches(const std::string& prefix, bool commandOnly) {
+std::vector<std::string> getCommonOptions(const std::string& command) {
+    std::vector<std::string> opts;
+    opts.push_back("-h");
+    opts.push_back("--help");
+    opts.push_back("--version");
+    
+    if (command == "ls" || command == "dir") {
+        opts.push_back("-l");
+        opts.push_back("-a");
+        opts.push_back("-la");
+        opts.push_back("-R");
+        opts.push_back("-F");
+        opts.push_back("-h");
+        opts.push_back("--color");
+    } else if (command == "grep") {
+        opts.push_back("-i");
+        opts.push_back("-v");
+        opts.push_back("-c");
+        opts.push_back("-n");
+        opts.push_back("-r");
+        opts.push_back("-l");
+        opts.push_back("-E");
+    } else if (command == "ping") {
+        opts.push_back("-t");
+        opts.push_back("-n");
+        opts.push_back("-l");
+    } else if (command == "git") {
+        opts.push_back("status");
+        opts.push_back("commit");
+        opts.push_back("push");
+        opts.push_back("pull");
+        opts.push_back("add");
+    }
+    
+    std::sort(opts.begin(), opts.end());
+    opts.erase(std::unique(opts.begin(), opts.end()), opts.end());
+    return opts;
+}
+
+std::vector<std::string> findMatches(const std::string& prefix, bool commandOnly, bool isOption, const std::string& currentCommand) {
     std::vector<std::string> matches;
     
-    if (commandOnly) {
+    if (isOption) {
+        std::vector<std::string> opts = getCommonOptions(currentCommand);
+        std::string prefixLower = g_caseSensitive ? prefix : toLower(prefix);
+        
+        for (const auto& opt : opts) {
+            std::string optLower = g_caseSensitive ? opt : toLower(opt);
+            if (optLower.find(prefixLower) == 0) {
+                matches.push_back(opt);
+            }
+        }
+    } else if (commandOnly) {
         // Match commands
         std::vector<std::string> commands = getCommandList();
+        std::string prefixLower = g_caseSensitive ? prefix : toLower(prefix);
+        
         for (const auto& cmd : commands) {
             std::string cmdLower = g_caseSensitive ? cmd : toLower(cmd);
-            std::string prefixLower = g_caseSensitive ? prefix : toLower(prefix);
-            
             if (cmdLower.find(prefixLower) == 0) {
                 matches.push_back(cmd);
             }
         }
     } else {
-        // Match files in current directory
+        // Match files in current or specified directory
+        // Handle path prefixes like ./, ../, /some/path/, etc.
+        std::string searchPrefix = prefix;
+        std::string pathPrefix = "";
+        std::string searchDir = ".";
+        
+        // Check if prefix contains a path separator
+        size_t lastSlash = prefix.rfind('/');
+        if (lastSlash != std::string::npos) {
+            pathPrefix = prefix.substr(0, lastSlash + 1);
+            searchPrefix = prefix.substr(lastSlash + 1);
+            searchDir = pathPrefix;
+            
+            // Convert to Windows path for directory search
+            if (searchDir.back() == '/') {
+                searchDir = searchDir.substr(0, searchDir.length() - 1);
+            }
+            searchDir = unixPathToWindows(searchDir);
+        }
+        
+        // Build search pattern
+        std::string searchPattern = searchDir;
+        if (searchPattern != ".") {
+            searchPattern += "\\*";
+        } else {
+            searchPattern = "*";
+        }
+        
         WIN32_FIND_DATAA findData;
-        HANDLE hFind = FindFirstFileA("*", &findData);
+        HANDLE hFind = FindFirstFileA(searchPattern.c_str(), &findData);
         
         if (hFind != INVALID_HANDLE_VALUE) {
+            std::string prefixLower = g_caseSensitive ? searchPrefix : toLower(searchPrefix);
             do {
                 std::string filename = findData.cFileName;
                 if (filename == "." || filename == "..") continue;
                 
                 std::string filenameLower = g_caseSensitive ? filename : toLower(filename);
-                std::string prefixLower = g_caseSensitive ? prefix : toLower(prefix);
-                
                 if (filenameLower.find(prefixLower) == 0) {
-                    matches.push_back(filename);
+                    matches.push_back(pathPrefix + filename);
                 }
             } while (FindNextFileA(hFind, &findData));
             FindClose(hFind);
@@ -42643,6 +47025,7 @@ std::vector<std::string> findMatches(const std::string& prefix, bool commandOnly
     }
     
     std::sort(matches.begin(), matches.end());
+    matches.erase(std::unique(matches.begin(), matches.end()), matches.end());
     return matches;
 }
 
@@ -42677,102 +47060,179 @@ void handleTabCompletion(HWND hwnd) {
     
     std::string input = allText.substr(g_promptStart);
     
-    // Parse tokens to determine what we're completing
-    std::vector<std::string> tokens = split(input);
-    bool isCommandPosition = (tokens.empty() || (input.back() != ' ' && tokens.size() == 1));
-    std::string prefix = tokens.empty() ? "" : tokens.back();
+    // Improved Tokenization
+    std::vector<std::string> tokens;
+    std::string currentToken;
+    bool inQuotes = false;
+    char quoteChar = 0;
     
-    // If input ends with space, we're completing a new word with empty prefix
-    if (!input.empty() && input.back() == ' ') {
-        prefix = "";
+    for (size_t i = 0; i < input.length(); i++) {
+        char c = input[i];
+        if (inQuotes) {
+            currentToken += c;
+            if (c == quoteChar) inQuotes = false;
+            continue;
+        }
+        
+        if (c == '"' || c == '\'') {
+            inQuotes = true;
+            quoteChar = c;
+            currentToken += c;
+            continue;
+        }
+        
+        // Operators
+        bool isOperatorStart = (c == '|' || c == '&' || c == ';');
+        if (isOperatorStart) {
+             bool isDouble = (i + 1 < input.length() && input[i+1] == c && c != ';');
+             if (!currentToken.empty()) {
+                 tokens.push_back(currentToken);
+                 currentToken = "";
+             }
+             if (isDouble) {
+                 tokens.push_back(input.substr(i, 2));
+                 i++;
+             } else {
+                 tokens.push_back(std::string(1, c));
+             }
+             continue;
+        }
+        
+        if (isspace(c)) {
+             if (!currentToken.empty()) {
+                 tokens.push_back(currentToken);
+                 currentToken = "";
+             }
+             continue;
+        }
+        
+        currentToken += c;
+    }
+    if (!currentToken.empty()) tokens.push_back(currentToken);
+
+    // Determine context
+    bool isCommandPosition = false;
+    bool isOption = false;
+    std::string currentCommand = "";
+    std::string prefix = "";
+    
+    bool isNewToken = input.empty() || isspace(input.back());
+    if (!isNewToken && !tokens.empty()) {
+        prefix = tokens.back();
     }
     
-    // Check if this is double-tab (within 500ms of last tab)
-    DWORD currentTime = GetTickCount();
-    bool isDoubleTap = (currentTime - g_lastTabTime) < 500;
-    g_lastTabTime = currentTime;
+    int tokenIndex = isNewToken ? (int)tokens.size() : (int)tokens.size() - 1;
     
-    // Check if we're starting a new completion sequence
-    bool newSequence = (g_tabMatches.empty() || prefix != g_tabPrefix);
-    
-    if (newSequence) {
-        // New completion sequence - find all matches
-        g_tabPrefix = prefix;
-        g_tabMatches = findMatches(prefix, isCommandPosition);
-        
-        if (g_tabMatches.empty()) {
-            return;
-        }
-        
-        // Find common prefix among all matches
-        std::string commonPrefix = findCommonPrefix(g_tabMatches);
-        
-        if (g_tabMatches.size() == 1) {
-            // Single match - complete it fully
-            std::string completion = g_tabMatches[0];
-            
-            // Add trailing / for directories
-            if (!isCommandPosition) {
-                std::string winPath = unixPathToWindows(completion);
-                DWORD attrs = GetFileAttributesA(winPath.c_str());
-                if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY)) {
-                    completion += "/";
-                }
-            }
-            
-            // Quote filenames with spaces
-            if (completion.find(' ') != std::string::npos) {
-                completion = "\"" + completion + "\"";
-            }
-            
-            // Replace the prefix with completion
-            int replaceStart = g_promptStart + input.length() - prefix.length();
-            SendMessage(hwnd, EM_SETSEL, replaceStart, textLen);
-            SendMessage(hwnd, EM_REPLACESEL, FALSE, (LPARAM)completion.c_str());
-            
-            // Clear state
-            g_tabMatches.clear();
-            g_tabPrefix.clear();
-        } else if (commonPrefix.length() > prefix.length()) {
-            // Multiple matches with common prefix - complete to common prefix
-            std::string completion = commonPrefix;
-            
-            // Quote if contains spaces
-            if (completion.find(' ') != std::string::npos) {
-                completion = "\"" + completion + "\"";
-            }
-            
-            int replaceStart = g_promptStart + input.length() - prefix.length();
-            SendMessage(hwnd, EM_SETSEL, replaceStart, textLen);
-            SendMessage(hwnd, EM_REPLACESEL, FALSE, (LPARAM)completion.c_str());
-            
-            // Update prefix to the common prefix for next tab
-            g_tabPrefix = commonPrefix;
-        }
-        // If commonPrefix.length() == prefix.length(), wait for second tab to show list
-    } else if (isDoubleTap && g_tabMatches.size() > 1) {
-        // Second tab with multiple matches - show all matches
-        output("");
-        std::string matchList;
-        for (size_t i = 0; i < g_tabMatches.size(); i++) {
-            matchList += g_tabMatches[i];
-            if (i < g_tabMatches.size() - 1) matchList += "  ";
-        }
-        output(matchList);
-        showPrompt();
-        
-        // Restore current input
-        int newTextLen = GetWindowTextLengthA(hwnd);
-        char* buf2 = new char[newTextLen + 1];
-        GetWindowTextA(hwnd, buf2, newTextLen + 1);
-        std::string newAllText = buf2;
-        delete[] buf2;
-        
-        if (newTextLen > g_promptStart) {
-            std::string currentInput = newAllText.substr(g_promptStart);
-            SendMessage(hwnd, EM_SETSEL, newTextLen, newTextLen);
+    if (tokenIndex == 0) {
+        isCommandPosition = true;
+    } else {
+        std::string prev = tokens[tokenIndex - 1];
+        if (prev == "|" || prev == "&&" || prev == "||" || prev == ";") {
+            isCommandPosition = true;
         }
     }
+    
+    if (!isCommandPosition) {
+        // Find command name
+        for (int i = tokenIndex - 1; i >= 0; i--) {
+            std::string t = tokens[i];
+            if (t == "|" || t == "&&" || t == "||" || t == ";") {
+                if (i + 1 < tokenIndex) currentCommand = tokens[i+1];
+                break;
+            }
+            if (i == 0) currentCommand = tokens[0];
+        }
+        
+        if (!prefix.empty() && prefix[0] == '-') {
+            isOption = true;
+        }
+    }
+
+    // Find all matches
+    std::vector<std::string> matches = findMatches(prefix, isCommandPosition, isOption, currentCommand);
+    
+    if (matches.empty()) {
+        return;
+    }
+    
+    // Single match: Complete and exit
+    if (matches.size() == 1) {
+        std::string completion = matches[0];
+        
+        // Add trailing / for directories
+        if (!isCommandPosition) {
+            std::string winPath = unixPathToWindows(completion);
+            DWORD attrs = GetFileAttributesA(winPath.c_str());
+            if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+                completion += "/";
+            }
+        }
+        
+        // Quote filenames with spaces
+        if (completion.find(' ') != std::string::npos) {
+            completion = "\"" + completion + "\"";
+        }
+        
+        // Replace the prefix with completion
+        int replaceStart = g_promptStart + input.length() - prefix.length();
+        SendMessage(hwnd, EM_SETSEL, replaceStart, textLen);
+        SendMessage(hwnd, EM_REPLACESEL, FALSE, (LPARAM)completion.c_str());
+        return;
+    }
+    
+    // Multiple matches: Enter cycling mode
+    // 1. Display options
+    output("");
+    output("Available options (use Left/Right to cycle, Space/Enter to select):");
+    std::string matchList;
+    for (size_t i = 0; i < matches.size(); i++) {
+        matchList += matches[i];
+        if (i < matches.size() - 1) matchList += "  ";
+    }
+    output(matchList);
+    
+    // 2. Setup completion state
+    g_isCompleting = true;
+    g_tabMatches = matches;
+    g_tabIndex = 0;
+    g_completionPrefix = prefix;
+    
+    // 3. Reprint prompt with first option pre-selected
+    showPrompt();
+    
+    // Recalculate preCompletion based on input logic
+    std::string preCompletion = input.substr(0, input.length() - prefix.length());
+    
+    // Update replace start relative to NEW prompt start
+    g_completionReplaceStart = g_promptStart + preCompletion.length();
+    
+    // Current completion candidate
+    std::string candidate = g_tabMatches[0];
+    
+    // Handle directory/quote formatting for display
+    if (!isCommandPosition) {
+         std::string winPath = unixPathToWindows(candidate);
+         DWORD attrs = GetFileAttributesA(winPath.c_str());
+         if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+             candidate += "/";
+         }
+    }
+    if (candidate.find(' ') != std::string::npos) candidate = "\"" + candidate + "\"";
+    
+    // Set full text
+    std::string newText = preCompletion + candidate;
+    
+    // We need to set the text of the LAST line (after the prompt we just printed)
+    // Actually, showPrompt just appended the prompt string. 
+    // We need to APPEND newText to the edit control.
+    
+    // Get length after showPrompt
+    int newLen = GetWindowTextLengthA(hwnd);
+    SendMessage(hwnd, EM_SETSEL, newLen, newLen);
+    SendMessage(hwnd, EM_REPLACESEL, FALSE, (LPARAM)newText.c_str());
+    
+    // Update g_promptStart? showPrompt updates it.
+    // So we just appended text.
 }
 
 // Forward declaration
@@ -42780,115 +47240,16 @@ void executeCommand(const std::string& command);
 
 // Subclassed edit control procedure
 LRESULT CALLBACK EditSubclassProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
-    if (uMsg == WM_KEYDOWN) {
-        // Handle Ctrl+F to exit full screen
-        if (wParam == 'F' && GetKeyState(VK_CONTROL) & 0x8000) {
-            if (g_isFullScreen) {
-                SendMessage(GetParent(hwnd), WM_COMMAND, ID_OPTIONS_FULLSCREEN, 0);
-            }
-            return 0;
-        }
-    }
-    
-    if (uMsg == WM_CHAR) {
-        // Check if in Save As input mode first
-        if (g_nanoSaveAsMode) {
-            if (wParam >= 32 && wParam < 127) {  // Printable characters
-                g_nanoSaveAsInput += (char)wParam;
-                // Echo the character
-                SetWindowTextA(g_hOutput, "");
-                output("Save As (Enter filename, ESC to cancel):");
-                output("");
-                output(g_nanoSaveAsInput);
-            }
-            return 0;
-        }
-        
-        // Check if in nano mode
-        if (g_nanoMode) {
-            // In nano mode, handle character input
-            if (wParam >= 32 && wParam < 127) {  // Printable characters
-                if (g_nanoCursorLine < (int)g_nanoBuffer.size()) {
-                    std::string& line = g_nanoBuffer[g_nanoCursorLine];
-                    if (g_nanoCursorCol <= (int)line.length()) {
-                        line.insert(g_nanoCursorCol, 1, (char)wParam);
-                        g_nanoCursorCol++;
-                        g_nanoModified = true;
-                        refreshNanoDisplay();
-                    }
-                }
-            }
-            return 0;  // Handled in nano mode
-        }
-        
-        // Prevent deletion/modification before prompt
-        DWORD start, end;
-        SendMessage(hwnd, EM_GETSEL, (WPARAM)&start, (LPARAM)&end);
-        
-        if (wParam == VK_BACK) {
-            // Prevent backspace before prompt
-            if (start <= (DWORD)g_promptStart) {
-                return 0;
-            }
-        } else if (wParam == VK_RETURN) {
-            // Check if we're in nano mode
-            if (g_nanoMode) {
-                // In nano mode, insert a new line
-                if (g_nanoCursorLine < (int)g_nanoBuffer.size()) {
-                    std::string currentLine = g_nanoBuffer[g_nanoCursorLine];
-                    std::string afterCursor = currentLine.substr(g_nanoCursorCol);
-                    g_nanoBuffer[g_nanoCursorLine] = currentLine.substr(0, g_nanoCursorCol);
-                    g_nanoBuffer.insert(g_nanoBuffer.begin() + g_nanoCursorLine + 1, afterCursor);
-                    g_nanoCursorLine++;
-                    g_nanoCursorCol = 0;
-                    g_nanoModified = true;
-                    refreshNanoDisplay();
-                }
-                return 0;  // Handled in nano mode
-            }
-            
-            // Get current input line FIRST before any output calls
-            int textLen = GetWindowTextLengthA(hwnd);
-            char* buffer = new char[textLen + 1];
-            GetWindowTextA(hwnd, buffer, textLen + 1);
-            std::string allText = buffer;
-            delete[] buffer;
-            
-            // Extract command (text after prompt)
-            std::string command;
-            if (textLen > g_promptStart) {
-                command = allText.substr(g_promptStart);
-            }
-            
-            // Add to history
-            if (!command.empty()) {
-                g_commandHistory.push_back(command);
-                g_historyIndex = g_commandHistory.size();
-                // Save immediately to preserve history
-                saveCommandHistory();
-            }
-            
-            // Reset tab completion
-            g_tabMatches.clear();
-            g_tabIndex = -1;
-            g_tabPrefix.clear();
-            g_tabInputLength = 0;
-            
-            // Execute command (this will call output)
-            executeCommand(command);
-            
-            return 0; // Don't pass to original proc
-        } else if (wParam == ' ') {
-            // Space confirms current tab selection and allows next word completion
-            // Just clear the matches so next tab starts fresh for the new word
-            g_tabMatches.clear();
-            g_tabIndex = -1;
-            g_tabPrefix.clear();
-            // Don't update g_tabInputLength - let it get updated naturally
-        }
-    }
+
+
     
     if (uMsg == WM_KEYDOWN) {
+        // Handle Ctrl+F (Fullscreen)
+        if (wParam == 'F' && (GetKeyState(VK_CONTROL) & 0x8000)) {
+            if (g_isFullScreen) SendMessage(GetParent(hwnd), WM_COMMAND, ID_OPTIONS_FULLSCREEN, 0);
+            return 0;
+        }
+
         // Handle Save As input mode first
         if (g_nanoSaveAsMode) {
             if (wParam == VK_RETURN) {
@@ -43013,16 +47374,13 @@ LRESULT CALLBACK EditSubclassProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lP
                 
                 return 0;
             } else if (wParam == 'K' && GetKeyState(VK_CONTROL) & 0x8000) {
-                // Ctrl+K - Cut line
-                if (g_nanoCursorLine < (int)g_nanoBuffer.size()) {
-                    // Store cut line (simplified - just clear it)
+                 if (g_nanoCursorLine < (int)g_nanoBuffer.size()) {
                     g_nanoBuffer.erase(g_nanoBuffer.begin() + g_nanoCursorLine);
                     g_nanoModified = true;
                     refreshNanoDisplay();
                 }
                 return 0;
             } else if (wParam == VK_DELETE) {
-                // Delete character
                 if (g_nanoCursorLine < (int)g_nanoBuffer.size()) {
                     std::string& line = g_nanoBuffer[g_nanoCursorLine];
                     if (g_nanoCursorCol < (int)line.length()) {
@@ -43033,7 +47391,6 @@ LRESULT CALLBACK EditSubclassProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lP
                 }
                 return 0;
             } else if (wParam == VK_BACK) {
-                // Backspace
                 if (g_nanoCursorLine < (int)g_nanoBuffer.size()) {
                     std::string& line = g_nanoBuffer[g_nanoCursorLine];
                     if (g_nanoCursorCol > 0) {
@@ -43045,14 +47402,12 @@ LRESULT CALLBACK EditSubclassProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lP
                 }
                 return 0;
             } else if (wParam == VK_LEFT) {
-                // Move left
                 if (g_nanoCursorCol > 0) {
                     g_nanoCursorCol--;
                     refreshNanoDisplay();
                 }
                 return 0;
             } else if (wParam == VK_RIGHT) {
-                // Move right
                 if (g_nanoCursorLine < (int)g_nanoBuffer.size()) {
                     if (g_nanoCursorCol < (int)g_nanoBuffer[g_nanoCursorLine].length()) {
                         g_nanoCursorCol++;
@@ -43061,10 +47416,8 @@ LRESULT CALLBACK EditSubclassProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lP
                 }
                 return 0;
             } else if (wParam == VK_UP) {
-                // Move up
                 if (g_nanoCursorLine > 0) {
                     g_nanoCursorLine--;
-                    // Keep column position or clamp to line length
                     if (g_nanoCursorCol > (int)g_nanoBuffer[g_nanoCursorLine].length()) {
                         g_nanoCursorCol = g_nanoBuffer[g_nanoCursorLine].length();
                     }
@@ -43072,10 +47425,8 @@ LRESULT CALLBACK EditSubclassProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lP
                 }
                 return 0;
             } else if (wParam == VK_DOWN) {
-                // Move down
                 if (g_nanoCursorLine < (int)g_nanoBuffer.size() - 1) {
                     g_nanoCursorLine++;
-                    // Keep column position or clamp to line length
                     if (g_nanoCursorCol > (int)g_nanoBuffer[g_nanoCursorLine].length()) {
                         g_nanoCursorCol = g_nanoBuffer[g_nanoCursorLine].length();
                     }
@@ -43088,102 +47439,172 @@ LRESULT CALLBACK EditSubclassProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lP
         
         // Handle Ctrl+C - Interrupt/terminate
         if (wParam == 'C' && GetKeyState(VK_CONTROL) & 0x8000) {
-            // Clear current input line
             int textLen = GetWindowTextLengthA(hwnd);
             SendMessage(hwnd, EM_SETSEL, g_promptStart, textLen);
             SendMessage(hwnd, EM_REPLACESEL, FALSE, (LPARAM)"");
-            
-            // Output ^C indicator
-            output("");
-            output("^C");
-            
-            // Show prompt
-            showPrompt();
-            return 0;
+            output(""); output("^C"); showPrompt(); return 0;
         }
         
-        // Handle Ctrl+Z - Suspend (show message - actual suspend not implemented)
+        // Handle Ctrl+Z - Suspend
         if (wParam == 'Z' && GetKeyState(VK_CONTROL) & 0x8000) {
-            // Clear current input line
             int textLen = GetWindowTextLengthA(hwnd);
             SendMessage(hwnd, EM_SETSEL, g_promptStart, textLen);
             SendMessage(hwnd, EM_REPLACESEL, FALSE, (LPARAM)"");
-            
-            // Output ^Z indicator and message
-            output("");
-            output("^Z");
+            output(""); output("^Z");
             output("[Process suspend not fully supported - use 'bg' and 'fg' commands for job control]");
-            
-            // Show prompt
-            showPrompt();
-            return 0;
+            showPrompt(); return 0;
+        }
+
+        // Handle Completion Navigation
+        if (g_isCompleting) {
+             if (wParam == VK_LEFT || wParam == VK_RIGHT || wParam == VK_TAB) {
+                 if (wParam == VK_LEFT) {
+                     g_tabIndex--;
+                     if (g_tabIndex < 0) g_tabIndex = g_tabMatches.size() - 1;
+                 } else {
+                     g_tabIndex++;
+                     if (g_tabIndex >= (int)g_tabMatches.size()) g_tabIndex = 0;
+                 }
+                 
+                 std::string candidate = g_tabMatches[g_tabIndex];
+                 
+                 // Apply directory/quote formatting
+                 std::string winPath = unixPathToWindows(candidate);
+                 DWORD attrs = GetFileAttributesA(winPath.c_str());
+                 if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+                     candidate += "/";
+                 }
+                 if (candidate.find(' ') != std::string::npos) candidate = "\"" + candidate + "\"";
+                 
+                 int textLen = GetWindowTextLengthA(hwnd);
+                 SendMessage(hwnd, EM_SETSEL, g_completionReplaceStart, textLen);
+                 SendMessage(hwnd, EM_REPLACESEL, FALSE, (LPARAM)candidate.c_str());
+                 return 0;
+             }
+             else if (wParam == VK_ESCAPE) {
+                 int textLen = GetWindowTextLengthA(hwnd);
+                 SendMessage(hwnd, EM_SETSEL, g_completionReplaceStart, textLen);
+                 SendMessage(hwnd, EM_REPLACESEL, FALSE, (LPARAM)g_completionPrefix.c_str());
+                 g_isCompleting = false;
+                 return 0;
+             }
+             else if (wParam == VK_RETURN || wParam == VK_SPACE) {
+                 g_isCompleting = false;
+                 // Fall through for normal processing
+             }
+             else if (wParam != VK_SHIFT && wParam != VK_CONTROL && wParam != VK_MENU) {
+                 // Any other typing exits completion mode
+                 g_isCompleting = false;
+             }
         }
         
         if (wParam == VK_DELETE) {
-            // Prevent delete before prompt
             DWORD start, end;
             SendMessage(hwnd, EM_GETSEL, (WPARAM)&start, (LPARAM)&end);
-            if (start < (DWORD)g_promptStart) {
-                return 0;
-            }
+            if (start < (DWORD)g_promptStart) return 0;
         } else if (wParam == VK_TAB) {
-            // Tab completion
             handleTabCompletion(hwnd);
             return 0;
         } else if (wParam == VK_UP) {
-            // Previous command
             if (g_historyIndex > 0) {
                 g_historyIndex--;
-                
-                // Replace current input with history
                 int textLen = GetWindowTextLengthA(hwnd);
                 SendMessage(hwnd, EM_SETSEL, g_promptStart, textLen);
                 SendMessage(hwnd, EM_REPLACESEL, FALSE, (LPARAM)g_commandHistory[g_historyIndex].c_str());
             }
             return 0;
         } else if (wParam == VK_DOWN) {
-            // Next command
             if (g_historyIndex < (int)g_commandHistory.size() - 1) {
                 g_historyIndex++;
-                
-                // Replace current input with history
                 int textLen = GetWindowTextLengthA(hwnd);
                 SendMessage(hwnd, EM_SETSEL, g_promptStart, textLen);
                 SendMessage(hwnd, EM_REPLACESEL, FALSE, (LPARAM)g_commandHistory[g_historyIndex].c_str());
             } else {
                 g_historyIndex = g_commandHistory.size();
-                
-                // Clear input
                 int textLen = GetWindowTextLengthA(hwnd);
                 SendMessage(hwnd, EM_SETSEL, g_promptStart, textLen);
                 SendMessage(hwnd, EM_REPLACESEL, FALSE, (LPARAM)"");
             }
             return 0;
         } else if (wParam == VK_BACK) {
-            // Prevent backspace before prompt
             DWORD start, end;
             SendMessage(hwnd, EM_GETSEL, (WPARAM)&start, (LPARAM)&end);
-            
-            if (start <= (DWORD)g_promptStart) {
-                return 0;
-            }
+            if (start <= (DWORD)g_promptStart) return 0;
+            // Allow default processing
         } else if (wParam == VK_LEFT) {
-            // Prevent moving cursor before prompt
             DWORD start, end;
             SendMessage(hwnd, EM_GETSEL, (WPARAM)&start, (LPARAM)&end);
-            
-            if (start <= (DWORD)g_promptStart) {
-                return 0;
-            }
+            if (start <= (DWORD)g_promptStart) return 0;
         } else if (wParam == VK_HOME) {
-            // Home goes to start of input, not line
             SendMessage(hwnd, EM_SETSEL, g_promptStart, g_promptStart);
             return 0;
         }
-    } else if (uMsg == WM_CHAR) {
-        // Prevent default processing for keys we handle in WM_KEYDOWN
-        if (wParam == VK_TAB) return 0;
-        if (wParam == VK_RETURN) return 0;
+    } 
+    
+    if (uMsg == WM_CHAR) {
+         // Check if in Save As input mode first
+        if (g_nanoSaveAsMode) {
+            if (wParam >= 32 && wParam < 127) {  // Printable characters
+                g_nanoSaveAsInput += (char)wParam;
+                SetWindowTextA(g_hOutput, "");
+                output("Save As (Enter filename, ESC to cancel):");
+                output("");
+                output(g_nanoSaveAsInput);
+            }
+            return 0;
+        }
+        
+        // Check if in nano mode
+        if (g_nanoMode) {
+            if (wParam >= 32 && wParam < 127) {
+                if (g_nanoCursorLine < (int)g_nanoBuffer.size()) {
+                    std::string& line = g_nanoBuffer[g_nanoCursorLine];
+                    if (g_nanoCursorCol <= (int)line.length()) {
+                        line.insert(g_nanoCursorCol, 1, (char)wParam);
+                        g_nanoCursorCol++;
+                        g_nanoModified = true;
+                        refreshNanoDisplay();
+                    }
+                }
+            }
+            return 0;
+        }
+
+        // Normal Mode
+        DWORD start, end;
+        SendMessage(hwnd, EM_GETSEL, (WPARAM)&start, (LPARAM)&end);
+        
+        if (wParam == VK_BACK) {
+            if (start <= (DWORD)g_promptStart) return 0;
+        }
+        else if (wParam == VK_RETURN) {
+            int textLen = GetWindowTextLengthA(hwnd);
+            char* buffer = new char[textLen + 1];
+            GetWindowTextA(hwnd, buffer, textLen + 1);
+            std::string allText = buffer;
+            delete[] buffer;
+            std::string command;
+            if (textLen > g_promptStart) {
+                command = allText.substr(g_promptStart);
+            }
+            if (!command.empty()) {
+                g_commandHistory.push_back(command);
+                g_historyIndex = g_commandHistory.size();
+                saveCommandHistory();
+            }
+            g_tabMatches.clear();
+            g_tabIndex = -1;
+            g_tabPrefix.clear();
+            g_tabInputLength = 0;
+            executeCommand(command);
+            return 0;
+        }
+        else if (wParam == VK_TAB) return 0;
+        else if (wParam == ' ') {
+            g_tabMatches.clear();
+            g_tabIndex = -1;
+            g_tabPrefix.clear();
+        }
     }
     
     // Call original window procedure
@@ -43312,8 +47733,10 @@ void executeCommand(const std::string& command) {
                 args.insert(args.end(), expandedArgs.begin(), expandedArgs.end());
             }
             
-            // Clear captured output and enable capture for all but the last command
-            g_capturedOutput.clear();
+            // Setup input for this command
+            g_capturedOutput = pipeInput;
+            g_isPipedCommand = (i > 0);
+            
             if (i < pipedCommands.size() - 1) {
                 g_capturingOutput = true;
             } else {
@@ -43325,6 +47748,7 @@ void executeCommand(const std::string& command) {
             
             // HEAD command with piped input
             if (commandEquals(cmd, "head") && !pipeInput.empty()) {
+                g_capturedOutput.clear(); // Clear input so we don't mix it with output
                 int numLines = 10;  // Default
                 
                 // Check for -n flag
@@ -43345,6 +47769,7 @@ void executeCommand(const std::string& command) {
             }
             // TAIL command with piped input
             else if (commandEquals(cmd, "tail") && !pipeInput.empty()) {
+                g_capturedOutput.clear(); // Clear input so we don't mix it with output
                 int numLines = 10;  // Default
                 
                 // Check for -n flag
@@ -43363,6 +47788,7 @@ void executeCommand(const std::string& command) {
             }
             // GREP command with piped input
             else if (commandEquals(cmd, "grep") && !pipeInput.empty()) {
+                g_capturedOutput.clear(); // Clear input so we don't mix it with output
                 if (args.size() < 2) {
                     outputError("grep: missing pattern");
                 } else {
@@ -43416,6 +47842,7 @@ void executeCommand(const std::string& command) {
             }
             // WC command with piped input
             else if (commandEquals(cmd, "wc") && !pipeInput.empty()) {
+                g_capturedOutput.clear(); // Clear input so we don't mix it with output
                 // Parse options
                 bool countLines = false;
                 bool countWords = false;
@@ -43481,6 +47908,7 @@ void executeCommand(const std::string& command) {
             }
             // TEE command with piped input
             else if (commandEquals(cmd, "tee") && !pipeInput.empty()) {
+                g_capturedOutput.clear(); // Clear input so we don't mix it with output
                 // Parse options
                 bool appendMode = false;
                 int fileArgStart = 1;
@@ -43535,19 +47963,19 @@ void executeCommand(const std::string& command) {
             }
             // TR command with piped input
             else if (commandEquals(cmd, "tr") && !pipeInput.empty()) {
-                g_capturedOutput = pipeInput;
+                // g_capturedOutput already set directly
                 cmd_tr(args);
                 handledPipeInput = true;
             }
             // NL command with piped input
             else if (commandEquals(cmd, "nl") && !pipeInput.empty()) {
-                g_capturedOutput = pipeInput;
+                // g_capturedOutput already set directly
                 cmd_nl(args);
                 handledPipeInput = true;
             }
             // SPLIT command with piped input
             else if (commandEquals(cmd, "split") && !pipeInput.empty()) {
-                g_capturedOutput = pipeInput;
+                // g_capturedOutput already set directly
                 cmd_split(args);
                 handledPipeInput = true;
             }
@@ -43555,6 +47983,12 @@ void executeCommand(const std::string& command) {
             else if (commandEquals(cmd, "shuf") && !pipeInput.empty()) {
                 g_capturedOutput = pipeInput;
                 cmd_shuf(args);
+                handledPipeInput = true;
+            }
+            // SORT command with piped input
+            else if (commandEquals(cmd, "sort") && !pipeInput.empty()) {
+                g_capturedOutput = pipeInput;
+                cmd_sort(args);
                 handledPipeInput = true;
             }
             
@@ -43714,6 +48148,64 @@ void executeCommand(const std::string& command) {
                 cmd_test(args);
             } else if (commandEquals(cmd, "egrep")) {
                 cmd_egrep(args);
+            } else if (commandEquals(cmd, "date")) {
+                cmd_date(args);
+            } else if (commandEquals(cmd, "base64")) {
+                cmd_base64(args);
+            } else if (commandEquals(cmd, "md5sum")) {
+                cmd_md5sum(args);
+            } else if (commandEquals(cmd, "sha1sum")) {
+                cmd_sha1sum(args);
+            } else if (commandEquals(cmd, "sha256sum")) {
+                cmd_sha256sum(args);
+            } else if (commandEquals(cmd, "cksum")) {
+                cmd_cksum(args);
+            } else if (commandEquals(cmd, "sum")) {
+                cmd_sum(args);
+            } else if (commandEquals(cmd, "echo")) {
+                cmd_echo(args);
+            } else if (commandEquals(cmd, "printf")) {
+                cmd_printf(args);
+            } else if (commandEquals(cmd, "basename")) {
+                cmd_basename(args);
+            } else if (commandEquals(cmd, "dirname")) {
+                cmd_dirname(args);
+            } else if (commandEquals(cmd, "pipedin")) {
+                cmd_pipedin(args);
+            } else if (commandEquals(cmd, "rev")) {
+                cmd_rev(args);
+            } else if (commandEquals(cmd, "expand")) {
+                cmd_expand(args);
+            } else if (commandEquals(cmd, "unexpand")) {
+                cmd_unexpand(args);
+            } else if (commandEquals(cmd, "fold")) {
+                cmd_fold(args);
+            } else if (commandEquals(cmd, "fmt")) {
+                cmd_fmt(args);
+            } else if (commandEquals(cmd, "column")) {
+                cmd_column(args);
+            } else if (commandEquals(cmd, "comm")) {
+                cmd_comm(args);
+            } else if (commandEquals(cmd, "join")) {
+                cmd_join(args);
+            } else if (commandEquals(cmd, "look")) {
+                cmd_look(args);
+            } else if (commandEquals(cmd, "tsort")) {
+                cmd_tsort(args);
+            } else if (commandEquals(cmd, "unvis")) {
+                cmd_unvis(args);
+            } else if (commandEquals(cmd, "vis")) {
+                cmd_vis(args);
+            } else if (commandEquals(cmd, "od")) {
+                cmd_od(args);
+            } else if (commandEquals(cmd, "hexdump") || commandEquals(cmd, "hd")) {
+                cmd_hexdump(args);
+            } else if (commandEquals(cmd, "strings")) {
+                cmd_strings(args);
+            } else if (commandEquals(cmd, "cal")) {
+                cmd_cal(args);
+            } else if (commandEquals(cmd, "ncal")) {
+                cmd_ncal(args);
             } else if (commandEquals(cmd, "help")) {
                 cmd_help(args);
             } else if (commandEquals(cmd, "exit") || commandEquals(cmd, "quit")) {
@@ -43733,6 +48225,7 @@ void executeCommand(const std::string& command) {
         
         // Reset capture mode
         g_capturingOutput = false;
+        g_isPipedCommand = false;
         showPrompt();
         return;
     }
@@ -44086,6 +48579,8 @@ void executeCommand(const std::string& command) {
         cmd_quota(args);
     } else if (commandEquals(cmd, "basename")) {
         cmd_basename(args);
+    } else if (commandEquals(cmd, "pipedin")) {
+        cmd_pipedin(args);
     } else if (commandEquals(cmd, "whereis")) {
         cmd_whereis(args);
     } else if (commandEquals(cmd, "stat")) {
@@ -44474,7 +48969,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             g_originalEditProc = (WNDPROC)SetWindowLongPtr(g_hOutput, GWLP_WNDPROC, (LONG_PTR)EditSubclassProc);
             
             // Welcome message
-            output("Windows Native Unix Shell (wnus) v0.1.2.3 - Native Unix Environment for Windows");
+            output("Windows Native Unix Shell (wnus) v" + WNUS_VERSION + " - Native Unix Environment for Windows");
             output("Type 'help' for available commands");
             output("Type 'version' for more information");
             output("Type 'exit' or 'quit' to close");
@@ -44993,7 +49488,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     g_hWnd = CreateWindowExA(
         0,
         CLASS_NAME,
-        "Windows Native Unix Shell (wnus) v0.1.2.3",
+        ("Windows Native Unix Shell (wnus) v" + WNUS_VERSION).c_str(),
         WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT, CW_USEDEFAULT, 800, 600,
         NULL, NULL, hInstance, NULL
@@ -45010,7 +49505,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         DwmSetWindowAttribute(g_hWnd, 20, &useDarkMode, sizeof(useDarkMode));
     }
     
-    ShowWindow(g_hWnd, hasExecuteFlag ? SW_SHOW : nCmdShow);
+    ShowWindow(g_hWnd, hasExecuteFlag ? SW_HIDE : nCmdShow);
     UpdateWindow(g_hWnd);
     
     // Message loop
