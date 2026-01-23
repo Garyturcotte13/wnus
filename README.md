@@ -1,11 +1,11 @@
-[![Version](https://img.shields.io/badge/version-0.1.3.3-orange.svg)](.)[![Size](https://img.shields.io/badge/size-6.91MB-blue.svg)](.)  
-# Windows Native Unix Shell (wnus) - Version 0.1.3.3
+[![Version](https://img.shields.io/badge/version-0.1.3.9-orange.svg)](.)[![Size](https://img.shields.io/badge/size-6.78MB-blue.svg)](.)
+# Windows Native Unix Shell (wnus) - Version 0.1.3.9
 
 A comprehensive Unix/Linux-like shell environment for Windows, implemented entirely in C++ without external dependencies. Windows Native Unix Shell brings the power and familiarity of bash commands to native Windows, with full NTFS support and Windows API integration.
 
 [![Platform](https://img.shields.io/badge/platform-Windows-blue.svg)](https://www.microsoft.com/windows)
 [![Build](https://img.shields.io/badge/build-passing-brightgreen.svg)](.)  
-[![Version](https://img.shields.io/badge/version-0.1.3.3-orange.svg)](.)[![Size](https://img.shields.io/badge/size-6.91MB-blue.svg)](.)  
+[![Version](https://img.shields.io/badge/version-0.1.3.9-orange.svg)](.)[![Size](https://img.shields.io/badge/size-6.78MB-blue.svg)](.)  
 - **Full bash compatibility** for common command-line workflows including I/O redirection and process control
 - **Comprehensive documentation** with man pages for every command
 - **Full-featured AWK interpreter** with all standard Unix/Linux AWK capabilities
@@ -87,8 +87,8 @@ A comprehensive Unix/Linux-like shell environment for Windows, implemented entir
 
 ### Prerequisites for wnus.exe usage
 - Windows 7 or later (Windows 10/11 recommended)
-- ~6.9 MB disk space for executable
-- ~30-40 MB RAM typical usage
+- 6.78 MB disk space for executable (v0.1.3.9)
+- 30-40 MB RAM typical usage
 
 ### Building
 
