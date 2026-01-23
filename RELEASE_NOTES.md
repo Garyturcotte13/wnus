@@ -1,4 +1,4 @@
-# wnus v0.1.4.1 - Release Notes: du Command Options Implementation
+# wnus v0.1.4.5 - Release Notes: Expanded POSIX Command Coverage
 
 ## Objective
 Enable ALL 259 wnus built-in commands to work seamlessly within sh subshells, expanding from the initial 50 commands to comprehensive coverage.

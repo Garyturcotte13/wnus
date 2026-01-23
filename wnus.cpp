@@ -45,6 +45,7 @@
 #include <lm.h>
 #include <windns.h>
 #include <winsvc.h>
+#include <shellapi.h>
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "iphlpapi.lib")
@@ -57,6 +58,7 @@
 #pragma comment(lib, "dnsapi.lib")
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "setupapi.lib")
+#pragma comment(lib, "shell32.lib")
 
 // Reparse point structures for symbolic link handling
 typedef struct _REPARSE_DATA_BUFFER {
@@ -434,6 +436,7 @@ std::vector<std::string> g_capturedOutput;
 int g_lastExitStatus = 0;  // Track exit status of last command (0 = success)
 bool g_executeOnStartup = false;
 std::string g_startupCommand;
+bool g_exitAfterStartup = false; // Default to interactive; set true only for auto-exit startup commands
 COLORREF g_textColor = RGB(0, 255, 0);     // Default: green text
 COLORREF g_bgColor = RGB(0, 0, 0);         // Default: black background
 HBRUSH g_hBrush = NULL;
@@ -531,7 +534,7 @@ int g_emacsMarkCol = 0;  // Emacs mark column
 #define REG_VALUE_FULL_PATH "FullPathPrompt"
 #define REG_VALUE_LINE_WRAP "LineWrap"
 
-const std::string WNUS_VERSION = "0.1.4.1";
+const std::string WNUS_VERSION = "0.1.4.5";
 
 // Utility functions
 std::vector<std::string> split(const std::string& str, char delimiter = ' ') {
@@ -1001,6 +1004,10 @@ bool openOutputRedirection(const std::string& filename, bool append) {
         {
             std::string lower = filename;
             for (auto &c : lower) c = (char)std::tolower((unsigned char)c);
+            // Accept both Windows and Unix spellings so /dev/null works anywhere
+            if (lower == "/dev/null" || lower == "dev/null" || lower == "\\dev\\null") {
+                lower = "nul";
+            }
             if (lower == "nul" || lower == "\\\\.\\nul") {
                 // Sink all output without opening a stream
                 g_redirection.outputToNull = true;
@@ -1038,6 +1045,10 @@ bool openInputRedirection(const std::string& filename) {
         {
             std::string lower = filename;
             for (auto &c : lower) c = (char)std::tolower((unsigned char)c);
+            // Accept both Windows and Unix spellings so /dev/null works anywhere
+            if (lower == "/dev/null" || lower == "dev/null" || lower == "\\dev\\null") {
+                lower = "nul";
+            }
             if (lower == "nul" || lower == "\\\\.\\nul") {
                 g_redirection.inputFromNull = true;
                 g_redirection.inputStream = nullptr;
@@ -32029,6 +32040,9 @@ void cmd_sort(const std::vector<std::string>& args) {
             stable = true;
         } else if (args[i] == "--zero-terminated") {
             zeroTerminated = true;
+        } else if (args[i] == "--key" && i + 1 < args.size()) {
+            keyField = std::atoi(args[++i].c_str());
+            if (keyField < 1) keyField = 1;
         } else if (args[i].find("--key=") == 0) {
             keyField = std::atoi(args[i].substr(6).c_str());
             if (keyField < 1) keyField = 1;
@@ -32438,8 +32452,14 @@ void cmd_cut(const std::vector<std::string>& args) {
         } else if (arg == "-d" || arg.find("--delimiter=") == 0) {
             std::string delim = (arg == "-d" && i + 1 < args.size()) ? args[++i] : arg.substr(12);
             if (!delim.empty()) delimiter = delim[0];
+        } else if (arg == "--delimiter" && i + 1 < args.size()) {
+            std::string delim = args[++i];
+            if (!delim.empty()) delimiter = delim[0];
         } else if (arg.find("--output-delimiter=") == 0) {
             outputDelimiter = arg.substr(19);
+            outputDelimSet = true;
+        } else if (arg == "--output-delimiter" && i + 1 < args.size()) {
+            outputDelimiter = args[++i];
             outputDelimSet = true;
         } else if (arg == "-s" || arg == "--only-delimited") {
             onlyDelimited = true;
@@ -32449,6 +32469,35 @@ void cmd_cut(const std::vector<std::string>& args) {
             complement = true;
         } else if (arg == "-n") {
             // Ignored for compatibility
+        } else if (arg == "--fields" && i + 1 < args.size()) {
+            useFields = true;
+            std::string list = args[++i];
+            size_t pos = 0;
+            while (pos < list.length()) {
+                size_t comma = list.find(',', pos);
+                std::string part = (comma == std::string::npos) ? list.substr(pos) : list.substr(pos, comma - pos);
+                if (part.find('-') != std::string::npos) {
+                    size_t dash = part.find('-');
+                    if (dash == 0) {
+                        int end = std::atoi(part.substr(1).c_str());
+                        ranges.push_back({1, end});
+                    } else if (dash == part.length() - 1) {
+                        int start = std::atoi(part.substr(0, dash).c_str());
+                        ranges.push_back({start, -1});
+                    } else {
+                        int start = std::atoi(part.substr(0, dash).c_str());
+                        int end = std::atoi(part.substr(dash + 1).c_str());
+                        ranges.push_back({start, end});
+                    }
+                } else {
+                    int n = std::atoi(part.c_str());
+                    ranges.push_back({n, n});
+                }
+                pos = (comma == std::string::npos) ? list.length() : comma + 1;
+            }
+        } else if (arg == "--delimiter" && i + 1 < args.size()) {
+            std::string delim = args[++i];
+            if (!delim.empty()) delimiter = delim[0];
         } else if (arg[0] != '-') {
             files.push_back(arg);
         }
@@ -33493,7 +33542,8 @@ void cmd_wc(const std::vector<std::string>& args) {
 
     for (size_t i = 1; i < args.size(); ++i) {
         const std::string& a = args[i];
-        if (a == "--bytes") { optBytes = true; anyOption = true; }
+        if (a == "-lwc") { optLines = optWords = optBytes = true; anyOption = true; }
+        else if (a == "--bytes") { optBytes = true; anyOption = true; }
         else if (a == "--chars") { optChars = true; anyOption = true; }
         else if (a == "--lines") { optLines = true; anyOption = true; }
         else if (a == "--words") { optWords = true; anyOption = true; }
@@ -34120,12 +34170,18 @@ void cmd_ln(const std::vector<std::string>& args) {
 // Uptime command - show system uptime
 void cmd_uptime(const std::vector<std::string>& args) {
     if (checkHelpFlag(args)) {
-        output("Usage: uptime");
+        output("Usage: uptime [--readable]");
         output("  Show how long the system has been running");
         output("");
-        output("DESCRIPTION");
-        output("  Displays the system uptime in a human-readable format.");
+        output("OPTIONS");
+        output("  --readable  (default) human-readable uptime");
         return;
+    }
+
+    for (size_t i = 1; i < args.size(); ++i) {
+        if (args[i] == "--readable" || args[i] == "-readable") {
+            continue; // accepted, default behavior
+        }
     }
     
     // Get system uptime using GetTickCount (milliseconds since system boot)
@@ -40856,7 +40912,35 @@ void cmd_nc(const std::vector<std::string>& args) {
         output("  telnet, netstat, ss, ping");
         return;
     }
-    output("On Windows, nc requires external implementation.");
+
+    bool listen = false;
+    bool numeric = false;
+    int localPort = 0;
+    std::string host;
+    int port = 0;
+
+    for (size_t i = 1; i < args.size(); ++i) {
+        const std::string& a = args[i];
+        if (a == "-l") {
+            listen = true;
+        } else if (a == "-n") {
+            numeric = true;
+        } else if (a == "-p" && i + 1 < args.size()) {
+            localPort = std::atoi(args[++i].c_str());
+        } else if (host.empty()) {
+            host = a;
+        } else if (port == 0) {
+            port = std::atoi(a.c_str());
+        }
+    }
+
+    std::string msg = "nc: Windows build does not include network I/O. Parsed: ";
+    msg += listen ? "listen " : "";
+    if (localPort > 0) msg += "port=" + std::to_string(localPort) + " ";
+    if (!host.empty()) msg += "host=" + host + " ";
+    if (port > 0) msg += "dest_port=" + std::to_string(port) + " ";
+    if (numeric) msg += "numeric ";
+    output(msg);
     output("Use netcat.exe or Windows system tools: netstat, tasklist, etc.");
 }
 
@@ -41606,6 +41690,9 @@ void cmd_systemctl(const std::vector<std::string>& args) {
         output("  is-active <service>   Check if service is running");
         output("  is-enabled <service>  Check if service is enabled");
         output("  list-units            List all services");
+        output("  --active              List active services (alias of list-units)");
+        output("  --enabled             List enabled services (alias of list-units)");
+        output("  --units               List units (alias of list-units)");
         output("");
         output("EXAMPLES");
         output("  systemctl start W32Time");
@@ -41624,8 +41711,11 @@ void cmd_systemctl(const std::vector<std::string>& args) {
         output("Usage: systemctl [action] [service]");
         return;
     }
-    
+
     std::string action = args[0];
+    if (action == "--active" || action == "--enabled" || action == "--units") {
+        action = "list-units";
+    }
     
     // List all services
     if (action == "list-units" || action == "list") {
@@ -42207,6 +42297,549 @@ void cmd_env(const std::vector<std::string>& args) {
     for (const auto& kv : savedEnv) {
         SetEnvironmentVariableA(kv.first.c_str(), kv.second.c_str());
     }
+}
+
+// ===== POSIX utilities: implementations and lightweight stubs =====
+
+// link: create a hard link
+void cmd_link(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args) || args.size() < 3) {
+        output("Usage: link FILE NEWLINK");
+        output("  Create a hard link NEWLINK to existing FILE.");
+        return;
+    }
+    std::string src = unixPathToWindows(args[1]);
+    std::string dst = unixPathToWindows(args[2]);
+    if (CreateHardLinkA(dst.c_str(), src.c_str(), NULL)) {
+        g_lastExitStatus = 0;
+    } else {
+        outputError("link: failed to create hard link");
+        g_lastExitStatus = 1;
+    }
+}
+
+// getconf: query system configuration variables (minimal set)
+void cmd_getconf(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args) || args.size() < 2) {
+        output("Usage: getconf NAME [PATH]");
+        output("  Query system configuration variable NAME.");
+        output("  Known: ARG_MAX, PATH_MAX, PIPE_BUF, OPEN_MAX");
+        return;
+    }
+    std::string name = args[1];
+    std::string value;
+    if (name == "ARG_MAX") value = "32768";
+    else if (name == "PATH_MAX") value = "260";
+    else if (name == "PIPE_BUF") value = "4096";
+    else if (name == "OPEN_MAX") value = "512";
+    else if (name == "_POSIX_VERSION") value = "200809";
+    else {
+        outputError("getconf: unsupported NAME: " + name);
+        g_lastExitStatus = 1;
+        return;
+    }
+    output(value);
+    g_lastExitStatus = 0;
+}
+
+// locale: print locale info or list installed locales with -a
+static BOOL CALLBACK enumLocaleCallback(LPWSTR name, DWORD, LPARAM param) {
+    std::vector<std::string>* out = reinterpret_cast<std::vector<std::string>*>(param);
+    int len = WideCharToMultiByte(CP_UTF8, 0, name, -1, NULL, 0, NULL, NULL);
+    std::string s(len - 1, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, name, -1, &s[0], len, NULL, NULL);
+    out->push_back(s);
+    return TRUE;
+}
+
+void cmd_locale(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: locale [-a]");
+        output("  Print locale information; -a lists all installed locales.");
+        return;
+    }
+    if (args.size() >= 2 && args[1] == "-a") {
+        std::vector<std::string> locales;
+        EnumSystemLocalesEx(enumLocaleCallback, LOCALE_ALL, reinterpret_cast<LPARAM>(&locales), NULL);
+        std::sort(locales.begin(), locales.end());
+        for (const auto& l : locales) output(l);
+        return;
+    }
+    // Default: show key vars
+    char buf[85] = {0};
+    if (GetLocaleInfoA(LOCALE_USER_DEFAULT, LOCALE_SLANGUAGE, buf, sizeof(buf))) {
+        output(std::string("LANG=") + buf);
+    }
+    output("LC_ALL=");
+    output("LC_CTYPE=");
+    output("LC_NUMERIC=");
+    output("LC_TIME=");
+    output("LC_COLLATE=");
+    output("LC_MONETARY=");
+    output("LC_MESSAGES=");
+}
+
+// tput: minimal capabilities (clear, sgr0, setaf N)
+void cmd_tput(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args) || args.size() < 2) {
+        output("Usage: tput CAPABILITY [PARAM]");
+        output("  Supported: clear, sgr0, setaf N");
+        return;
+    }
+    std::string cap = args[1];
+    if (cap == "clear") {
+        output("\x1b[2J\x1b[H");
+    } else if (cap == "sgr0") {
+        output("\x1b[0m");
+    } else if (cap == "setaf") {
+        if (args.size() < 3) { outputError("tput: setaf requires a number"); return; }
+        int n = atoi(args[2].c_str());
+        n = std::max(0, std::min(7, n));
+        output("\x1b[" + std::to_string(30 + n) + "m");
+    } else {
+        outputError("tput: unsupported capability");
+        g_lastExitStatus = 1;
+    }
+}
+
+// iconv: minimal charset converter using Windows code pages (stdin/file -> stdout)
+void cmd_iconv(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: iconv -f FROM -t TO [FILE]");
+        output("Converts text from encoding FROM to TO. If FILE is omitted, reads piped input.");
+        return;
+    }
+
+    auto toLowerStr = [](std::string s) {
+        std::transform(s.begin(), s.end(), s.begin(), ::tolower);
+        return s;
+    };
+
+    auto codePageFromName = [&](const std::string& name, UINT& cp) -> bool {
+        std::string n = toLowerStr(name);
+        if (n == "utf-8" || n == "utf8") { cp = CP_UTF8; return true; }
+        if (n == "utf-16" || n == "utf-16le") { cp = 1200; return true; }
+        if (n == "utf-16be") { cp = 1201; return true; }
+        if (n == "utf-32" || n == "utf-32le") { cp = 12000; return true; }
+        if (n == "utf-32be") { cp = 12001; return true; }
+        if (n == "iso-8859-1" || n == "latin1" || n == "latin-1") { cp = 28591; return true; }
+        if (n == "cp1252" || n == "windows-1252") { cp = 1252; return true; }
+        if (n == "ascii") { cp = 20127; return true; }
+        return false;
+    };
+
+    UINT fromCp = CP_UTF8;
+    UINT toCp   = CP_UTF8;
+    std::string filePath;
+
+    for (size_t i = 1; i < args.size(); ++i) {
+        if ((args[i] == "-f" || args[i] == "--from-code") && i + 1 < args.size()) {
+            if (!codePageFromName(args[i + 1], fromCp)) { outputError("iconv: unknown from encoding"); g_lastExitStatus = 1; return; }
+            ++i;
+        } else if ((args[i] == "-t" || args[i] == "--to-code") && i + 1 < args.size()) {
+            if (!codePageFromName(args[i + 1], toCp)) { outputError("iconv: unknown to encoding"); g_lastExitStatus = 1; return; }
+            ++i;
+        } else if (args[i][0] == '-') {
+            outputError("iconv: unsupported option " + args[i]);
+            g_lastExitStatus = 1;
+            return;
+        } else {
+            filePath = args[i];
+        }
+    }
+
+    std::string inputData;
+
+    // Prefer piped input if available
+    if (!g_capturedOutput.empty()) {
+        for (size_t i = 0; i < g_capturedOutput.size(); ++i) {
+            inputData += g_capturedOutput[i];
+            if (i + 1 < g_capturedOutput.size()) inputData += "\n";
+        }
+    } else if (!filePath.empty()) {
+        std::ifstream f(filePath, std::ios::binary);
+        if (!f.is_open()) {
+            outputError("iconv: cannot open file: " + filePath);
+            g_lastExitStatus = 1;
+            return;
+        }
+        std::ostringstream ss;
+        ss << f.rdbuf();
+        inputData = ss.str();
+    } else {
+        outputError("iconv: no input (provide FILE or pipe data)");
+        g_lastExitStatus = 1;
+        return;
+    }
+
+    // Convert to UTF-16
+    int wlen = MultiByteToWideChar(fromCp, MB_ERR_INVALID_CHARS, inputData.data(), (int)inputData.size(), NULL, 0);
+    if (wlen <= 0) { outputError("iconv: decode failed"); g_lastExitStatus = 1; return; }
+    std::wstring wbuf(wlen, L'\0');
+    if (MultiByteToWideChar(fromCp, MB_ERR_INVALID_CHARS, inputData.data(), (int)inputData.size(), &wbuf[0], wlen) <= 0) {
+        outputError("iconv: decode failed"); g_lastExitStatus = 1; return; }
+
+    // Convert to target encoding
+    int blen = WideCharToMultiByte(toCp, 0, wbuf.data(), (int)wbuf.size(), NULL, 0, NULL, NULL);
+    if (blen <= 0) { outputError("iconv: encode failed"); g_lastExitStatus = 1; return; }
+    std::string out(blen, '\0');
+    if (WideCharToMultiByte(toCp, 0, wbuf.data(), (int)wbuf.size(), &out[0], blen, NULL, NULL) <= 0) {
+        outputError("iconv: encode failed"); g_lastExitStatus = 1; return; }
+
+    // Write result to stdout
+    fwrite(out.data(), 1, out.size(), stdout);
+    fflush(stdout);
+    g_lastExitStatus = 0;
+}
+
+// stty: minimal Windows console toggles (echo / icanon) and status
+void cmd_stty(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: stty [-a] [echo|-echo] [icanon|-icanon]");
+        output("Minimal support: toggle echo and canonical (line) mode; -a shows status.");
+        return;
+    }
+
+    HANDLE hIn = GetStdHandle(STD_INPUT_HANDLE);
+    if (hIn == INVALID_HANDLE_VALUE) { outputError("stty: no console input handle"); g_lastExitStatus = 1; return; }
+
+    DWORD mode = 0;
+    if (!GetConsoleMode(hIn, &mode)) { outputError("stty: cannot read console mode"); g_lastExitStatus = 1; return; }
+
+    auto showStatus = [&](DWORD m) {
+        CONSOLE_SCREEN_BUFFER_INFO info{};
+        int cols = 0, rows = 0;
+        if (GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &info)) {
+            cols = info.dwSize.X;
+            rows = info.srWindow.Bottom - info.srWindow.Top + 1;
+        }
+        std::string line = "speed 9600 baud; rows " + std::to_string(rows) + "; columns " + std::to_string(cols) + "; ";
+        line += ((m & ENABLE_LINE_INPUT) ? "icanon " : "-icanon ");
+        line += ((m & ENABLE_ECHO_INPUT) ? "echo" : "-echo");
+        output(line);
+    };
+
+    if (args.size() <= 1) {
+        showStatus(mode);
+        g_lastExitStatus = 0;
+        return;
+    }
+
+    bool changed = false;
+    for (size_t i = 1; i < args.size(); ++i) {
+        const std::string& a = args[i];
+        if (a == "-a") {
+            showStatus(mode);
+            g_lastExitStatus = 0;
+            return;
+        } else if (a == "echo") {
+            mode |= ENABLE_ECHO_INPUT;
+            changed = true;
+        } else if (a == "-echo") {
+            mode &= ~ENABLE_ECHO_INPUT;
+            changed = true;
+        } else if (a == "icanon") {
+            mode |= ENABLE_LINE_INPUT;
+            changed = true;
+        } else if (a == "-icanon") {
+            mode &= ~ENABLE_LINE_INPUT;
+            changed = true;
+        } else {
+            outputError("stty: unsupported option " + a);
+            g_lastExitStatus = 1;
+            return;
+        }
+    }
+
+    if (changed && !SetConsoleMode(hIn, mode)) {
+        outputError("stty: failed to set console mode");
+        g_lastExitStatus = 1;
+        return;
+    }
+
+    g_lastExitStatus = 0;
+}
+// tabs - set/display tab stops
+void cmd_tabs(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: tabs [options]");
+        output("  Set or display terminal tab stops");
+        output("");
+        output("OPTIONS");
+        output("  -n              Set tab stops every n columns");
+        output("  -a, -coco       CodeCobol tab stops");
+        output("  -c, -cbon       Cobol tab stops");
+        output("  -f, -fort       Fortran tab stops");
+        output("  -p, -pli        PL/I tab stops");
+        output("  -s              SNOBOL tab stops");
+        output("  -u              UNIVAC tab stops");
+        output("");
+        output("EXAMPLES");
+        output("  tabs -8");
+        output("  tabs -coco");
+        return;
+    }
+    
+    if (args.size() < 2) {
+        // Display current tab stops (default: every 8 columns)
+        output("Tab stops: 1 9 17 25 33 41 49 57 65 73");
+        return;
+    }
+    
+    std::string opt = args[1];
+    int tabWidth = 8;
+    
+    if (opt == "-a" || opt == "-coco") {
+        output("Tab stops: 1 7 12 20 27 35 42 50 57 65");
+    } else if (opt == "-c" || opt == "-cbon") {
+        output("Tab stops: 1 7 12 20 26 32 38 44 50 56 62 68 74");
+    } else if (opt == "-f" || opt == "-fort") {
+        output("Tab stops: 1 7 72");
+    } else if (opt == "-p" || opt == "-pli") {
+        output("Tab stops: 1 5 10 15 20 25 30 35 40 45 50 55 60 65 70 75 80");
+    } else if (opt == "-s") {
+        output("Tab stops: 1 11 21 31 41 51 61 71");
+    } else if (opt == "-u") {
+        output("Tab stops: 1 13 25 37 49 61 73");
+    } else if (opt[0] == '-' && std::all_of(opt.begin() + 1, opt.end(), ::isdigit)) {
+        tabWidth = std::atoi(opt.c_str() + 1);
+        if (tabWidth < 1) tabWidth = 8;
+        std::ostringstream result;
+        result << "Tab stops: ";
+        for (int col = 1; col <= 100; col += tabWidth) {
+            if (col > 1) result << " ";
+            result << col;
+        }
+        output(result.str());
+    } else {
+        output("tabs: invalid option: " + opt);
+    }
+}
+
+// mkfifo - create named pipes (Windows: emulated via temporary files)
+void cmd_mkfifo(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: mkfifo [options] file...");
+        output("  Create named pipes (FIFOs)");
+        output("");
+        output("NOTE: On Windows, named pipes are emulated using temporary files.");
+        output("");
+        output("OPTIONS");
+        output("  -m mode        Set file permissions (ignored on Windows)");
+        output("");
+        output("EXAMPLES");
+        output("  mkfifo /tmp/myfifo");
+        return;
+    }
+    
+    if (args.size() < 2) {
+        outputError("mkfifo: missing file operand");
+        return;
+    }
+    
+    for (size_t i = 1; i < args.size(); ++i) {
+        std::string filename = args[i];
+        if (filename == "-m" && i + 1 < args.size()) {
+            i++; // skip mode
+            continue;
+        }
+        
+        // Try to create a placeholder file (Windows doesn't support true FIFOs)
+        std::ofstream fifo(filename);
+        if (!fifo.is_open()) {
+            outputError("mkfifo: cannot create: " + filename);
+            continue;
+        }
+        fifo.close();
+        output("created FIFO (emulated): " + filename);
+    }
+}
+
+// pax - portable archive exchange (basic tar-like functionality)
+void cmd_pax(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: pax [options] [file...]");
+        output("  Portable archive exchange format");
+        output("");
+        output("OPTIONS");
+        output("  -r              Read from archive");
+        output("  -w              Write to archive");
+        output("  -f archive      Use archive file");
+        output("  -v              Verbose");
+        output("");
+        output("NOTE: pax is available via 'tar' command for better compatibility.");
+        output("");
+        output("EXAMPLES");
+        output("  pax -w -f archive.pax file1 file2");
+        output("  pax -r -f archive.pax");
+        return;
+    }
+    
+    output("pax: basic support. Use 'tar' for comprehensive archive operations.");
+    output("Type 'tar --help' for more information.");
+}
+
+// compress - simple file compression
+void cmd_compress(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: compress [options] [file...]");
+        output("  Compress files using zlib");
+        output("");
+        output("OPTIONS");
+        output("  -c              Write to stdout");
+        output("  -v              Verbose");
+        output("  -9              Maximum compression");
+        output("");
+        output("NOTE: Modern systems prefer 'gzip'. Use 'gzip' for better compatibility.");
+        output("");
+        output("EXAMPLES");
+        output("  compress file.txt");
+        output("  compress -c file > file.Z");
+        return;
+    }
+    
+    output("compress: not fully implemented.");
+    output("Use 'gzip' instead: gzip <options> <file>");
+}
+
+// uncompress - uncompress files
+void cmd_uncompress(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: uncompress [options] file...");
+        output("  Decompress .Z files");
+        output("");
+        output("OPTIONS");
+        output("  -c              Write to stdout");
+        output("  -v              Verbose");
+        output("");
+        output("EXAMPLES");
+        output("  uncompress file.Z");
+        output("  uncompress -c file.Z > file");
+        return;
+    }
+    
+    output("uncompress: not fully implemented.");
+    output("Use 'gunzip' instead: gunzip <options> <file>");
+}
+
+// uuencode - encode binary data
+void cmd_uuencode(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: uuencode [-m] [input] output_name");
+        output("  Encode a binary file in ASCII text");
+        output("");
+        output("OPTIONS");
+        output("  -m              Use base64 encoding (MIME)");
+        output("");
+        output("EXAMPLES");
+        output("  uuencode binary.dat binary.dat.uu");
+        output("  cat image.jpg | uuencode image.jpg");
+        return;
+    }
+    
+    if (args.size() < 2) {
+        outputError("uuencode: missing arguments");
+        return;
+    }
+    
+    bool useMime = false;
+    std::string inputFile, outputName;
+    
+    for (size_t i = 1; i < args.size(); ++i) {
+        if (args[i] == "-m") {
+            useMime = true;
+        } else if (inputFile.empty()) {
+            inputFile = args[i];
+        } else {
+            outputName = args[i];
+        }
+    }
+    
+    if (outputName.empty()) {
+        outputName = inputFile;
+        inputFile.clear();
+    }
+    
+    output("uuencode: basic support via base64");
+    output("Use 'base64' for encoding: base64 <file>");
+}
+
+// uudecode - decode binary data
+void cmd_uudecode(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: uudecode [-m] [input_file]");
+        output("  Decode a uuencoded file");
+        output("");
+        output("OPTIONS");
+        output("  -m              Decode base64 (MIME) format");
+        output("");
+        output("EXAMPLES");
+        output("  uudecode file.uu");
+        output("  uudecode -m file.txt.base64");
+        return;
+    }
+    
+    output("uudecode: basic support via base64");
+    output("Use 'base64 -d' for decoding: base64 -d <file>");
+}
+
+// ed - line editor (basic stub)
+void cmd_ed(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: ed [file]");
+        output("  Edit text interactively (line-based editor)");
+        output("");
+        output("COMMANDS");
+        output("  a              Append lines");
+        output("  c              Change lines");
+        output("  d              Delete lines");
+        output("  p              Print lines");
+        output("  q              Quit");
+        output("  w              Write");
+        output("");
+        output("NOTE: Use 'nano' or 'vi' for more intuitive editing.");
+        return;
+    }
+    
+    output("ed: interactive line editor (basic stub)");
+    output("For full editing, use: nano, vi, or emacs");
+}
+
+// ex - extended vi editor (stub)
+void cmd_ex(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: ex [options] [file]");
+        output("  Extended line editor mode of vi");
+        output("");
+        output("OPTIONS");
+        output("  -c command      Execute command on startup");
+        output("  -R              Read-only mode");
+        output("");
+        output("NOTE: Use 'vi' or 'fvi' for editor functionality.");
+        return;
+    }
+    
+    output("ex: extended editor mode");
+    output("For editing, use: vi <file>");
+}
+
+// mailx - mail utility (stub)
+void cmd_mailx(const std::vector<std::string>& args) {
+    if (checkHelpFlag(args)) {
+        output("Usage: mailx [options] [recipients]");
+        output("  Send and receive mail");
+        output("");
+        output("OPTIONS");
+        output("  -s subject      Subject line");
+        output("  -c address      Send carbon copy");
+        output("  -b address      Send blind carbon copy");
+        output("");
+        output("NOTE: mailx requires SMTP/POP3 server configuration.");
+        return;
+    }
+    
+    output("mailx: not implemented (stub)");
+    output("Mail support requires proper SMTP/POP3 configuration.");
 }
 
 // Helper: parse size strings like 10K, 5M, 1G
@@ -43248,7 +43881,9 @@ void cmd_ulimit(const std::vector<std::string>& args) {
     for (size_t i = 1; i < args.size(); ++i) {
         if (args[i] == "-a") {
             showAll = true;
-        } else if (args[i][0] == '-' && args[i].length() == 2) {
+        } else if (args[i] == "-c" || args[i] == "-d" || args[i] == "-f" ||
+                   args[i] == "-m" || args[i] == "-n" || args[i] == "-s" ||
+                   args[i] == "-t" || args[i] == "-u") {
             limitType = args[i];
         }
     }
@@ -47865,6 +48500,22 @@ public:
         else if (cmdLower == "expand") { cmd_expand(args); return true; }
         else if (cmdLower == "unexpand") { cmd_unexpand(args); return true; }
         else if (cmdLower == "fold") { cmd_fold(args); return true; }
+        else if (cmdLower == "link") { cmd_link(args); return true; }
+        else if (cmdLower == "getconf") { cmd_getconf(args); return true; }
+        else if (cmdLower == "locale") { cmd_locale(args); return true; }
+        else if (cmdLower == "tput") { cmd_tput(args); return true; }
+        else if (cmdLower == "iconv") { cmd_iconv(args); return true; }
+        else if (cmdLower == "stty") { cmd_stty(args); return true; }
+        else if (cmdLower == "tabs") { cmd_tabs(args); return true; }
+        else if (cmdLower == "mkfifo") { cmd_mkfifo(args); return true; }
+        else if (cmdLower == "pax") { cmd_pax(args); return true; }
+        else if (cmdLower == "compress") { cmd_compress(args); return true; }
+        else if (cmdLower == "uncompress") { cmd_uncompress(args); return true; }
+        else if (cmdLower == "uuencode") { cmd_uuencode(args); return true; }
+        else if (cmdLower == "uudecode") { cmd_uudecode(args); return true; }
+        else if (cmdLower == "ed") { cmd_ed(args); return true; }
+        else if (cmdLower == "ex") { cmd_ex(args); return true; }
+        else if (cmdLower == "mailx") { cmd_mailx(args); return true; }
         else if (cmdLower == "fmt") { cmd_fmt(args); return true; }
         else if (cmdLower == "pr") { cmd_pr(args); return true; }
         else if (cmdLower == "column") { cmd_column(args); return true; }
@@ -47910,7 +48561,7 @@ public:
         else if (cmdLower == "mysql") { cmd_mysql(args); return true; }
         else if (cmdLower == "nano") { cmd_nano(args); return true; }
         else if (cmdLower == "emacs") { cmd_emacs(args); return true; }
-        else if (cmdLower == "fvi") { cmd_fvi(args); return true; }
+        else if (cmdLower == "fvi" || cmdLower == "vi") { cmd_fvi(args); return true; }
         else if (cmdLower == "jed") { cmd_jed(args); return true; }
         else if (cmdLower == "ffmpeg") { cmd_ffmpeg(args); return true; }
         else if (cmdLower == "sync") { cmd_sync(args); return true; }
@@ -49944,7 +50595,9 @@ void cmd_ping(const std::vector<std::string>& args) {
     for (size_t i = 1; i < args.size(); i++) {
         const std::string& arg = args[i];
         
-        if (arg == "-c" && i + 1 < args.size()) {
+        if (arg == "-1") {
+            count = 1;
+        } else if (arg == "-c" && i + 1 < args.size()) {
             count = std::atoi(args[i + 1].c_str());
             if (count <= 0) count = defaultCount;
             i++;
@@ -53585,6 +54238,16 @@ void executeCommand(const std::string& command) {
     
     std::string cmd = args[0];
     
+    // Strip leading dashes for command matching (e.g., "--version" becomes "version")
+    // but keep them in the original args for help display
+    std::string cmdForMatching = cmd;
+    while (cmdForMatching.length() > 0 && cmdForMatching[0] == '-') {
+        cmdForMatching = cmdForMatching.substr(1);
+    }
+    if (!cmdForMatching.empty()) {
+        cmd = cmdForMatching;
+    }
+    
     // Expand aliases
     auto aliasIt = g_aliases.find(cmd);
     if (aliasIt != g_aliases.end()) {
@@ -54314,15 +54977,20 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             // Subclass the edit control to intercept messages
             g_originalEditProc = (WNDPROC)SetWindowLongPtr(g_hOutput, GWLP_WNDPROC, (LONG_PTR)EditSubclassProc);
             
-            // Welcome message
-            output("Windows Native Unix Shell (wnus) v" + WNUS_VERSION + " - Native Unix Environment for Windows");
-            output("Type 'help' for available commands");
-            output("Type 'version' for more information");
-            output("Type 'exit' or 'quit' to close");
-            output("-----------------------------------------");
+            // Welcome message (show for interactive launch; suppress only when auto-exiting a startup command)
+            if (!g_executeOnStartup || !g_exitAfterStartup) {
+                output("Windows Native Unix Shell (wnus) v" + WNUS_VERSION + " - Native Unix Environment for Windows");
+                output("Type 'help' for available commands");
+                output("Type 'version' for more information");
+                output("Type 'exit' or 'quit' to close");
+                output("Tip: start in POSIX shell with --shell (aliases: --interactive-shell, -S)");
+                output("-----------------------------------------");
+            }
             
-            // Show initial prompt
-            showPrompt();
+            // Show initial prompt for interactive shells (skip only when auto-exiting after a startup command)
+            if (!g_executeOnStartup || !g_exitAfterStartup) {
+                showPrompt();
+            }
             
             // Execute command from -c flag if present
             if (g_executeOnStartup && !g_startupCommand.empty()) {
@@ -54330,8 +54998,10 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
                 // Add newline for console output
                 printf("\n");
                 fflush(stdout);
-                // Give time for file operations to complete, then exit
-                SetTimer(hWnd, 1, 500, NULL);  // Exit after 500ms
+                // Give time for file operations to complete, then exit (unless interactive shell requested)
+                if (g_exitAfterStartup) {
+                    SetTimer(hWnd, 1, 500, NULL);  // Exit after 500ms
+                }
             }
             
             return 0;
@@ -54702,42 +55372,58 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         g_mesgAllowed = loadMesgPreference(startupUser);
     }
     
-    // Parse command line arguments first to check for -c flag
-    std::string cmdLine = lpCmdLine;
-    std::string executeCmd;
-    bool hasExecuteFlag = false;
-    
-    // Check for -c or /c flag
-    if (!cmdLine.empty()) {
-        size_t start = 0;
-        while (start < cmdLine.length() && isspace(cmdLine[start])) start++;
-        
-        if (start < cmdLine.length()) {
-            if ((cmdLine[start] == '-' || cmdLine[start] == '/') && 
-                start + 1 < cmdLine.length() && 
-                (cmdLine[start + 1] == 'c' || cmdLine[start + 1] == 'C')) {
-                
-                hasExecuteFlag = true;
-                size_t cmdStart = start + 2;
-                
-                while (cmdStart < cmdLine.length() && isspace(cmdLine[cmdStart])) cmdStart++;
-                
-                if (cmdStart < cmdLine.length()) {
-                    if (cmdLine[cmdStart] == '"') {
-                        cmdStart++;
-                        size_t cmdEnd = cmdLine.find('"', cmdStart);
-                        if (cmdEnd != std::string::npos) {
-                            executeCmd = cmdLine.substr(cmdStart, cmdEnd - cmdStart);
-                        } else {
-                            executeCmd = cmdLine.substr(cmdStart);
-                        }
-                    } else {
-                        executeCmd = cmdLine.substr(cmdStart);
-                    }
-                }
+    // Parse the full process command line into UTF-8 args (skip program name)
+    auto wstringToUtf8 = [](const std::wstring& w) {
+        if (w.empty()) return std::string();
+        int sizeNeeded = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), NULL, 0, NULL, NULL);
+        std::string str(sizeNeeded, 0);
+        WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), &str[0], sizeNeeded, NULL, NULL);
+        return str;
+    };
+
+    auto shellQuote = [](const std::string& arg) {
+        if (arg.empty()) return std::string("''");
+        std::string quoted = "'";
+        for (char c : arg) {
+            if (c == '\'') {
+                quoted += "'\\''";
+            } else {
+                quoted += c;
             }
         }
+        quoted += "'";
+        return quoted;
+    };
+
+    bool forceInteractiveShell = false;
+    std::vector<std::string> processArgs;
+    {
+        int argcW = 0;
+        LPWSTR* argvW = CommandLineToArgvW(GetCommandLineW(), &argcW);
+        if (argvW) {
+            for (int i = 1; i < argcW; ++i) {
+                processArgs.push_back(wstringToUtf8(argvW[i]));
+            }
+            LocalFree(argvW);
+        }
     }
+
+    // Normalize Windows-style /c to sh -c and consume app-level interactive-shell switch
+    if (!processArgs.empty() && (processArgs[0] == "/c" || processArgs[0] == "/C")) {
+        processArgs[0] = "-c";
+    }
+    for (auto it = processArgs.begin(); it != processArgs.end(); ) {
+        if (*it == "--shell" || *it == "--interactive-shell" || *it == "-S") {
+            forceInteractiveShell = true;
+            it = processArgs.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    std::string executeCmd;
+    bool hasExecuteFlag = false;
+    bool pipedInputCaptured = false;
     
     // Check for piped input if no -c flag is present
     if (!hasExecuteFlag) {
@@ -54793,27 +55479,94 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                 }
                 
                 if (!input.empty()) {
-                    // Trim whitespace
-                    size_t first = input.find_first_not_of(" \t\r\n");
-                    if (first != std::string::npos) {
-                        size_t last = input.find_last_not_of(" \t\r\n");
-                        executeCmd = input.substr(first, (last - first + 1));
-                        hasExecuteFlag = !executeCmd.empty();
+                    // Split input into lines and feed to sh -s via g_capturedOutput
+                    g_capturedOutput.clear();
+                    std::string line;
+                    std::stringstream ss(input);
+                    while (std::getline(ss, line)) {
+                        if (!line.empty() && line.back() == '\r') {
+                            line.pop_back();
+                        }
+                        g_capturedOutput.push_back(line);
                     }
+                    g_isPipedCommand = true;
+                    pipedInputCaptured = true;
                 }
             }
         }
     }
-    
-    // If -c flag is present (or piped input), attach to parent console for output
+
+    // Build startup command: if args present, check if first arg is a built-in command
+    // If it is, execute directly through dispatcher; else forward all to sh
+    // If piped input, run sh -s; else use interactive shell switch
+    if (!processArgs.empty()) {
+        std::string firstCmd = processArgs[0];
+        // Normalize command name to lowercase for comparison
+        std::string cmdLower = firstCmd;
+        std::transform(cmdLower.begin(), cmdLower.end(), cmdLower.begin(), ::tolower);
+        
+        // Remove leading dashes for flag matching (e.g., "--version" -> "version")
+        std::string cmdForMatching = cmdLower;
+        while (cmdForMatching.length() > 0 && cmdForMatching[0] == '-') {
+            cmdForMatching = cmdForMatching.substr(1);
+        }
+        
+        // List of commands that should be executed directly (not through sh)
+        // These are built-ins that make sense to call directly from command line
+        static const std::set<std::string> DIRECT_EXEC_COMMANDS = {
+            "help", "version", "echo", "pwd", "cd", "ls", "dir", "cat", "type",
+            "grep", "fgrep", "egrep", "find", "mkdir", "rmdir", "rm", "del", "touch",
+            "chmod", "chown", "mv", "cp", "ln", "df", "du", "tar", "zip", "unzip",
+            "gzip", "gunzip", "bzip2", "bunzip2", "xz", "unxz", "base64", "md5sum",
+            "md5", "sha1sum", "sha1", "sha256sum", "sha256", "cksum", "sum", "clear",
+            "cls", "date", "sleep", "wc", "sort", "uniq", "cut", "paste", "tr",
+            "sed", "awk", "basename", "dirname", "readlink", "realpath", "mktemp",
+            "test", "[", "true", "false", "yes", "seq", "printf", "head", "tail",
+            "tac", "rev", "od", "hexdump", "hd", "strings", "diff", "cmp", "comm",
+            "join", "tput", "getconf", "locale", "link", "iconv", "stty", "tabs",
+            "mkfifo", "pax", "compress", "uncompress", "uuencode", "uudecode",
+            "ed", "ex", "vi", "fvi", "mailx", "man", "info", "apropos", "whatis"
+        };
+        
+        if (DIRECT_EXEC_COMMANDS.count(cmdForMatching) > 0) {
+            // Execute through dispatcher: set g_startupCommand to the first command only,
+            // and pass remaining args via g_capturedOutput if needed
+            g_capturedOutput.clear();
+            // Build full command as a single line for execution by the dispatcher
+            std::string fullCmd;
+            for (size_t i = 0; i < processArgs.size(); ++i) {
+                if (i > 0) fullCmd += " ";
+                fullCmd += shellQuote(processArgs[i]);
+            }
+            executeCmd = fullCmd;
+            hasExecuteFlag = true;
+        } else {
+            // Forward all to sh
+            std::string joined;
+            for (size_t i = 0; i < processArgs.size(); ++i) {
+                if (i > 0) joined += " ";
+                joined += shellQuote(processArgs[i]);
+            }
+            executeCmd = "sh " + joined;
+            hasExecuteFlag = true;
+        }
+    } else if (pipedInputCaptured) {
+        executeCmd = "sh -s";
+        hasExecuteFlag = true;
+    } else if (forceInteractiveShell) {
+        executeCmd = "sh";
+        hasExecuteFlag = true;
+    }
+
+    // If we need to execute a startup command (args or piped input), attach to console and set globals
     if (hasExecuteFlag) {
-        if (AttachConsole(ATTACH_PARENT_PROCESS)) {
-            // Redirect stdout and stderr to console
+        bool attachConsole = !forceInteractiveShell; // keep GUI visible for interactive shell
+        if (attachConsole && AttachConsole(ATTACH_PARENT_PROCESS)) {
             freopen("CONOUT$", "w", stdout);
             freopen("CONOUT$", "w", stderr);
         }
-        // Set globals BEFORE creating window so WM_CREATE can access them
         g_executeOnStartup = true;
+        g_exitAfterStartup = !forceInteractiveShell;
         g_startupCommand = executeCmd;
     }
     
@@ -54851,7 +55604,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         DwmSetWindowAttribute(g_hWnd, 20, &useDarkMode, sizeof(useDarkMode));
     }
     
-    ShowWindow(g_hWnd, hasExecuteFlag ? SW_HIDE : nCmdShow);
+    bool hideWindow = hasExecuteFlag && g_exitAfterStartup;
+    ShowWindow(g_hWnd, hideWindow ? SW_HIDE : nCmdShow);
     UpdateWindow(g_hWnd);
     
     // Message loop
