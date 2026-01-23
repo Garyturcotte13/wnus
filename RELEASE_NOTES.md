@@ -1,7 +1,7 @@
-# wnus v0.1.3.9 - Session Summary: Shell Execution and Command Resolution Fixes
+# wnus v0.1.4.0 - Release Notes: Complete Command Coverage in Subshells
 
 ## Objective
-Fix critical shell parsing and execution issues preventing proper handling of commands, particularly within nested `sh -c` invocations. The user requested "fix the shell to support the missing options!"
+Enable ALL 259 wnus built-in commands to work seamlessly within sh subshells, expanding from the initial 50 commands to comprehensive coverage.
 
 ## Root Cause Analysis
 The fundamental issue was in the `parseRedirections()` function which uses a single boolean flag (`inQuotes`) to track whether the parser is inside quotes. This caused the function to incorrectly identify redirection operators (`>`, `<`, `>>`, `2>`, etc.) that appeared within quoted strings.

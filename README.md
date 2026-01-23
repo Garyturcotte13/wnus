@@ -1,5 +1,5 @@
-[![Version](https://img.shields.io/badge/version-0.1.3.9-orange.svg)](.)[![Size](https://img.shields.io/badge/size-6.78MB-blue.svg)](.)
-# Windows Native Unix Shell (wnus) - Version 0.1.3.9
+[![Version](https://img.shields.io/badge/version-0.1.4.0-orange.svg)](.)[![Size](https://img.shields.io/badge/size-6.79MB-blue.svg)](.)
+# Windows Native Unix Shell (wnus) - Version 0.1.4.0
 
 A comprehensive Unix/Linux-like shell environment for Windows, implemented entirely in C++ without external dependencies. Windows Native Unix Shell brings the power and familiarity of bash commands to native Windows, with full NTFS support and Windows API integration.
 
@@ -87,7 +87,7 @@ A comprehensive Unix/Linux-like shell environment for Windows, implemented entir
 
 ### Prerequisites for wnus.exe usage
 - Windows 7 or later (Windows 10/11 recommended)
-- 6.78 MB disk space for executable (v0.1.3.9)
+- 6.79 MB disk space for executable (v0.1.4.0)
 - 30-40 MB RAM typical usage
 
 ### Building

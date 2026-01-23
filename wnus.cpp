@@ -531,7 +531,7 @@ int g_emacsMarkCol = 0;  // Emacs mark column
 #define REG_VALUE_FULL_PATH "FullPathPrompt"
 #define REG_VALUE_LINE_WRAP "LineWrap"
 
-const std::string WNUS_VERSION = "0.1.3.9";
+const std::string WNUS_VERSION = "0.1.4.0";
 
 // Utility functions
 std::vector<std::string> split(const std::string& str, char delimiter = ' ') {
@@ -46701,6 +46701,16 @@ void cmd_lsusb(const std::vector<std::string>& args) {
 // - All POSIX-mandated built-ins and options
 // ============================================================================
 
+// Forward declarations for cmd_ functions used in ShellInterpreter
+void cmd_sh(const std::vector<std::string>& args);
+void cmd_help(const std::vector<std::string>& args);
+void cmd_ping(const std::vector<std::string>& args);
+void cmd_traceroute(const std::vector<std::string>& args);
+void cmd_ip(const std::vector<std::string>& args);
+void cmd_iptables(const std::vector<std::string>& args);
+void cmd_find(const std::vector<std::string>& args);
+void cmd_locate(const std::vector<std::string>& args);
+
 class ShellInterpreter {
 private:
     // ========== EXECUTION STATE ==========
@@ -47470,152 +47480,273 @@ public:
         std::string cmdLower = cmd;
         std::transform(cmdLower.begin(), cmdLower.end(), cmdLower.begin(), ::tolower);
         
-        // Check against known wnus commands and execute them directly
-        // This ensures built-in commands are available in subshell contexts
-        if (cmdLower == "pwd") {
-            cmd_pwd(args); return true;
-        } else if (cmdLower == "cd") {
-            cmd_cd(args); return true;
-        } else if (cmdLower == "echo") {
-            cmd_echo(args); return true;
-        } else if (cmdLower == "ls" || cmdLower == "dir") {
-            cmd_ls(args); return true;
-        } else if (cmdLower == "cat" || cmdLower == "type") {
-            cmd_cat(args); return true;
-        } else if (cmdLower == "less") {
-            cmd_less(args); return true;
-        } else if (cmdLower == "head") {
-            cmd_head(args); return true;
-        } else if (cmdLower == "tail") {
-            cmd_tail(args); return true;
-        } else if (cmdLower == "grep") {
-            cmd_grep(args); return true;
-        } else if (cmdLower == "mkdir") {
-            cmd_mkdir(args); return true;
-        } else if (cmdLower == "rmdir") {
-            cmd_rmdir(args); return true;
-        } else if (cmdLower == "rm" || cmdLower == "del") {
-            cmd_rm(args); return true;
-        } else if (cmdLower == "touch") {
-            cmd_touch(args); return true;
-        } else if (cmdLower == "chmod") {
-            cmd_chmod(args); return true;
-        } else if (cmdLower == "chown") {
-            cmd_chown(args); return true;
-        } else if (cmdLower == "chgrp") {
-            cmd_chgrp(args); return true;
-        } else if (cmdLower == "mv") {
-            cmd_mv(args); return true;
-        } else if (cmdLower == "cp") {
-            cmd_cp(args); return true;
-        } else if (cmdLower == "dd") {
-            cmd_dd(args); return true;
-        } else if (cmdLower == "df") {
-            cmd_df(args); return true;
-        } else if (cmdLower == "du") {
-            cmd_du(args); return true;
-        } else if (cmdLower == "tar") {
-            cmd_tar(args); return true;
-        } else if (cmdLower == "gzip") {
-            cmd_gzip(args); return true;
-        } else if (cmdLower == "gunzip") {
-            cmd_gunzip(args); return true;
-        } else if (cmdLower == "zip") {
-            cmd_zip(args); return true;
-        } else if (cmdLower == "unzip") {
-            cmd_unzip(args); return true;
-        } else if (cmdLower == "basename") {
-            cmd_basename(args); return true;
-        } else if (cmdLower == "dirname") {
-            cmd_dirname(args); return true;
-        } else if (cmdLower == "yes") {
-            cmd_yes(args); return true;
-        } else if (cmdLower == "seq") {
-            cmd_seq(args); return true;
-        } else if (cmdLower == "factor") {
-            cmd_factor(args); return true;
-        } else if (cmdLower == "jot") {
-            cmd_jot(args); return true;
-        } else if (cmdLower == "od") {
-            cmd_od(args); return true;
-        } else if (cmdLower == "hexdump" || cmdLower == "hd") {
-            cmd_hexdump(args); return true;
-        } else if (cmdLower == "strings") {
-            cmd_strings(args); return true;
-        } else if (cmdLower == "base64") {
-            cmd_base64(args); return true;
-        } else if (cmdLower == "md5sum") {
-            cmd_md5sum(args); return true;
-        } else if (cmdLower == "sha1sum") {
-            cmd_sha1sum(args); return true;
-        } else if (cmdLower == "sha256sum") {
-            cmd_sha256sum(args); return true;
-        } else if (cmdLower == "cksum") {
-            cmd_cksum(args); return true;
-        } else if (cmdLower == "sum") {
-            cmd_sum(args); return true;
-        } else if (cmdLower == "install") {
-            cmd_install(args); return true;
-        } else if (cmdLower == "mktemp") {
-            cmd_mktemp(args); return true;
-        } else if (cmdLower == "truncate") {
-            cmd_truncate(args); return true;
-        } else if (cmdLower == "fmt") {
-            cmd_fmt(args); return true;
-        } else if (cmdLower == "fold") {
-            cmd_fold(args); return true;
-        } else if (cmdLower == "pr") {
-            cmd_pr(args); return true;
-        } else if (cmdLower == "expand") {
-            cmd_expand(args); return true;
-        } else if (cmdLower == "unexpand") {
-            cmd_unexpand(args); return true;
-        } else if (cmdLower == "column") {
-            cmd_column(args); return true;
-        } else if (cmdLower == "comm") {
-            cmd_comm(args); return true;
-        } else if (cmdLower == "cmp") {
-            cmd_cmp(args); return true;
-        } else if (cmdLower == "sdiff") {
-            cmd_sdiff(args); return true;
-        } else if (cmdLower == "join") {
-            cmd_join(args); return true;
-        } else if (cmdLower == "look") {
-            cmd_look(args); return true;
-        } else if (cmdLower == "tsort") {
-            cmd_tsort(args); return true;
-        } else if (cmdLower == "arch") {
-            cmd_arch(args); return true;
-        } else if (cmdLower == "nproc") {
-            cmd_nproc(args); return true;
-        } else if (cmdLower == "hostid") {
-            cmd_hostid(args); return true;
-        } else if (cmdLower == "ssh") {
-            cmd_ssh(args); return true;
-        } else if (cmdLower == "scp") {
-            cmd_scp(args); return true;
-        } else if (cmdLower == "ssh-keygen") {
-            cmd_ssh_keygen(args); return true;
-        } else if (cmdLower == "wget") {
-            cmd_wget(args); return true;
-        } else if (cmdLower == "curl") {
-            cmd_curl(args); return true;
-        } else if (cmdLower == "ffmpeg") {
-            cmd_ffmpeg(args); return true;
-        } else if (cmdLower == "sync") {
-            cmd_sync(args); return true;
-        } else if (cmdLower == "rsync") {
-            cmd_rsync(args); return true;
-        } else if (cmdLower == "fuser") {
-            cmd_fuser(args); return true;
-        } else if (cmdLower == "fdisk") {
-            cmd_fdisk(args); return true;
-        } else if (cmdLower == "parted") {
-            cmd_parted(args); return true;
-        } else if (cmdLower == "readlink") {
-            cmd_readlink(args); return true;
-        } else if (cmdLower == "realpath") {
-            cmd_realpath(args); return true;
+        // Check against ALL wnus commands and execute them directly
+        // This ensures ALL built-in commands are available in subshell contexts
+        if (cmdLower == "pwd") { cmd_pwd(args); return true; }
+        else if (cmdLower == "cd") { cmd_cd(args); return true; }
+        else if (cmdLower == "echo") { cmd_echo(args); return true; }
+        else if (cmdLower == "ls" || cmdLower == "dir") { cmd_ls(args); return true; }
+        else if (cmdLower == "tree") { cmd_tree(args); return true; }
+        else if (cmdLower == "cat" || cmdLower == "type") { cmd_cat(args); return true; }
+        else if (cmdLower == "pv") { cmd_pv(args); return true; }
+        else if (cmdLower == "less") { cmd_less(args); return true; }
+        else if (cmdLower == "more") { cmd_more(args); return true; }
+        else if (cmdLower == "head") { cmd_head(args); return true; }
+        else if (cmdLower == "tail") { cmd_tail(args); return true; }
+        else if (cmdLower == "tac") { cmd_tac(args); return true; }
+        else if (cmdLower == "grep") { cmd_grep(args); return true; }
+        else if (cmdLower == "fgrep") { cmd_fgrep(args); return true; }
+        else if (cmdLower == "egrep") { cmd_egrep(args); return true; }
+        else if (cmdLower == "find") { cmd_find(args); return true; }
+        else if (cmdLower == "locate") { cmd_locate(args); return true; }
+        else if (cmdLower == "updatedb") { cmd_updatedb(args); return true; }
+        else if (cmdLower == "mkdir") { cmd_mkdir(args); return true; }
+        else if (cmdLower == "rmdir") { cmd_rmdir(args); return true; }
+        else if (cmdLower == "rm" || cmdLower == "del") { cmd_rm(args); return true; }
+        else if (cmdLower == "touch") { cmd_touch(args); return true; }
+        else if (cmdLower == "chmod") { cmd_chmod(args); return true; }
+        else if (cmdLower == "chown") { cmd_chown(args); return true; }
+        else if (cmdLower == "chgrp") { cmd_chgrp(args); return true; }
+        else if (cmdLower == "chattr") { cmd_chattr(args); return true; }
+        else if (cmdLower == "mv") { cmd_mv(args); return true; }
+        else if (cmdLower == "cp") { cmd_cp(args); return true; }
+        else if (cmdLower == "ln") { cmd_ln(args); return true; }
+        else if (cmdLower == "dd") { cmd_dd(args); return true; }
+        else if (cmdLower == "df") { cmd_df(args); return true; }
+        else if (cmdLower == "du") { cmd_du(args); return true; }
+        else if (cmdLower == "tar") { cmd_tar(args); return true; }
+        else if (cmdLower == "make") { cmd_make(args); return true; }
+        else if (cmdLower == "gzip") { cmd_gzip(args); return true; }
+        else if (cmdLower == "gunzip") { cmd_gunzip(args); return true; }
+        else if (cmdLower == "zcat") { cmd_zcat(args); return true; }
+        else if (cmdLower == "bzip2") { cmd_bzip2(args); return true; }
+        else if (cmdLower == "bunzip2") { cmd_bunzip2(args); return true; }
+        else if (cmdLower == "xz") { cmd_xz(args); return true; }
+        else if (cmdLower == "unxz") { cmd_unxz(args); return true; }
+        else if (cmdLower == "zip") { cmd_zip(args); return true; }
+        else if (cmdLower == "unzip") { cmd_unzip(args); return true; }
+        else if (cmdLower == "unrar") { cmd_unrar(args); return true; }
+        else if (cmdLower == "basename") { cmd_basename(args); return true; }
+        else if (cmdLower == "dirname") { cmd_dirname(args); return true; }
+        else if (cmdLower == "readlink") { cmd_readlink(args); return true; }
+        else if (cmdLower == "realpath") { cmd_realpath(args); return true; }
+        else if (cmdLower == "mktemp") { cmd_mktemp(args); return true; }
+        else if (cmdLower == "install") { cmd_install(args); return true; }
+        else if (cmdLower == "truncate") { cmd_truncate(args); return true; }
+        else if (cmdLower == "fallocate") { cmd_fallocate(args); return true; }
+        else if (cmdLower == "rename") { cmd_rename(args); return true; }
+        else if (cmdLower == "unlink") { cmd_unlink(args); return true; }
+        else if (cmdLower == "clear" || cmdLower == "cls") { cmd_clear(args); return true; }
+        else if (cmdLower == "rev") { cmd_rev(args); return true; }
+        else if (cmdLower == "yes") { cmd_yes(args); return true; }
+        else if (cmdLower == "seq") { cmd_seq(args); return true; }
+        else if (cmdLower == "factor") { cmd_factor(args); return true; }
+        else if (cmdLower == "jot") { cmd_jot(args); return true; }
+        else if (cmdLower == "logname") { cmd_logname(args); return true; }
+        else if (cmdLower == "users") { cmd_users(args); return true; }
+        else if (cmdLower == "mesg") { cmd_mesg(args); return true; }
+        else if (cmdLower == "write") { cmd_write(args); return true; }
+        else if (cmdLower == "wall") { cmd_wall(args); return true; }
+        else if (cmdLower == "pathchk") { cmd_pathchk(args); return true; }
+        else if (cmdLower == "true") { cmd_true_cmd(args); return true; }
+        else if (cmdLower == "false") { cmd_false_cmd(args); return true; }
+        else if (cmdLower == "tty") { cmd_tty(args); return true; }
+        else if (cmdLower == "script") { cmd_script(args); return true; }
+        else if (cmdLower == "logger") { cmd_logger(args); return true; }
+        else if (cmdLower == "xdg-open") { cmd_xdg_open(args); return true; }
+        else if (cmdLower == "pgrep") { cmd_pgrep(args); return true; }
+        else if (cmdLower == "pidof") { cmd_pidof(args); return true; }
+        else if (cmdLower == "pstree") { cmd_pstree(args); return true; }
+        else if (cmdLower == "sleep") { cmd_sleep(args); return true; }
+        else if (cmdLower == "wait") { cmd_wait(args); return true; }
+        else if (cmdLower == "timeout") { cmd_timeout(args); return true; }
+        else if (cmdLower == "nc") { cmd_nc(args); return true; }
+        else if (cmdLower == "dmesg") { cmd_dmesg(args); return true; }
+        else if (cmdLower == "mkfs") { cmd_mkfs(args); return true; }
+        else if (cmdLower == "fsck") { cmd_fsck(args); return true; }
+        else if (cmdLower == "blkid") { cmd_blkid(args); return true; }
+        else if (cmdLower == "systemctl") { cmd_systemctl(args); return true; }
+        else if (cmdLower == "journalctl") { cmd_journalctl(args); return true; }
+        else if (cmdLower == "service") { cmd_service(args); return true; }
+        else if (cmdLower == "ftp") { cmd_ftp(args); return true; }
+        else if (cmdLower == "sftp") { cmd_sftp(args); return true; }
+        else if (cmdLower == "sysctl") { cmd_sysctl(args); return true; }
+        else if (cmdLower == "read") { cmd_read(args); return true; }
+        else if (cmdLower == "nohup") { cmd_nohup(args); return true; }
+        else if (cmdLower == "test" || cmdLower == "[") { cmd_test(args); return true; }
+        else if (cmdLower == "date") { cmd_date(args); return true; }
+        else if (cmdLower == "timedatectl") { cmd_timedatectl(args); return true; }
+        else if (cmdLower == "base64") { cmd_base64(args); return true; }
+        else if (cmdLower == "md5sum" || cmdLower == "md5") { cmd_md5sum(args); return true; }
+        else if (cmdLower == "sha1sum" || cmdLower == "sha1") { cmd_sha1sum(args); return true; }
+        else if (cmdLower == "sha256sum" || cmdLower == "sha256") { cmd_sha256sum(args); return true; }
+        else if (cmdLower == "cksum") { cmd_cksum(args); return true; }
+        else if (cmdLower == "sum") { cmd_sum(args); return true; }
+        else if (cmdLower == "printf") { cmd_printf(args); return true; }
+        else if (cmdLower == "pipedin") { cmd_pipedin(args); return true; }
+        else if (cmdLower == "expand") { cmd_expand(args); return true; }
+        else if (cmdLower == "unexpand") { cmd_unexpand(args); return true; }
+        else if (cmdLower == "fold") { cmd_fold(args); return true; }
+        else if (cmdLower == "fmt") { cmd_fmt(args); return true; }
+        else if (cmdLower == "pr") { cmd_pr(args); return true; }
+        else if (cmdLower == "column") { cmd_column(args); return true; }
+        else if (cmdLower == "comm") { cmd_comm(args); return true; }
+        else if (cmdLower == "cmp") { cmd_cmp(args); return true; }
+        else if (cmdLower == "sdiff") { cmd_sdiff(args); return true; }
+        else if (cmdLower == "diff") { cmd_diff(args); return true; }
+        else if (cmdLower == "patch") { cmd_patch(args); return true; }
+        else if (cmdLower == "join") { cmd_join(args); return true; }
+        else if (cmdLower == "look") { cmd_look(args); return true; }
+        else if (cmdLower == "tsort") { cmd_tsort(args); return true; }
+        else if (cmdLower == "unvis") { cmd_unvis(args); return true; }
+        else if (cmdLower == "vis") { cmd_vis(args); return true; }
+        else if (cmdLower == "od") { cmd_od(args); return true; }
+        else if (cmdLower == "hexdump" || cmdLower == "hd") { cmd_hexdump(args); return true; }
+        else if (cmdLower == "strings") { cmd_strings(args); return true; }
+        else if (cmdLower == "lpr") { cmd_lpr(args); return true; }
+        else if (cmdLower == "lp") { cmd_lp(args); return true; }
+        else if (cmdLower == "cal") { cmd_cal(args); return true; }
+        else if (cmdLower == "ncal") { cmd_ncal(args); return true; }
+        else if (cmdLower == "help") { cmd_help(args); return true; }
+        else if (cmdLower == "man") { cmd_man(args); return true; }
+        else if (cmdLower == "info") { cmd_info(args); return true; }
+        else if (cmdLower == "apropos") { cmd_apropos(args); return true; }
+        else if (cmdLower == "whatis") { cmd_whatis(args); return true; }
+        else if (cmdLower == "proc" || cmdLower == "ps") { cmd_proc(args); return true; }
+        else if (cmdLower == "top") { cmd_top(args); return true; }
+        else if (cmdLower == "htop") { cmd_htop(args); return true; }
+        else if (cmdLower == "kill") { cmd_kill(args); return true; }
+        else if (cmdLower == "killall") { cmd_killall(args); return true; }
+        else if (cmdLower == "pkill") { cmd_pkill(args); return true; }
+        else if (cmdLower == "xkill") { cmd_xkill(args); return true; }
+        else if (cmdLower == "nice") { cmd_nice(args); return true; }
+        else if (cmdLower == "renice") { cmd_renice(args); return true; }
+        else if (cmdLower == "jobs") { cmd_jobs(args); return true; }
+        else if (cmdLower == "bg") { cmd_bg(args); return true; }
+        else if (cmdLower == "fg") { cmd_fg(args); return true; }
+        else if (cmdLower == "ssh") { cmd_ssh(args); return true; }
+        else if (cmdLower == "scp") { cmd_scp(args); return true; }
+        else if (cmdLower == "ssh-keygen") { cmd_ssh_keygen(args); return true; }
+        else if (cmdLower == "wget") { cmd_wget(args); return true; }
+        else if (cmdLower == "curl") { cmd_curl(args); return true; }
+        else if (cmdLower == "mysql") { cmd_mysql(args); return true; }
+        else if (cmdLower == "nano") { cmd_nano(args); return true; }
+        else if (cmdLower == "emacs") { cmd_emacs(args); return true; }
+        else if (cmdLower == "fvi") { cmd_fvi(args); return true; }
+        else if (cmdLower == "jed") { cmd_jed(args); return true; }
+        else if (cmdLower == "ffmpeg") { cmd_ffmpeg(args); return true; }
+        else if (cmdLower == "sync") { cmd_sync(args); return true; }
+        else if (cmdLower == "rsync") { cmd_rsync(args); return true; }
+        else if (cmdLower == "fuser") { cmd_fuser(args); return true; }
+        else if (cmdLower == "fdisk") { cmd_fdisk(args); return true; }
+        else if (cmdLower == "parted") { cmd_parted(args); return true; }
+        else if (cmdLower == "shutdown") { cmd_shutdown(args); return true; }
+        else if (cmdLower == "reboot") { cmd_reboot(args); return true; }
+        else if (cmdLower == "halt") { cmd_halt(args); return true; }
+        else if (cmdLower == "lshw") { cmd_lshw(args); return true; }
+        else if (cmdLower == "lscpu") { cmd_lscpu(args); return true; }
+        else if (cmdLower == "lspci") { cmd_lspci(args); return true; }
+        else if (cmdLower == "lsusb") { cmd_lsusb(args); return true; }
+        else if (cmdLower == "lsof") { cmd_lsof(args); return true; }
+        else if (cmdLower == "iftop") { cmd_iftop(args); return true; }
+        else if (cmdLower == "sar") { cmd_sar(args); return true; }
+        else if (cmdLower == "mount") { cmd_mount(args); return true; }
+        else if (cmdLower == "whoami") { cmd_whoami(args); return true; }
+        else if (cmdLower == "id") { cmd_id(args); return true; }
+        else if (cmdLower == "who") { cmd_who(args); return true; }
+        else if (cmdLower == "w") { cmd_w(args); return true; }
+        else if (cmdLower == "last") { cmd_last(args); return true; }
+        else if (cmdLower == "uname") { cmd_uname(args); return true; }
+        else if (cmdLower == "arch") { cmd_arch(args); return true; }
+        else if (cmdLower == "nproc") { cmd_nproc(args); return true; }
+        else if (cmdLower == "lsb_release") { cmd_lsb_release(args); return true; }
+        else if (cmdLower == "hostid") { cmd_hostid(args); return true; }
+        else if (cmdLower == "hostname") { cmd_hostname(args); return true; }
+        else if (cmdLower == "uptime") { cmd_uptime(args); return true; }
+        else if (cmdLower == "free") { cmd_free(args); return true; }
+        else if (cmdLower == "vmstat") { cmd_vmstat(args); return true; }
+        else if (cmdLower == "iostat") { cmd_iostat(args); return true; }
+        else if (cmdLower == "mpstat") { cmd_mpstat(args); return true; }
+        else if (cmdLower == "neofetch") { cmd_neofetch(args); return true; }
+        else if (cmdLower == "sed") { cmd_sed(args); return true; }
+        else if (cmdLower == "awk") { cmd_awk(args); return true; }
+        else if (cmdLower == "xargs") { cmd_xargs(args); return true; }
+        else if (cmdLower == "exec") { cmd_exec(args); return true; }
+        else if (cmdLower == "env") { cmd_env(args); return true; }
+        else if (cmdLower == "printenv") { cmd_printenv(args); return true; }
+        else if (cmdLower == "export") { cmd_export(args); return true; }
+        else if (cmdLower == "sort") { cmd_sort(args); return true; }
+        else if (cmdLower == "uniq") { cmd_uniq(args); return true; }
+        else if (cmdLower == "cut") { cmd_cut(args); return true; }
+        else if (cmdLower == "paste") { cmd_paste(args); return true; }
+        else if (cmdLower == "split") { cmd_split(args); return true; }
+        else if (cmdLower == "nl") { cmd_nl(args); return true; }
+        else if (cmdLower == "wc") { cmd_wc(args); return true; }
+        else if (cmdLower == "tr") { cmd_tr(args); return true; }
+        else if (cmdLower == "tee") { cmd_tee(args); return true; }
+        else if (cmdLower == "shuf") { cmd_shuf(args); return true; }
+        else if (cmdLower == "banner") { cmd_banner(args); return true; }
+        else if (cmdLower == "time") { cmd_time(args); return true; }
+        else if (cmdLower == "watch") { cmd_watch(args); return true; }
+        else if (cmdLower == "quota") { cmd_quota(args); return true; }
+        else if (cmdLower == "whereis") { cmd_whereis(args); return true; }
+        else if (cmdLower == "which") { cmd_which(args); return true; }
+        else if (cmdLower == "type") { cmd_type(args); return true; }
+        else if (cmdLower == "stat") { cmd_stat(args); return true; }
+        else if (cmdLower == "file") { cmd_file(args); return true; }
+        else if (cmdLower == "finger") { cmd_finger(args); return true; }
+        else if (cmdLower == "user") { cmd_user(args); return true; }
+        else if (cmdLower == "groups") { cmd_groups(args); return true; }
+        else if (cmdLower == "version") { cmd_version(args); return true; }
+        else if (cmdLower == "history") { cmd_history(args); return true; }
+        else if (cmdLower == "passwd") { cmd_passwd(args); return true; }
+        else if (cmdLower == "chage") { cmd_chage(args); return true; }
+        else if (cmdLower == "useradd") { cmd_useradd(args); return true; }
+        else if (cmdLower == "userdel") { cmd_userdel(args); return true; }
+        else if (cmdLower == "usermod") { cmd_usermod(args); return true; }
+        else if (cmdLower == "groupadd") { cmd_groupadd(args); return true; }
+        else if (cmdLower == "addgroup") { cmd_addgroup(args); return true; }
+        else if (cmdLower == "groupmod") { cmd_groupmod(args); return true; }
+        else if (cmdLower == "groupdel") { cmd_groupdel(args); return true; }
+        else if (cmdLower == "gpasswd") { cmd_gpasswd(args); return true; }
+        else if (cmdLower == "umask") { cmd_umask(args); return true; }
+        else if (cmdLower == "screen") { cmd_screen(args); return true; }
+        else if (cmdLower == "getent") { cmd_getent(args); return true; }
+        else if (cmdLower == "source" || cmdLower == ".") { cmd_source(args); return true; }
+        else if (cmdLower == "sh") { cmd_sh(args); return true; }
+        else if (cmdLower == "at") { cmd_at(args); return true; }
+        else if (cmdLower == "cron") { cmd_cron(args); return true; }
+        else if (cmdLower == "crontab") { cmd_crontab(args); return true; }
+        else if (cmdLower == "dig") { cmd_dig(args); return true; }
+        else if (cmdLower == "nslookup") { cmd_nslookup(args); return true; }
+        else if (cmdLower == "ping") { cmd_ping(args); return true; }
+        else if (cmdLower == "traceroute" || cmdLower == "tracert") { cmd_traceroute(args); return true; }
+        else if (cmdLower == "netstat") { cmd_netstat(args); return true; }
+        else if (cmdLower == "ifconfig") { cmd_ifconfig(args); return true; }
+        else if (cmdLower == "ip") { cmd_ip(args); return true; }
+        else if (cmdLower == "ss") { cmd_ss(args); return true; }
+        else if (cmdLower == "iptables") { cmd_iptables(args); return true; }
+        else if (cmdLower == "nmap") { cmd_nmap(args); return true; }
+        else if (cmdLower == "tcpdump") { cmd_tcpdump(args); return true; }
+        else if (cmdLower == "bc") { cmd_bc(args); return true; }
+        else if (cmdLower == "calc") { cmd_calc(args); return true; }
+        else if (cmdLower == "qalc") { cmd_qalc(args); return true; }
+        else if (cmdLower == "case") { cmd_case(args); return true; }
+        else if (cmdLower == "sudo") { cmd_sudo(args); return true; }
+        else if (cmdLower == "su") { cmd_su(args); return true; }
+        else if (cmdLower == "strace") { cmd_strace(args); return true; }
+        else if (cmdLower == "trap") { cmd_trap(args); return true; }
+        else if (cmdLower == "ulimit") { cmd_ulimit(args); return true; }
+        else if (cmdLower == "expr") { cmd_expr(args); return true; }
+        else if (cmdLower == "alias") { cmd_alias(args); return true; }
+        else if (cmdLower == "unalias") { cmd_unalias(args); return true; }
+        else if (cmdLower == "exit" || cmdLower == "quit") { 
+            // Special handling for exit/quit - these should terminate the subshell
+            g_lastExitStatus = 0;
+            if (args.size() > 1) {
+                g_lastExitStatus = std::atoi(args[1].c_str());
+            }
+            return true; 
         }
         
         // Not a recognized wnus command - return false to let executeCommand handle it
