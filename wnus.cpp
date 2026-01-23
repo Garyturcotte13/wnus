@@ -2563,7 +2563,7 @@ void cmd_df(const std::vector<std::string>& args) {
         return;
     }
 
-    bool human = false, si = false, posixFmt = false, includeAll = false, localOnly = false, printType = false, showTotal = false;
+    bool human = false, si = false, posixFmt = false, includeAll = false, localOnly = false, printType = false, showTotal = false, showInodes = false;
     unsigned long long blockSize = 1024; // default 1K
     std::string onlyType, excludeType;
     std::vector<std::string> paths;
@@ -2597,6 +2597,7 @@ void cmd_df(const std::vector<std::string>& args) {
         else if (a == "--total") showTotal = true;
         else if (a == "-l") localOnly = true;
         else if (a == "-T" || a == "--print-type") printType = true;
+        else if (a == "-i") showInodes = true;
         else if (a == "-t" && i + 1 < args.size()) { onlyType = args[++i]; }
         else if (a.rfind("-t",0)==0 && a.size()>2) { onlyType = a.substr(2); }
         else if (a == "-x" && i + 1 < args.size()) { excludeType = args[++i]; }
@@ -2606,7 +2607,7 @@ void cmd_df(const std::vector<std::string>& args) {
             for (size_t j=1;j<a.size();++j) {
                 if (a[j]=='h') human=true; else if (a[j]=='H') si=true; else if (a[j]=='k') blockSize=1024;
                 else if (a[j]=='m') blockSize=1024ULL*1024; else if (a[j]=='a') includeAll=true; else if (a[j]=='P') posixFmt=true;
-                else if (a[j]=='l') localOnly=true; else if (a[j]=='T') printType=true;
+                else if (a[j]=='l') localOnly=true; else if (a[j]=='T') printType=true; else if (a[j]=='i') showInodes=true;
             }
         } else {
             paths.push_back(a);
@@ -2627,7 +2628,7 @@ void cmd_df(const std::vector<std::string>& args) {
         }
     }
 
-    struct Row { std::string fs; std::string mount; std::string type; ULONGLONG total=0, used=0, avail=0; };
+    struct Row { std::string fs; std::string mount; std::string type; ULONGLONG total=0, used=0, avail=0; ULONGLONG inodeTotal=0, inodeUsed=0, inodeFree=0; };
     std::vector<Row> rows;
 
     auto shouldInclude = [&](UINT dtype, const std::string& fstype) -> bool {
@@ -2635,6 +2636,39 @@ void cmd_df(const std::vector<std::string>& args) {
         if (!onlyType.empty() && _stricmp(onlyType.c_str(), fstype.c_str()) != 0) return false;
         if (!excludeType.empty() && _stricmp(excludeType.c_str(), fstype.c_str()) == 0) return false;
         return true;
+    };
+
+    auto countInodes = [&](const std::string& root) -> ULONGLONG {
+        ULONGLONG count = 0;
+        std::vector<std::string> stack;
+        std::string base = root;
+        if (!base.empty() && base.back() != '\\') base += '\\';
+        stack.push_back(base);
+
+        WIN32_FIND_DATAA fd;
+        while (!stack.empty()) {
+            std::string cur = stack.back();
+            stack.pop_back();
+            std::string pattern = cur + "*";
+            HANDLE hFind = FindFirstFileA(pattern.c_str(), &fd);
+            if (hFind == INVALID_HANDLE_VALUE) continue;
+            do {
+                const char* name = fd.cFileName;
+                if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) continue;
+                ++count; // file or directory counts as an inode
+                bool isDir = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+                bool isReparse = (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+                if (isDir && !isReparse) {
+                    std::string next = cur;
+                    if (!next.empty() && next.back() != '\\') next += '\\';
+                    next += name;
+                    next += '\\';
+                    stack.push_back(next);
+                }
+            } while (FindNextFileA(hFind, &fd));
+            FindClose(hFind);
+        }
+        return count;
     };
 
     for (std::string p : paths) {
@@ -2669,6 +2703,16 @@ void cmd_df(const std::vector<std::string>& args) {
         r.total = total.QuadPart;
         r.used = total.QuadPart - freeb.QuadPart;
         r.avail = avail.QuadPart;
+
+        if (showInodes) {
+            ULONGLONG usedInodes = countInodes(winPath);
+            // Estimate possible inode capacity using free space / 1KB per MFT entry as heuristic
+            ULONGLONG estFreeInodes = (ULONGLONG)(freeb.QuadPart / 1024ULL);
+            r.inodeTotal = usedInodes + estFreeInodes;
+            if (r.inodeTotal < usedInodes) r.inodeTotal = usedInodes; // guard underflow
+            r.inodeUsed = usedInodes;
+            r.inodeFree = (r.inodeTotal >= r.inodeUsed) ? (r.inodeTotal - r.inodeUsed) : 0;
+        }
         rows.push_back(r);
     }
 
@@ -2689,11 +2733,18 @@ void cmd_df(const std::vector<std::string>& args) {
 
     // Header
     if (posixFmt) {
-        output("Filesystem     " + std::string(printType ? "Type     " : "") + "1024-blocks      Used Available Capacity Mounted on");
+        std::string inodeCols = showInodes ? "     Inodes     IUsed     IFree IUse% " : "";
+        output("Filesystem     " + std::string(printType ? "Type     " : "") + inodeCols + "1024-blocks      Used Available Capacity Mounted on");
     } else {
         std::ostringstream hdr;
         hdr << std::left << std::setw(16) << "Filesystem";
         if (printType) hdr << std::left << std::setw(8) << "Type";
+        if (showInodes) {
+            hdr << std::right << std::setw(12) << "Inodes";
+            hdr << std::right << std::setw(12) << "IUsed";
+            hdr << std::right << std::setw(12) << "IFree";
+            hdr << std::right << std::setw(8) << "IUse%";
+        }
         hdr << std::right << std::setw(12) << (human?"Size":"Blocks");
         hdr << std::right << std::setw(12) << "Used";
         hdr << std::right << std::setw(12) << "Avail";
@@ -2706,10 +2757,18 @@ void cmd_df(const std::vector<std::string>& args) {
 
     for (const auto& r : rows) {
         totalRow.total += r.total; totalRow.used += r.used; totalRow.avail += r.avail;
+        totalRow.inodeTotal += r.inodeTotal; totalRow.inodeUsed += r.inodeUsed; totalRow.inodeFree += r.inodeFree;
         double pct = (r.total > 0) ? (100.0 * (double)r.used / (double)r.total) : 0.0;
+        double ipct = (showInodes && r.inodeTotal > 0) ? (100.0 * (double)r.inodeUsed / (double)r.inodeTotal) : 0.0;
         std::ostringstream line;
         line << std::left << std::setw(16) << r.fs;
         if (printType) line << std::left << std::setw(8) << r.type;
+        if (showInodes) {
+            line << std::right << std::setw(12) << r.inodeTotal;
+            line << std::right << std::setw(12) << r.inodeUsed;
+            line << std::right << std::setw(12) << r.inodeFree;
+            line << std::right << std::setw(8) << std::fixed << std::setprecision(1) << ipct << "%";
+        }
         line << std::right << std::setw(12) << fmtSize(r.total);
         line << std::right << std::setw(12) << fmtSize(r.used);
         line << std::right << std::setw(12) << fmtSize(r.avail);
@@ -2720,9 +2779,16 @@ void cmd_df(const std::vector<std::string>& args) {
 
     if (showTotal && !rows.empty()) {
         double pct = (totalRow.total > 0) ? (100.0 * (double)totalRow.used / (double)totalRow.total) : 0.0;
+        double ipct = (showInodes && totalRow.inodeTotal > 0) ? (100.0 * (double)totalRow.inodeUsed / (double)totalRow.inodeTotal) : 0.0;
         std::ostringstream line;
         line << std::left << std::setw(16) << "total";
         if (printType) line << std::left << std::setw(8) << "-";
+        if (showInodes) {
+            line << std::right << std::setw(12) << totalRow.inodeTotal;
+            line << std::right << std::setw(12) << totalRow.inodeUsed;
+            line << std::right << std::setw(12) << totalRow.inodeFree;
+            line << std::right << std::setw(8) << std::fixed << std::setprecision(1) << ipct << "%";
+        }
         line << std::right << std::setw(12) << fmtSize(totalRow.total);
         line << std::right << std::setw(12) << fmtSize(totalRow.used);
         line << std::right << std::setw(12) << fmtSize(totalRow.avail);
