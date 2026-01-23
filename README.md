@@ -1,11 +1,11 @@
-# Windows Native Unix Shell (wnus) - Version 0.1.3.2
+[![Version](https://img.shields.io/badge/version-0.1.3.3-orange.svg)](.)[![Size](https://img.shields.io/badge/size-6.91MB-blue.svg)](.)  
+# Windows Native Unix Shell (wnus) - Version 0.1.3.3
 
 A comprehensive Unix/Linux-like shell environment for Windows, implemented entirely in C++ without external dependencies. Windows Native Unix Shell brings the power and familiarity of bash commands to native Windows, with full NTFS support and Windows API integration.
 
 [![Platform](https://img.shields.io/badge/platform-Windows-blue.svg)](https://www.microsoft.com/windows)
-[![Build](https://img.shields.io/badge/build-passing-brightgreen.svg)](.)
-[![Version](https://img.shields.io/badge/version-0.1.3.2-orange.svg)](.)
-
+[![Build](https://img.shields.io/badge/build-passing-brightgreen.svg)](.)  
+[![Version](https://img.shields.io/badge/version-0.1.3.3-orange.svg)](.)[![Size](https://img.shields.io/badge/size-6.91MB-blue.svg)](.)  
 - **Full bash compatibility** for common command-line workflows including I/O redirection and process control
 - **Comprehensive documentation** with man pages for every command
 - **Full-featured AWK interpreter** with all standard Unix/Linux AWK capabilities
@@ -85,13 +85,14 @@ A comprehensive Unix/Linux-like shell environment for Windows, implemented entir
 
 ## 🚀 Quick Start
 
-### Prerequisites
+### Prerequisites for wnus.exe usage
 - Windows 7 or later (Windows 10/11 recommended)
-- C++ compiler (MSVC, MinGW, or Clang)
-- ~6.5 MB disk space for executable
-- ~28-36 MB RAM typical usage
+- ~6.9 MB disk space for executable
+- ~30-40 MB RAM typical usage
 
 ### Building
+
+- C++ compiler (MSVC, MinGW, or Clang) is needed to compile from source code 
 
 #### Using PowerShell build script (recommended):
 ```powershell
@@ -404,6 +405,8 @@ ls -la                        # List all files with details
 cat file.txt | grep "error"   # Search in file
 find . -name "*.log"          # Find log files
 tar -czf backup.tar.gz data/  # Create archive
+du -h --max-depth=1           # Directory sizes with depth limit
+wc -m --files0-from=list.txt  # Count characters from NUL list
 ```
 
 ### Text Processing
@@ -541,12 +544,55 @@ Run as Administrator or use built-in `sudo` command.
 
 - **Startup**: Instant (native executable)
 - **Execution**: Native Windows API performance
-- **Memory**: ~26 MB typical usage
-- **Size**: ~6.00 MB executable (6138.87 KB)
+- **Memory**: ~30-40 MB typical usage
+- **Size**: ~6.91 MB executable (6911.46 KB)
 
 ## 🔄 Version History
 
-### v0.1.2.2 (Current)
+### v0.1.3.3 (Current)
+- **Enhanced sh command fixes**:
+  - **Semicolon-separated commands**: Added `splitCommandsBySemicolon()` function to properly split and execute multiple commands on one line (e.g., `echo A; echo B; echo C`)
+  - **Test expression evaluation**: Fixed `executeInlineIf()` to strip `[` and `]` brackets before evaluating test expressions, enabling proper execution of if statements with test conditions (e.g., `if [ "abc" = "abc" ]; then echo PASS; fi`)
+  - All 10 smoke tests now passing: basic echo, variables, inline control structures, arithmetic, command substitution, /dev/null redirection, file I/O, test expressions, multiple commands
+- **Technical improvements**:
+  - Size: 6911.46 KB (6.91 MB)
+  - Line count: 53,480 lines
+  - Memory: ~30-40 MB typical usage
+  - Zero regressions - all existing features maintained
+
+### v0.1.3.2
+- **Comprehensive GNU Make Implementation**: Full-featured build automation system (~2000 lines)
+- **Pattern Rules**: %.o: %.c with stem matching
+- **All Make Functions**: wildcard, patsubst, subst, strip, findstring, filter, sort, word, dir, basename, shell, if, foreach, call, error, warning, info (25+ functions)
+- **Variable System**: Recursive (=), simple (:=), conditional (?=), append (+=) operators
+- **Automatic Variables**: $@, $<, $^, $?, $* for pattern rules
+- **Command-Line Options**: All 20+ options (-B, -C, -d, -e, -f, -i, -j, -k, -n, -p, -q, -r, -s, -t, -w, etc.)
+- **Advanced Features**: Include directives, vpath, .PHONY, double-colon rules, defines, recipe prefixes
+- Size: 6896.79 KB (6.73 MB)
+
+### v0.1.3.1
+- **Enhanced Shell Interpreter**: Full ShellInterpreter class (~1600 lines)
+- **Here-Documents**: <<DELIMITER syntax with multi-line input
+- **Shell Functions**: Function definitions with parameters
+- **Arithmetic**: $((expr)) with full operator precedence
+- **Test Expressions**: [ ... ] with file/string/numeric tests
+- **Control Flow**: if/elif/else, while, for with full nesting
+- **Quote Handling**: Proper single/double quote and escape support
+- Size: 6521.25 KB (6.37 MB)
+
+### v0.1.2.9
+- **Comprehensive sh Implementation**: Full POSIX shell
+- All shell options: -c, -s, -e, -u, -v, -x, -n, -f, -a, -k, -t, -C
+- Script execution with shebang, line continuation, multiline
+- Size: 6489.58 KB (6.34 MB)
+
+### v0.1.2.8
+- **Full AWK Implementation**: Complete interpreter
+- Pattern-action syntax, BEGIN/END blocks
+- All built-in variables and functions
+- Size: 6138.87 KB (6.00 MB)
+
+### v0.1.2.7
 - **Refactored `sed` implementation**:
   - Re-implemented core engine using `std::regex` for robust pattern matching and better performance
   - Architecture upgrade from line-by-line interpreter to two-pass compilation (parse script once, execute many times)
