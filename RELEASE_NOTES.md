@@ -1,4 +1,4 @@
-# wnus v0.1.4.0 - Release Notes: Complete Command Coverage in Subshells
+# wnus v0.1.4.1 - Release Notes: du Command Options Implementation
 
 ## Objective
 Enable ALL 259 wnus built-in commands to work seamlessly within sh subshells, expanding from the initial 50 commands to comprehensive coverage.

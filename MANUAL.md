@@ -1,7 +1,7 @@
 # Windows Native Unix Shell (wnus) User Manual
-## Version 0.1.4.0
+## Version 0.1.4.1
 **Build Date:** January 23, 2026  
-**Executable Size:** 6.79 MB (6959.14 KB)  
+**Executable Size:** 6.82 MB (6981.83 KB)  
 **Memory Usage:** 30-40 MB typical
 
 ---
@@ -91,7 +91,7 @@ allowing Windows users to enjoy the power and flexibility of Unix command-line t
 
 - **Operating System**: Windows 7 or later (Windows 10/11 recommended)
 - **Memory**: 30-40 MB RAM in use
-- **Disk Space**: ~6.91 MB for executable (v0.1.3.3)
+- **Disk Space**: 6.82 MB for executable (v0.1.4.1)
 - **Privileges**: Standard user for most commands, Administrator for system operations
 
 ---

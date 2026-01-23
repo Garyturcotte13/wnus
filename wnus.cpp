@@ -531,7 +531,7 @@ int g_emacsMarkCol = 0;  // Emacs mark column
 #define REG_VALUE_FULL_PATH "FullPathPrompt"
 #define REG_VALUE_LINE_WRAP "LineWrap"
 
-const std::string WNUS_VERSION = "0.1.4.0";
+const std::string WNUS_VERSION = "0.1.4.1";
 
 // Utility functions
 std::vector<std::string> split(const std::string& str, char delimiter = ' ') {
@@ -1892,6 +1892,7 @@ void cmd_ls(const std::vector<std::string>& args) {
         output("  -R, --recursive           list subdirectories recursively");
         output("      --full-time           like -l --time-style=full-iso");
         output("      --time-style=STYLE    style for time stamps (full-iso, long-iso, iso)");
+        output("  -I, --ignore=PATTERN      do not list entries matching PATTERN");
         output("      --color[=WHEN]        colorize the output (ignored on Windows)");
         output("      --help                display this help and exit");
         return;
@@ -1903,6 +1904,7 @@ void cmd_ls(const std::vector<std::string>& args) {
         bool oneLine=false, inode=false, blocks=false, classify=false, appendSlash=false, numericIds=false, omitGroup=false, omitOwner=false;
         bool comma=false, groupDirsFirst=false, fullTime=false, horiz=false;
         std::string timeStyle="default";
+        std::string ignorePattern="";
     } opt;
 
     std::vector<std::string> paths;
@@ -1922,6 +1924,8 @@ void cmd_ls(const std::vector<std::string>& args) {
         else if (a=="-o") {opt.longFmt=true; opt.omitGroup=true;}
         else if (a=="-g") {opt.longFmt=true; opt.omitOwner=true;}
         else if (a=="-p") opt.appendSlash=true;
+        else if ((a=="-I"||a=="--ignore") && i+1<args.size()) {opt.ignorePattern=args[++i];}
+        else if (a.rfind("--ignore=",0)==0) {opt.ignorePattern=a.substr(9);}
         else if (a=="-i"||a=="--inode") opt.inode=true;
         else if (a=="-s"||a=="--size") opt.blocks=true;
         else if (a=="-1") opt.oneLine=true;
@@ -1985,6 +1989,27 @@ void cmd_ls(const std::vector<std::string>& args) {
                 if (!opt.almostAll && (name.size()>0 && name[0]=='.')) continue;
             }
             if (opt.ignoreBackups && !name.empty() && name.back()=='~') continue;
+            // Check ignore pattern
+            if (!opt.ignorePattern.empty()) {
+                bool matches = false;
+                const char* p = opt.ignorePattern.c_str();
+                const char* s = name.c_str();
+                while (*p) {
+                    if (*p == '*') {
+                        if (*(p+1) == 0) { matches = true; break; }
+                        while (*s && *s != *(p+1)) s++;
+                        if (!*s) { matches = false; break; }
+                        p++;
+                    } else if (*p == '?' || *p == *s) {
+                        p++; s++;
+                    } else {
+                        break;
+                    }
+                }
+                while (*p == '*') p++;
+                if (!*p && !*s) matches = true;
+                if (matches) continue;
+            }
             if (opt.listDir && name!=win && name!="." && name!="..") { /*noop*/ }
             Entry e; e.name=name; e.fullPath = opt.listDir ? win : (win + (win.back()=='\\'?"":"\\") + name);
             e.attrs=fd.dwFileAttributes; e.isDir = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)!=0;
@@ -2820,11 +2845,12 @@ void cmd_du(const std::vector<std::string>& args) {
         output("  -k                       like --block-size=1K");
         output("  -m                       like --block-size=1M");
         output("  -s, --summarize          display only a total for each argument");
+        output("  -x, --one-file-system    skip directories on different file systems");
         output("      --help               display this help and exit");
         return;
     }
 
-    bool human = false, si = false, summarize = false, allFiles = false, grandTotal = false, apparent = false;
+    bool human = false, si = false, summarize = false, allFiles = false, grandTotal = false, apparent = false, oneFileSystem = false;
     long long blockSize = 1024; // default 1K
     int maxDepth = -1;
     std::vector<std::string> paths;
@@ -2869,6 +2895,7 @@ void cmd_du(const std::vector<std::string>& args) {
         else if (a.rfind("--block-size=",0)==0) { blockSize = parseBlock(a.substr(13)); }
         else if (a == "--block-size" && i + 1 < args.size()) { blockSize = parseBlock(args[++i]); }
         else if (a == "-s" || a == "--summarize") summarize = true;
+        else if (a == "-x" || a == "--one-file-system") oneFileSystem = true;
         else if (a.rfind("--exclude=",0)==0) { excludePatterns.push_back(a.substr(10)); }
         else if (a == "--exclude" && i + 1 < args.size()) { excludePatterns.push_back(args[++i]); }
         else if (a.rfind("--exclude-from=",0)==0) { loadExcludes(a.substr(15)); }
@@ -2910,8 +2937,31 @@ void cmd_du(const std::vector<std::string>& args) {
 
     struct Stats { unsigned long long size=0; };
 
+    // Get volume name for filesystem comparison
+    auto getVolumeName = [](const std::string& path) -> std::string {
+        char volumePath[MAX_PATH];
+        if (GetVolumePathNameA(path.c_str(), volumePath, MAX_PATH)) {
+            return std::string(volumePath);
+        }
+        return "";
+    };
+
+    std::string startVolume;
+    if (oneFileSystem && !paths.empty()) {
+        std::string firstWinPath = unixPathToWindows(paths[0]);
+        startVolume = getVolumeName(firstWinPath.empty() ? paths[0] : firstWinPath);
+    }
+
     std::function<unsigned long long(const std::string&, const std::string&, int)> walk;
     walk = [&](const std::string& winPath, const std::string& dispPath, int depth) -> unsigned long long {
+        // Check filesystem boundary
+        if (oneFileSystem && !startVolume.empty()) {
+            std::string currentVolume = getVolumeName(winPath);
+            if (!currentVolume.empty() && currentVolume != startVolume) {
+                return 0; // Skip this directory - different filesystem
+            }
+        }
+
         WIN32_FIND_DATAA fd;
         DWORD attrs = GetFileAttributesA(winPath.c_str());
         if (attrs == INVALID_FILE_ATTRIBUTES) {
@@ -4547,6 +4597,7 @@ struct GrepConfig {
     bool textMode = false; // -a
     bool binaryMode = false; // -U
     bool ignoreBinary = false; // -I
+    bool nullDataMode = false; // -z (NUL-terminated input)
     int maxCount = -1; // -m
     
     std::vector<std::string> includeGlobs;
@@ -4701,47 +4752,65 @@ static void grepProcessFile(const std::string& path, GrepConfig& cfg, bool print
         return result;
     };
     
-    while (std::getline(file, line)) {
-        if (!line.empty() && line.back() == '\r') line.pop_back();
-        lineNum++;
-        long long currentOffset = byteOffset;
-        byteOffset += line.length() + 1;
-
-        bool match = false;
-        std::smatch sm;
+    // Read input with NUL delimiter when -z is set
+    if (cfg.nullDataMode) {
+        // Read entire file for NUL-delimited processing
+        file.clear();
+        file.seekg(0);
+        char buffer[8192];
+        std::string accumulated;
         
-        if (cfg.fixedStrings) {
-            std::string l = line;
-            std::string p = cfg.fixedPattern;
-            if (cfg.ignoreCase) {
-                std::transform(l.begin(), l.end(), l.begin(), ::tolower);
-                std::transform(p.begin(), p.end(), p.begin(), ::tolower);
-            }
-            if (cfg.wordRegexp) {
-                 size_t pos = l.find(p);
-                 while (pos != std::string::npos) {
-                     bool startOk = (pos == 0 || !isalnum(l[pos-1]) && l[pos-1] != '_');
-                     bool endOk = (pos + p.length() == l.length() || !isalnum(l[pos+p.length()]) && l[pos+p.length()] != '_');
-                     if (startOk && endOk) { match = true; break; }
-                     pos = l.find(p, pos + 1);
-                 }
-            } else if (cfg.lineRegexp) {
-                match = (l == p);
-            } else {
-                match = (l.find(p) != std::string::npos);
-            }
-        } else {
-             if (cfg.lineRegexp) match = std::regex_match(line, sm, cfg.regex);
-             else match = std::regex_search(line, sm, cfg.regex);
+        while (file.read(buffer, sizeof(buffer)) || file.gcount() > 0) {
+            accumulated.append(buffer, file.gcount());
         }
         
-        if (cfg.invertMatch) match = !match;
+        // Split by NUL byte
+        size_t pos = 0;
+        while (pos < accumulated.length()) {
+            size_t nulPos = accumulated.find('\0', pos);
+            if (nulPos == std::string::npos) nulPos = accumulated.length();
+            
+            line = accumulated.substr(pos, nulPos - pos);
+            lineNum++;
+            long long currentOffset = byteOffset;
+            byteOffset += line.length() + 1;
+
+            bool match = false;
+            std::smatch sm;
+            
+            if (cfg.fixedStrings) {
+                std::string l = line;
+                std::string p = cfg.fixedPattern;
+                if (cfg.ignoreCase) {
+                    std::transform(l.begin(), l.end(), l.begin(), ::tolower);
+                    std::transform(p.begin(), p.end(), p.begin(), ::tolower);
+                }
+                if (cfg.wordRegexp) {
+                     size_t pos = l.find(p);
+                     while (pos != std::string::npos) {
+                         bool startOk = (pos == 0 || !isalnum(l[pos-1]) && l[pos-1] != '_');
+                         bool endOk = (pos + p.length() == l.length() || !isalnum(l[pos+p.length()]) && l[pos+p.length()] != '_');
+                         if (startOk && endOk) { match = true; break; }
+                         pos = l.find(p, pos + 1);
+                     }
+                } else if (cfg.lineRegexp) {
+                    match = (l == p);
+                } else {
+                    match = (l.find(p) != std::string::npos);
+                }
+            } else {
+                 if (cfg.lineRegexp) match = std::regex_match(line, sm, cfg.regex);
+                 else match = std::regex_search(line, sm, cfg.regex);
+            }
+            
+            if (cfg.invertMatch) match = !match;
+            
+            if (match) {
+                matchCount++;
+                if (cfg.count) continue;
+                if (cfg.filesWithMatches) { output(displayPath); return; }
+                if (cfg.filesWithoutMatch) return;
         
-        if (match) {
-            matchCount++;
-            if (cfg.count) continue;
-            if (cfg.filesWithMatches) { output(displayPath); return; }
-            if (cfg.filesWithoutMatch) return;
             if (cfg.silent) return;
             
             while (!contextBuf.empty()) {
@@ -4818,6 +4887,129 @@ static void grepProcessFile(const std::string& path, GrepConfig& cfg, bool print
                  if (contextBuf.size() > (size_t)cfg.contextBefore) contextBuf.pop_front();
             }
         }
+        pos = nulPos + 1;
+        }
+    } else {
+        // Normal line-by-line processing with newline delimiter
+        while (std::getline(file, line)) {
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            lineNum++;
+            long long currentOffset = byteOffset;
+            byteOffset += line.length() + 1;
+
+            bool match = false;
+            std::smatch sm;
+            
+            if (cfg.fixedStrings) {
+                std::string l = line;
+                std::string p = cfg.fixedPattern;
+                if (cfg.ignoreCase) {
+                    std::transform(l.begin(), l.end(), l.begin(), ::tolower);
+                    std::transform(p.begin(), p.end(), p.begin(), ::tolower);
+                }
+                if (cfg.wordRegexp) {
+                     size_t pos = l.find(p);
+                     while (pos != std::string::npos) {
+                         bool startOk = (pos == 0 || !isalnum(l[pos-1]) && l[pos-1] != '_');
+                         bool endOk = (pos + p.length() == l.length() || !isalnum(l[pos+p.length()]) && l[pos+p.length()] != '_');
+                         if (startOk && endOk) { match = true; break; }
+                         pos = l.find(p, pos + 1);
+                     }
+                } else if (cfg.lineRegexp) {
+                    match = (l == p);
+                } else {
+                    match = (l.find(p) != std::string::npos);
+                }
+            } else {
+                 if (cfg.lineRegexp) match = std::regex_match(line, sm, cfg.regex);
+                 else match = std::regex_search(line, sm, cfg.regex);
+            }
+            
+            if (cfg.invertMatch) match = !match;
+            
+            if (match) {
+                matchCount++;
+                if (cfg.count) continue;
+                if (cfg.filesWithMatches) { output(displayPath); return; }
+                if (cfg.filesWithoutMatch) return;
+                
+                if (cfg.silent) return;
+                
+                while (!contextBuf.empty()) {
+                    auto& p = contextBuf.front();
+                    std::stringstream ss;
+                    if (printFileName) {
+                        if (useColor) ss << COLOR_FILENAME << displayPath << COLOR_RESET;
+                        else ss << displayPath;
+                        ss << (cfg.nullAfterName ? '\0' : '-');
+                    }
+                    if (cfg.lineNumbers) {
+                        if (useColor) ss << COLOR_LINENUM << p.first << COLOR_RESET << COLOR_SEP << "-" << COLOR_RESET;
+                        else ss << p.first << "-";
+                    }
+                    ss << p.second;
+                    output(ss.str());
+                    contextBuf.pop_front();
+                }
+                
+                std::stringstream ss;
+                if (printFileName) {
+                    if (useColor) ss << COLOR_FILENAME << displayPath << COLOR_RESET;
+                    else ss << displayPath;
+                    ss << (cfg.nullAfterName ? '\0' : ':');
+                }
+                if (cfg.lineNumbers) {
+                    if (useColor) ss << COLOR_LINENUM << lineNum << COLOR_RESET << COLOR_SEP << ":" << COLOR_RESET;
+                    else ss << lineNum << ":";
+                }
+                if (cfg.byteOffset) ss << currentOffset << ":";
+                if (cfg.initialTab) ss << "\t";
+                
+                if (cfg.onlyMatching && !cfg.invertMatch && !cfg.fixedStrings) {
+                     std::string subject = line;
+                     while (std::regex_search(subject, sm, cfg.regex)) {
+                         std::stringstream mss;
+                         if (printFileName) {
+                             if (useColor) mss << COLOR_FILENAME << displayPath << COLOR_RESET << ":";
+                             else mss << displayPath << ":";
+                         }
+                         if (cfg.lineNumbers) {
+                             if (useColor) mss << COLOR_LINENUM << lineNum << COLOR_RESET << COLOR_SEP << ":" << COLOR_RESET;
+                             else mss << lineNum << ":";
+                         }
+                         if (useColor) mss << COLOR_MATCH << sm.str() << COLOR_RESET;
+                         else mss << sm.str();
+                         output(mss.str());
+                         subject = sm.suffix();
+                     }
+                } else {
+                     ss << colorizeMatch(line);
+                     output(ss.str());
+                }
+                printContextAfter = cfg.contextAfter;
+                if (cfg.maxCount != -1 && matchCount >= cfg.maxCount) break;
+                
+            } else {
+                if (printContextAfter > 0) {
+                     std::stringstream ss;
+                     if (printFileName) {
+                         if (useColor) ss << COLOR_FILENAME << displayPath << COLOR_RESET;
+                         else ss << displayPath;
+                         ss << (cfg.nullAfterName ? '\0' : '-');
+                     }
+                     if (cfg.lineNumbers) {
+                         if (useColor) ss << COLOR_LINENUM << lineNum << COLOR_RESET << COLOR_SEP << "-" << COLOR_RESET;
+                         else ss << lineNum << "-";
+                     }
+                     ss << line;
+                     output(ss.str());
+                     printContextAfter--;
+                } else if (cfg.contextBefore > 0) {
+                     contextBuf.push_back({lineNum, line});
+                     if (contextBuf.size() > (size_t)cfg.contextBefore) contextBuf.pop_front();
+                }
+            }
+        }
     }
     
     if (cfg.filesWithoutMatch && matchCount == 0 && !cfg.silent) output(displayPath);
@@ -4866,6 +5058,8 @@ void cmd_grep(const std::vector<std::string>& args) {
         output("  -L, --files-without-match  print only names of FILEs containing no match");
         output("  -o, --only-matching        show only the part of a line matching PATTERN");
         output("  -r, -R, --recursive        recursively search directories");
+        output("  -z, --null-data            treat input as NUL-terminated records");
+        output("  -Z, --null                 separate output with NUL instead of newline");
         output("  -A, --after-context=NUM    print NUM lines of trailing context");
         output("  -B, --before-context=NUM   print NUM lines of leading context");
         output("  -C, --context=NUM          print NUM lines of output context");
@@ -4939,6 +5133,7 @@ void cmd_grep(const std::vector<std::string>& args) {
             else if (arg == "-U" || arg == "--binary") cfg.binaryMode = true;
             else if (arg == "-T" || arg == "--initial-tab") cfg.initialTab = true;
             else if (arg == "-Z" || arg == "--null") cfg.nullAfterName = true;
+            else if (arg == "-z" || arg == "--null-data") cfg.nullDataMode = true;
             else if (arg == "--color" || arg == "--colour") {
                 useColor = true;
                 colorWhen = "always";
@@ -5008,6 +5203,8 @@ void cmd_grep(const std::vector<std::string>& args) {
                          case 'H': cfg.withFilename = true; break;
                          case 'r': case 'R': cfg.recursive = true; break;
                          case 'o': cfg.onlyMatching = true; break;
+                         case 'z': cfg.nullDataMode = true; break;
+                         case 'Z': cfg.nullAfterName = true; break;
                      }
                  }
             }
@@ -5083,7 +5280,11 @@ void cmd_grep(const std::vector<std::string>& args) {
                         ss << lineNum << ":";
                     }
                     ss << line;
-                    output(ss.str());
+                    if (cfg.nullAfterName) {
+                        std::cout << ss.str() << '\0' << std::flush;
+                    } else {
+                        output(ss.str());
+                    }
                     
                     if (cfg.maxCount != -1 && matchCount >= cfg.maxCount) break;
                 }
@@ -6359,8 +6560,8 @@ void cmd_chmod(const std::vector<std::string>& args) {
             }
         }
         
-        if (success && verbose && !changesOnly) {
-            output("mode of '" + filepath + "' changed");
+        if (success && (verbose || changesOnly)) {
+            output("mode of '" + filepath + "' changed to " + mode);
         }
         
         // Cleanup
@@ -6824,17 +7025,15 @@ void cmd_chown(const std::vector<std::string>& args) {
         
         // Output diagnostic
         if (verbose || changesOnly) {
-            std::string msg = "ownership of '" + unixPath + "'";
+            std::string msg = "ownership of '" + unixPath + "' changed";
             if (useOwnerSid && useGroupSid) {
-                msg += " changed";
+                msg = "changed ownership of '" + unixPath + "' to " + owner + ":" + group;
             } else if (useOwnerSid) {
-                msg += " changed";
+                msg = "changed ownership of '" + unixPath + "' to " + owner;
             } else if (useGroupSid) {
-                msg += " changed";
+                msg = "changed group of '" + unixPath + "' to " + group;
             }
-            if (verbose || changesOnly) {
-                output(msg);
-            }
+            output(msg);
         }
         
         return true;
@@ -32028,7 +32227,7 @@ void cmd_sort(const std::vector<std::string>& args) {
         std::srand(std::time(nullptr));
         std::random_shuffle(lines.begin(), lines.end());
     } else {
-        std::stable_sort(lines.begin(), lines.end(), [&](const std::string& a, const std::string& b) {
+        auto comparator = [&](const std::string& a, const std::string& b) {
             std::string keyA = processKey(getKey(a));
             std::string keyB = processKey(getKey(b));
             
@@ -32054,7 +32253,13 @@ void cmd_sort(const std::vector<std::string>& args) {
             }
             
             return reverse ? !result : result;
-        });
+        };
+        
+        if (stable) {
+            std::stable_sort(lines.begin(), lines.end(), comparator);
+        } else {
+            std::sort(lines.begin(), lines.end(), comparator);
+        }
     }
     
     // Remove duplicates if requested
@@ -36426,20 +36631,27 @@ void cmd_uniq(const std::vector<std::string>& args) {
     groups.push_back(currentGroup);
     
     // Output results
-    std::ostream* outStream = &std::cout;
     std::ofstream outFile;
+    bool useFile = !outputFile.empty();
     
-    if (!outputFile.empty()) {
+    if (useFile) {
         outFile.open(unixPathToWindows(outputFile));
         if (!outFile.is_open()) {
             outputError("uniq: cannot create '" + outputFile + "'");
             return;
         }
-        outStream = &outFile;
     }
     
     char outputDelim = zeroTerminated ? '\0' : '\n';
     bool firstGroup = true;
+    
+    auto outputLine = [&](const std::string& line) {
+        if (useFile) {
+            outFile << line << outputDelim;
+        } else {
+            output(line);
+        }
+    };
     
     for (size_t i = 0; i < results.size(); i++) {
         bool isDuplicate = results[i].second > 1;
@@ -36453,13 +36665,13 @@ void cmd_uniq(const std::vector<std::string>& args) {
         // Group separators
         if (!groupMethod.empty()) {
             if (!firstGroup && (groupMethod == "separate" || groupMethod == "both" || groupMethod == "prepend")) {
-                output("");
+                outputLine("");
             }
             firstGroup = false;
         }
         
         if (allRepeatedMethod == "prepend" && isDuplicate) {
-            output("");
+            outputLine("");
         }
         
         // Output line(s)
@@ -36467,26 +36679,26 @@ void cmd_uniq(const std::vector<std::string>& args) {
             // Print all instances of duplicate
             for (const auto& line : groups[i]) {
                 if (showCount) {
-                    output(padRight(std::to_string(results[i].second), 7) + " " + line);
+                    outputLine(padRight(std::to_string(results[i].second), 7) + " " + line);
                 } else {
-                    output(line);
+                    outputLine(line);
                 }
             }
         } else {
             // Print one instance
             if (showCount) {
-                output(padRight(std::to_string(results[i].second), 7) + " " + results[i].first);
+                outputLine(padRight(std::to_string(results[i].second), 7) + " " + results[i].first);
             } else {
-                output(results[i].first);
+                outputLine(results[i].first);
             }
         }
         
         if (allRepeatedMethod == "separate" && isDuplicate && i + 1 < results.size()) {
-            output("");
+            outputLine("");
         }
         
         if (!groupMethod.empty() && (groupMethod == "append" || groupMethod == "both") && i + 1 < results.size()) {
-            output("");
+            outputLine("");
         }
     }
     
@@ -50729,6 +50941,7 @@ struct FindCriteria {
     bool followSymlinks = false;
     bool xdev = false;  // Don't descend into different filesystems
     bool prune = false;
+    bool depthFirst = false;  // Process directory after its contents when true
     
     // Actions
     bool doPrint = true;
@@ -50935,17 +51148,9 @@ void findSearchRecursive(const std::string& basePath, const std::string& current
         std::string fullPath = currentPath + "\\" + fileName;
         bool isDir = (findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
         bool isLink = (findData.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
-        
-        // Check mindepth
-        if (currentDepth < criteria.minDepth) {
-            if (isDir && !isLink) {
-                bool localPrune = false;
-                findSearchRecursive(basePath, fullPath, criteria, currentDepth + 1, matchCount, localPrune, baseVolume);
-            }
-            continue;
-        }
-        
-        // Check -xdev (don't cross filesystem boundaries)
+        bool canDescend = isDir && !isLink && currentDepth < criteria.maxDepth && !shouldPrune;
+
+        // Check -xdev (don't cross filesystem boundaries) before deciding to descend or test
         if (criteria.xdev && isDir) {
             char volumeName[MAX_PATH];
             if (GetVolumePathNameA(fullPath.c_str(), volumeName, MAX_PATH)) {
@@ -50956,6 +51161,21 @@ void findSearchRecursive(const std::string& basePath, const std::string& current
                     }
                 }
             }
+        }
+
+        // Honor mindepth by recursing without evaluating until minDepth is reached
+        if (currentDepth < criteria.minDepth) {
+            if (canDescend) {
+                bool localPrune = false;
+                findSearchRecursive(basePath, fullPath, criteria, currentDepth + 1, matchCount, localPrune, baseVolume);
+            }
+            continue;
+        }
+
+        // For -depth, process children before evaluating the directory itself
+        if (criteria.depthFirst && canDescend) {
+            bool localPrune = false;
+            findSearchRecursive(basePath, fullPath, criteria, currentDepth + 1, matchCount, localPrune, baseVolume);
         }
         
         bool matches = true;
@@ -51272,8 +51492,8 @@ void findSearchRecursive(const std::string& basePath, const std::string& current
             }
         }
         
-        // Recurse into subdirectories (unless pruned)
-        if (isDir && !isLink && currentDepth < criteria.maxDepth && !shouldPrune) {
+        // Recurse into subdirectories (unless pruned) when not using -depth
+        if (!criteria.depthFirst && canDescend && !shouldPrune) {
             bool localPrune = false;
             findSearchRecursive(basePath, fullPath, criteria, currentDepth + 1, matchCount, localPrune, baseVolume);
         }
@@ -51318,6 +51538,7 @@ void cmd_find(const std::vector<std::string>& args) {
         output("  -executable       File is executable");
         output("");
         output("TRAVERSAL OPTIONS:");
+        output("  -depth            Process contents before directory (post-order)");
         output("  -maxdepth n       Descend at most n directory levels");
         output("  -mindepth n       Do not apply tests at levels less than n");
         output("  -prune            Don't descend into this directory");
@@ -51596,6 +51817,9 @@ void cmd_find(const std::vector<std::string>& args) {
                 criteria.minDepth = std::atoi(args[++i].c_str());
             }
             // Traversal options
+            else if (arg == "-depth") {
+                criteria.depthFirst = true;
+            }
             else if (arg == "-follow" || arg == "-L") {
                 criteria.followSymlinks = true;
             } else if (arg == "-xdev") {
