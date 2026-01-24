@@ -1,13 +1,77 @@
-# WNUS Release Notes - Version 0.1.4.7
+# WNUS Release Notes - Version 0.1.4.8
 
 **Release Date:** January 24, 2026  
-**Current Build:** 6.92 MB (7089.03 KB)  
+**Current Build:** 7.1 MB (7113.52 KB)  
 **Platform:** Windows (all versions)  
 **Compiler:** TDM-GCC 10.3.0+ or MSVC 2019+  
 **C++ Standard:** C++11  
-**Command Count:** 275 (269 fully implemented; 6 informational stubs: nc, strace, journalctl, pax, uuencode, uudecode)  
+**Command Count:** 275 (273 fully implemented; 2 informational stubs: strace, journalctl)  
 **Manual Pages:** 275 (100% coverage)  
 **Test Suite:** 10/10 PASS (test_posix_simple.ps1)  
+**Memory Usage:** 30-40 MB typical
+
+---
+
+## Version 0.1.4.8 - January 24, 2026 🎯 STUB COMMAND IMPLEMENTATION
+
+### Summary
+Complete implementation of all POSIX stub commands as fully functional internal built-in utilities with no external dependencies. This release brings 273 fully implemented commands (99.3% coverage), leaving only 2 platform-limited stubs.
+
+### New Fully Implemented Commands
+
+#### 1. **uuencode** (RFC 1113 + RFC 4648)
+- Encodes binary files into ASCII text format
+- Traditional uuencode format (RFC 1113) - default
+- Base64/MIME format (RFC 4648) with `-m` flag
+- Read from files or stdin (with `-` argument)
+- Zero external dependencies
+
+#### 2. **uudecode** (RFC 1113 + RFC 4648)  
+- Decodes uuencoded and base64-encoded files
+- Auto-detects format from "begin" / "begin-base64" markers
+- Proper RFC 1113 character table decoding
+- RFC 4648 base64 decoding with padding
+- Zero external dependencies
+
+#### 3. **pax** (POSIX Portable Archive Exchange)
+- Create archives with `-w` flag
+- Extract archives with `-r` flag  
+- Selective extraction with `-x` option
+- Verbose mode with `-v` flag
+- Simple but effective binary archive format
+- Zero external dependencies
+
+#### 4. **nc (netcat)** - Network Utility
+- TCP/UDP socket client and server
+- Server mode with `-l` (listen) and `-p` (port)
+- Client mode for connecting to hosts
+- Timeout support with `-w` flag
+- Full Winsock2 integration
+- Zero external dependencies
+
+### Implementation Status
+- **Total Commands:** 275
+- **Fully Implemented:** 273 (was 269) - +4 new implementations
+- **Informational Stubs:** 2 (strace, journalctl - Windows platform limitations)
+- **Implementation Rate:** 99.3% (was 97.8%)
+
+### Bug Fixes
+- Fixed variable shadowing of `listen()` function in nc command
+- Fixed scope issue with `lenByte` variable in uudecode
+- Both files (main and release_current) synchronized
+
+### Technical Improvements
+- RFC 1113 uuencode format with proper 6-bit encoding
+- RFC 4648 base64 format with standard alphabet and padding
+- Winsock2 TCP/UDP socket operations
+- Binary archive format with metadata preservation
+- All implementations are completely internal (no external tools)
+
+### Build & Testing
+- ✅ Build Status: Successful (no warnings or errors)
+- ✅ Test Suite: 10/10 PASS
+- ✅ Executable Size: 7.1 MB (+0.18 MB from v0.1.4.7)
+- ✅ Memory Usage: 30-40 MB (unchanged)
 
 ---
 

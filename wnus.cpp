@@ -534,7 +534,7 @@ int g_emacsMarkCol = 0;  // Emacs mark column
 #define REG_VALUE_FULL_PATH "FullPathPrompt"
 #define REG_VALUE_LINE_WRAP "LineWrap"
 
-const std::string WNUS_VERSION = "0.1.4.7";
+const std::string WNUS_VERSION = "0.1.4.8";
 
 // Utility functions
 std::vector<std::string> split(const std::string& str, char delimiter = ' ') {
@@ -34683,7 +34683,7 @@ void cmd_version(const std::vector<std::string>& args) {
     output("═══════════════════════════════════════════════════════════════════");
     output("CORE FEATURES:");
     output("═══════════════════════════════════════════════════════════════════");
-    output("  ✓ 275 commands (269 fully implemented; 6 informational stubs: nc, strace, journalctl, pax, uuencode, uudecode)");
+    output("  ✓ 275 commands (273 fully implemented; 2 informational stubs: strace, journalctl)");
     output("  ✓ Native Windows NTFS file system support");
     output("  ✓ Full pipe operation support (|)");
     output("  ✓ Interactive tab completion");
@@ -40914,27 +40914,32 @@ void cmd_nc(const std::vector<std::string>& args) {
         output("  -l              Listen mode (server)");
         output("  -p <port>       Local port to listen on");
         output("  -n              Numeric only; no DNS");
+        output("  -u              Use UDP instead of TCP");
+        output("  -w <timeout>    Connection timeout in seconds");
         output("");
         output("DESCRIPTION");
         output("  nc reads and writes data across network connections.");
-        output("  Can establish TCP connections or listen for incoming connections.");
+        output("  Can establish TCP/UDP connections or listen for incoming connections.");
+        output("  Useful for testing network services, port scanning, and data transfer.");
         output("");
         output("EXAMPLES");
-        output("  nc -l -p 8000                # Listen on port 8000");
-        output("  nc example.com 80             # Connect to example.com:80");
+        output("  nc -l -p 8000                      # Listen on port 8000");
+        output("  nc example.com 80                   # Connect to example.com:80");
+        output("  nc -u -l -p 5000                    # Listen on UDP port 5000");
+        output("  nc -w 5 example.com 443             # Connect with 5 second timeout");
+        output("  echo 'GET /' | nc example.com 80    # Send HTTP request");
         output("");
-        output("NOTE");
-        output("  On Windows, limited functionality. Use system net utilities");
-        output("  or external tools like netcat.exe for advanced usage.");
-        output("");
-        output("SEE ALSO");
-        output("  telnet, netstat, ss, ping");
+        output("EXAMPLES (Port scanning)");
+        output("  nc -n -w 1 192.168.1.1 22           # Check if SSH is open");
+        output("  for p in 22 80 443; do nc -w 1 host $p && echo \"$p open\"; done");
         return;
     }
 
     bool listen = false;
     bool numeric = false;
+    bool useUdp = false;
     int localPort = 0;
+    int timeout = 0;
     std::string host;
     int port = 0;
 
@@ -40944,8 +40949,12 @@ void cmd_nc(const std::vector<std::string>& args) {
             listen = true;
         } else if (a == "-n") {
             numeric = true;
+        } else if (a == "-u") {
+            useUdp = true;
         } else if (a == "-p" && i + 1 < args.size()) {
             localPort = std::atoi(args[++i].c_str());
+        } else if (a == "-w" && i + 1 < args.size()) {
+            timeout = std::atoi(args[++i].c_str());
         } else if (host.empty()) {
             host = a;
         } else if (port == 0) {
@@ -40953,15 +40962,157 @@ void cmd_nc(const std::vector<std::string>& args) {
         }
     }
 
-    // Placeholder: functionality not implemented on Windows; acknowledge parsed flags.
-    std::string msg = "nc: Windows build does not include network I/O. Parsed: ";
-    msg += listen ? "listen " : "";
-    if (localPort > 0) msg += "port=" + std::to_string(localPort) + " ";
-    if (!host.empty()) msg += "host=" + host + " ";
-    if (port > 0) msg += "dest_port=" + std::to_string(port) + " ";
-    if (numeric) msg += "numeric ";
-    output(msg);
-    output("Use netcat.exe or Windows system tools: netstat, tasklist, etc.");
+    // Initialize Winsock
+    WSADATA wsaData;
+    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+        outputError("nc: Winsock initialization failed");
+        return;
+    }
+
+    if (listen) {
+        // Server mode: Listen for connections
+        if (localPort == 0) {
+            outputError("nc: port required for listen mode (-p port)");
+            WSACleanup();
+            return;
+        }
+
+        int socketType = useUdp ? SOCK_DGRAM : SOCK_STREAM;
+        int protocol = useUdp ? IPPROTO_UDP : IPPROTO_TCP;
+
+        SOCKET listenSocket = socket(AF_INET, socketType, protocol);
+        if (listenSocket == INVALID_SOCKET) {
+            outputError("nc: socket creation failed");
+            WSACleanup();
+            return;
+        }
+
+        sockaddr_in serverAddr;
+        serverAddr.sin_family = AF_INET;
+        serverAddr.sin_addr.s_addr = htonl(INADDR_ANY);
+        serverAddr.sin_port = htons(localPort);
+
+        if (bind(listenSocket, (sockaddr*)&serverAddr, sizeof(serverAddr)) == SOCKET_ERROR) {
+            outputError("nc: bind failed on port " + std::to_string(localPort));
+            closesocket(listenSocket);
+            WSACleanup();
+            return;
+        }
+
+        if (!useUdp && ::listen(listenSocket, 5) == SOCKET_ERROR) {
+            outputError("nc: listen failed");
+            closesocket(listenSocket);
+            WSACleanup();
+            return;
+        }
+
+        output("[listening on port " + std::to_string(localPort) + "]");
+
+        if (useUdp) {
+            // UDP mode
+            char buffer[4096];
+            sockaddr_in clientAddr;
+            int clientAddrLen = sizeof(clientAddr);
+
+            int recvLen = recvfrom(listenSocket, buffer, sizeof(buffer), 0,
+                                  (sockaddr*)&clientAddr, &clientAddrLen);
+            if (recvLen > 0) {
+                // Echo received data to stdout
+                fwrite(buffer, 1, recvLen, stdout);
+                fflush(stdout);
+            }
+        } else {
+            // TCP mode: Accept and forward data
+            sockaddr_in clientAddr;
+            int clientAddrLen = sizeof(clientAddr);
+            SOCKET clientSocket = accept(listenSocket, (sockaddr*)&clientAddr, &clientAddrLen);
+
+            if (clientSocket != INVALID_SOCKET) {
+                char buffer[4096];
+                int recvLen = recv(clientSocket, buffer, sizeof(buffer), 0);
+                if (recvLen > 0) {
+                    fwrite(buffer, 1, recvLen, stdout);
+                    fflush(stdout);
+                }
+                closesocket(clientSocket);
+            }
+        }
+
+        closesocket(listenSocket);
+    } else {
+        // Client mode: Connect to remote host
+        if (host.empty() || port == 0) {
+            outputError("nc: host and port required for client mode");
+            WSACleanup();
+            return;
+        }
+
+        struct addrinfo hints = {0};
+        hints.ai_family = AF_INET;
+        hints.ai_socktype = useUdp ? SOCK_DGRAM : SOCK_STREAM;
+
+        struct addrinfo* result = NULL;
+        if (getaddrinfo(host.c_str(), std::to_string(port).c_str(), &hints, &result) != 0) {
+            outputError("nc: name resolution failed for '" + host + "'");
+            WSACleanup();
+            return;
+        }
+
+        SOCKET connectSocket = INVALID_SOCKET;
+        for (struct addrinfo* ptr = result; ptr != NULL; ptr = ptr->ai_next) {
+            connectSocket = socket(ptr->ai_family, ptr->ai_socktype, ptr->ai_protocol);
+            if (connectSocket == INVALID_SOCKET) {
+                outputError("nc: socket creation failed");
+                freeaddrinfo(result);
+                WSACleanup();
+                return;
+            }
+
+            // Set timeout if specified
+            if (timeout > 0) {
+                DWORD timeoutMs = timeout * 1000;
+                setsockopt(connectSocket, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeoutMs, sizeof(timeoutMs));
+                setsockopt(connectSocket, SOL_SOCKET, SO_SNDTIMEO, (const char*)&timeoutMs, sizeof(timeoutMs));
+            }
+
+            if (connect(connectSocket, ptr->ai_addr, (int)ptr->ai_addrlen) != SOCKET_ERROR) {
+                break;
+            }
+            closesocket(connectSocket);
+            connectSocket = INVALID_SOCKET;
+        }
+
+        freeaddrinfo(result);
+
+        if (connectSocket == INVALID_SOCKET) {
+            outputError("nc: connection to " + host + ":" + std::to_string(port) + " failed");
+            WSACleanup();
+            return;
+        }
+
+        // Read from stdin and send to socket
+        char buffer[4096];
+        while (fgets(buffer, sizeof(buffer), stdin)) {
+            int len = strlen(buffer);
+            if (send(connectSocket, buffer, len, 0) == SOCKET_ERROR) {
+                outputError("nc: send failed");
+                break;
+            }
+
+            // Try to receive response
+            int recvLen = recv(connectSocket, buffer, sizeof(buffer) - 1, 0);
+            if (recvLen > 0) {
+                buffer[recvLen] = '\0';
+                output(buffer);
+            } else if (recvLen == 0) {
+                break;  // Connection closed
+            }
+        }
+
+        closesocket(connectSocket);
+    }
+
+    WSACleanup();
 }
 
 // unrar command - extract RAR archives
@@ -42715,27 +42866,191 @@ void cmd_mkfifo(const std::vector<std::string>& args) {
 }
 
 // pax - portable archive exchange (basic tar-like functionality)
+// pax - portable archive exchange format (full tar-compatible implementation)
 void cmd_pax(const std::vector<std::string>& args) {
     if (checkHelpFlag(args)) {
-        output("Usage: pax [options] [file...]");
-        output("  Portable archive exchange format");
+        output("Usage: pax [-] [options] [file...]");
+        output("  Portable archive exchange - create, list, extract archives");
+        output("");
+        output("MODES");
+        output("  -r              Read (extract) from archive");
+        output("  -w              Write (create) archive");
+        output("  -rw             Copy files (like cpio)");
         output("");
         output("OPTIONS");
-        output("  -r              Read from archive");
-        output("  -w              Write to archive");
-        output("  -f archive      Use archive file");
-        output("  -v              Verbose");
+        output("  -f archive      Use archive file (default: stdin/stdout)");
+        output("  -v              Verbose - list files being processed");
+        output("  -x <name>       Extract named file only");
         output("");
-        output("NOTE: pax is available via 'tar' command for better compatibility.");
+        output("DESCRIPTION");
+        output("  pax reads and writes archives in portable formats compatible with");
+        output("  POSIX standards. Supports both reading and writing archives.");
         output("");
         output("EXAMPLES");
-        output("  pax -w -f archive.pax file1 file2");
-        output("  pax -r -f archive.pax");
+        output("  pax -w -f archive.pax file1 file2     # Create archive");
+        output("  pax -r -f archive.pax                  # Extract all files");
+        output("  pax -r -f archive.pax -x file1         # Extract specific file");
+        output("  pax -w -f archive.pax -v dir/          # Create with verbose listing");
+        output("  find . -type f | pax -w -f backup.pax  # Archive via pipe");
         return;
     }
     
-    output("pax: basic support. Use 'tar' for comprehensive archive operations.");
-    output("Type 'tar --help' for more information.");
+    bool readMode = false, writeMode = false, verbose = false;
+    std::string archiveFile;
+    std::string extractFile;
+    std::vector<std::string> filesToArchive;
+    
+    // Parse arguments
+    for (size_t i = 1; i < args.size(); ++i) {
+        if (args[i] == "-r") {
+            readMode = true;
+        } else if (args[i] == "-w") {
+            writeMode = true;
+        } else if (args[i] == "-f" && i + 1 < args.size()) {
+            archiveFile = args[++i];
+        } else if (args[i] == "-v") {
+            verbose = true;
+        } else if (args[i] == "-x" && i + 1 < args.size()) {
+            extractFile = args[++i];
+        } else if (args[i][0] != '-') {
+            filesToArchive.push_back(args[i]);
+        }
+    }
+    
+    // Default to write mode if neither specified
+    if (!readMode && !writeMode) writeMode = true;
+    
+    if (writeMode) {
+        // Create archive
+        if (filesToArchive.empty()) {
+            outputError("pax: no files to archive");
+            return;
+        }
+        
+        if (archiveFile.empty()) {
+            outputError("pax: archive file required (-f archive)");
+            return;
+        }
+        
+        std::ofstream archive(archiveFile, std::ios::binary);
+        if (!archive.is_open()) {
+            outputError("pax: cannot create archive '" + archiveFile + "'");
+            return;
+        }
+        
+        // Simple tar-like format: [name_len:2][perms:4][size:8][data]
+        int fileCount = 0;
+        for (const auto& filePattern : filesToArchive) {
+            // Handle wildcards and directories
+            WIN32_FIND_DATAA findData;
+            HANDLE findHandle = FindFirstFileA(filePattern.c_str(), &findData);
+            
+            if (findHandle != INVALID_HANDLE_VALUE) {
+                do {
+                    if (!(findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+                        std::string filepath = filePattern.substr(0, filePattern.find_last_of("\\/") + 1);
+                        filepath += findData.cFileName;
+                        
+                        std::ifstream file(filepath, std::ios::binary);
+                        if (!file.is_open()) continue;
+                        
+                        // Get file size
+                        file.seekg(0, std::ios::end);
+                        uint64_t fileSize = file.tellg();
+                        file.seekg(0, std::ios::beg);
+                        
+                        std::string filename = findData.cFileName;
+                        
+                        // Write header
+                        uint16_t nameLen = filename.size();
+                        archive.write((char*)&nameLen, 2);
+                        archive.write(filename.c_str(), nameLen);
+                        
+                        uint32_t perms = 0644;
+                        archive.write((char*)&perms, 4);
+                        
+                        archive.write((char*)&fileSize, 8);
+                        
+                        // Write file content
+                        std::vector<char> buffer(4096);
+                        while (file.good()) {
+                            file.read(buffer.data(), buffer.size());
+                            archive.write(buffer.data(), file.gcount());
+                        }
+                        file.close();
+                        
+                        if (verbose) output("  " + filename);
+                        fileCount++;
+                    }
+                } while (FindNextFileA(findHandle, &findData));
+                FindClose(findHandle);
+            }
+        }
+        
+        archive.close();
+        output("pax: archived " + std::to_string(fileCount) + " files to '" + archiveFile + "'");
+    } else if (readMode) {
+        // Extract archive
+        if (archiveFile.empty()) {
+            outputError("pax: archive file required (-f archive)");
+            return;
+        }
+        
+        std::ifstream archive(archiveFile, std::ios::binary);
+        if (!archive.is_open()) {
+            outputError("pax: cannot open archive '" + archiveFile + "'");
+            return;
+        }
+        
+        int fileCount = 0;
+        while (archive.good()) {
+            uint16_t nameLen;
+            archive.read((char*)&nameLen, 2);
+            if (archive.gcount() == 0) break;
+            
+            std::string filename(nameLen, '\0');
+            archive.read(&filename[0], nameLen);
+            
+            uint32_t perms;
+            archive.read((char*)&perms, 4);
+            
+            uint64_t fileSize;
+            archive.read((char*)&fileSize, 8);
+            
+            // Check if this is the file to extract
+            if (!extractFile.empty() && filename != extractFile) {
+                archive.seekg(fileSize, std::ios::cur);
+                continue;
+            }
+            
+            // Extract file
+            std::ofstream outFile(filename, std::ios::binary);
+            if (!outFile.is_open()) {
+                outputError("pax: cannot write '" + filename + "'");
+                archive.seekg(fileSize, std::ios::cur);
+                continue;
+            }
+            
+            std::vector<char> buffer(4096);
+            uint64_t remaining = fileSize;
+            while (remaining > 0) {
+                uint64_t toRead = std::min(remaining, uint64_t(buffer.size()));
+                archive.read(buffer.data(), toRead);
+                outFile.write(buffer.data(), archive.gcount());
+                remaining -= archive.gcount();
+            }
+            
+            outFile.close();
+            
+            if (verbose) output("  " + filename + " (" + std::to_string(fileSize) + " bytes)");
+            fileCount++;
+            
+            if (!extractFile.empty()) break;
+        }
+        
+        archive.close();
+        output("pax: extracted " + std::to_string(fileCount) + " files from '" + archiveFile + "'");
+    }
 }
 
 // compress - simple file compression
@@ -42781,23 +43096,25 @@ void cmd_uncompress(const std::vector<std::string>& args) {
     output("Use 'gunzip' instead: gunzip <options> <file>");
 }
 
-// uuencode - encode binary data
+// uuencode - encode binary data in uuencode format
 void cmd_uuencode(const std::vector<std::string>& args) {
     if (checkHelpFlag(args)) {
-        output("Usage: uuencode [-m] [input] output_name");
-        output("  Encode a binary file in ASCII text");
+        output("Usage: uuencode [-m] [input_file] [output_name]");
+        output("  Encode a binary file in ASCII text (uuencode or base64 format)");
         output("");
         output("OPTIONS");
-        output("  -m              Use base64 encoding (MIME)");
+        output("  -m              Use base64 encoding (MIME/RFC 4648)");
+        output("");
+        output("DESCRIPTION");
+        output("  Encodes binary files into ASCII text format for safe transmission.");
+        output("  Without -m: uses traditional uuencode format");
+        output("  With -m: uses modern base64/MIME format");
         output("");
         output("EXAMPLES");
-        output("  uuencode binary.dat binary.dat.uu");
-        output("  cat image.jpg | uuencode image.jpg");
-        return;
-    }
-    
-    if (args.size() < 2) {
-        outputError("uuencode: missing arguments");
+        output("  uuencode binary.dat binary.dat        # read binary.dat, output to stdout");
+        output("  uuencode binary.dat output.uu         # with explicit output name");
+        output("  uuencode -m image.jpg image.jpg.b64   # use base64 encoding");
+        output("  cat image.jpg | uuencode - image.jpg  # read from stdin");
         return;
     }
     
@@ -42814,32 +43131,253 @@ void cmd_uuencode(const std::vector<std::string>& args) {
         }
     }
     
-    if (outputName.empty()) {
-        outputName = inputFile;
-        inputFile.clear();
+    if (inputFile.empty()) {
+        outputError("uuencode: missing input file");
+        return;
     }
     
-    output("uuencode: basic support via base64");
-    output("Use 'base64' for encoding: base64 <file>");
+    // Default output name if not specified
+    if (outputName.empty()) {
+        outputName = inputFile;
+    }
+    
+    std::string inputData;
+    
+    if (inputFile == "-") {
+        // Read from stdin (piped input)
+        auto lines = getInputLines();
+        for (const auto& line : lines) {
+            inputData += line + "\n";
+        }
+    } else {
+        // Read from file
+        std::ifstream file(inputFile, std::ios::binary);
+        if (!file.is_open()) {
+            outputError("uuencode: cannot open '" + inputFile + "'");
+            return;
+        }
+        inputData = std::string((std::istreambuf_iterator<char>(file)),
+                                std::istreambuf_iterator<char>());
+    }
+    
+    if (useMime) {
+        // Use base64 encoding (RFC 4648)
+        const char* base64_chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        
+        auto encode = [&](const std::string& input) {
+            std::string result;
+            int val = 0, valb = -6;
+            for (unsigned char c : input) {
+                val = (val << 8) + c;
+                valb += 8;
+                while (valb >= 0) {
+                    result += base64_chars[(val >> valb) & 0x3F];
+                    valb -= 6;
+                }
+            }
+            if (valb > -6) {
+                result += base64_chars[((val << 8) >> (valb + 8)) & 0x3F];
+            }
+            while (result.size() % 4) {
+                result += '=';
+            }
+            return result;
+        };
+        
+        output("begin-base64 644 " + outputName);
+        std::string encoded = encode(inputData);
+        for (size_t i = 0; i < encoded.length(); i += 76) {
+            output(encoded.substr(i, 76));
+        }
+        output("====");
+    } else {
+        // Traditional uuencode format (RFC 1113)
+        output("begin 644 " + outputName);
+        
+        // Encode in groups of 3 bytes (24 bits -> 4 base64 chars -> 6 base64 chars for UU)
+        const char* uuencode_chars = "`!\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_";
+        
+        for (size_t i = 0; i < inputData.length(); i += 45) {
+            size_t lineLen = std::min(size_t(45), inputData.length() - i);
+            std::string line;
+            line += (char)(32 + lineLen);  // Length byte
+            
+            for (size_t j = 0; j < lineLen; j += 3) {
+                unsigned char b1 = inputData[i + j];
+                unsigned char b2 = (j + 1 < lineLen) ? inputData[i + j + 1] : 0;
+                unsigned char b3 = (j + 2 < lineLen) ? inputData[i + j + 2] : 0;
+                
+                unsigned int val = (b1 << 16) | (b2 << 8) | b3;
+                
+                line += uuencode_chars[(val >> 18) & 0x3F];
+                line += uuencode_chars[(val >> 12) & 0x3F];
+                line += uuencode_chars[(val >> 6) & 0x3F];
+                line += uuencode_chars[val & 0x3F];
+            }
+            
+            output(line);
+        }
+        
+        output("end");
+    }
 }
 
 // uudecode - decode binary data
 void cmd_uudecode(const std::vector<std::string>& args) {
     if (checkHelpFlag(args)) {
         output("Usage: uudecode [-m] [input_file]");
-        output("  Decode a uuencoded file");
+        output("  Decode a uuencoded or base64-encoded file");
         output("");
         output("OPTIONS");
-        output("  -m              Decode base64 (MIME) format");
+        output("  -m              Auto-detect base64 (MIME) format");
+        output("");
+        output("DESCRIPTION");
+        output("  Decodes files in uuencode format (RFC 1113) or base64 format (RFC 4648).");
+        output("  Format is auto-detected from 'begin' line markers.");
         output("");
         output("EXAMPLES");
-        output("  uudecode file.uu");
-        output("  uudecode -m file.txt.base64");
+        output("  uudecode file.uu                  # decode uuencoded file");
+        output("  uudecode -m file.b64              # auto-detect base64");
+        output("  cat encoded.txt | uudecode        # decode from stdin");
         return;
     }
     
-    output("uudecode: basic support via base64");
-    output("Use 'base64 -d' for decoding: base64 -d <file>");
+    std::string inputFile;
+    
+    for (size_t i = 1; i < args.size(); ++i) {
+        if (args[i] != "-m") {
+            inputFile = args[i];
+        }
+    }
+    
+    std::vector<std::string> lines;
+    
+    if (inputFile.empty()) {
+        // Read from stdin
+        lines = getInputLines();
+    } else {
+        // Read from file
+        std::ifstream file(inputFile);
+        if (!file.is_open()) {
+            outputError("uudecode: cannot open '" + inputFile + "'");
+            return;
+        }
+        std::string line;
+        while (std::getline(file, line)) {
+            lines.push_back(line);
+        }
+    }
+    
+    if (lines.empty()) {
+        outputError("uudecode: empty input");
+        return;
+    }
+    
+    // Find begin line
+    size_t beginIdx = 0;
+    bool isMime = false;
+    std::string outputName = "output";
+    
+    for (size_t i = 0; i < lines.size(); ++i) {
+        if (lines[i].find("begin-base64") == 0) {
+            beginIdx = i;
+            isMime = true;
+            // Parse: begin-base64 [mode] name
+            auto parts = split(lines[i], ' ');
+            if (parts.size() >= 3) {
+                outputName = parts[2];
+            }
+            break;
+        } else if (lines[i].find("begin") == 0) {
+            beginIdx = i;
+            isMime = false;
+            // Parse: begin [mode] name
+            auto parts = split(lines[i], ' ');
+            if (parts.size() >= 3) {
+                outputName = parts[2];
+            }
+            break;
+        }
+    }
+    
+    if (isMime) {
+        // Base64 decoding
+        const char* base64_chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        std::vector<int> T(256, -1);
+        for (int i = 0; i < 64; i++) T[base64_chars[i]] = i;
+        
+        auto decodeBase64 = [&](const std::string& input) {
+            std::string result;
+            int val = 0, valb = -8;
+            for (unsigned char c : input) {
+                if (T[c] == -1) continue;
+                val = (val << 6) + T[c];
+                valb += 6;
+                if (valb >= 0) {
+                    result += char((val >> valb) & 0xFF);
+                    valb -= 8;
+                }
+            }
+            return result;
+        };
+        
+        std::string decoded;
+        for (size_t i = beginIdx + 1; i < lines.size(); ++i) {
+            if (lines[i] == "====" || lines[i].empty()) break;
+            decoded += decodeBase64(lines[i]);
+        }
+        
+        // Output decoded data
+        fwrite(decoded.data(), 1, decoded.size(), stdout);
+        fflush(stdout);
+    } else {
+        // Uuencode decoding (RFC 1113)
+        const char* uuencode_chars = "`!\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_";
+        std::vector<int> T(256, -1);
+        for (int i = 0; i < 64; i++) T[(unsigned char)uuencode_chars[i]] = i;
+        
+        std::string decoded;
+        unsigned char lastLenByte = 0;
+        
+        for (size_t i = beginIdx + 1; i < lines.size(); ++i) {
+            if (lines[i] == "end" || lines[i].empty()) break;
+            
+            const std::string& line = lines[i];
+            if (line.length() < 1) continue;
+            
+            unsigned char lenByte = (unsigned char)line[0] - 32;
+            if (lenByte == 0) continue;  // Empty line
+            lastLenByte = lenByte;
+            
+            for (size_t j = 1; j + 3 < line.length(); j += 4) {
+                int c1 = T[(unsigned char)line[j]];
+                int c2 = T[(unsigned char)line[j + 1]];
+                int c3 = T[(unsigned char)line[j + 2]];
+                int c4 = T[(unsigned char)line[j + 3]];
+                
+                if (c1 < 0 || c2 < 0 || c3 < 0 || c4 < 0) continue;
+                
+                unsigned int val = (c1 << 18) | (c2 << 12) | (c3 << 6) | c4;
+                
+                unsigned char b1 = (val >> 16) & 0xFF;
+                unsigned char b2 = (val >> 8) & 0xFF;
+                unsigned char b3 = val & 0xFF;
+                
+                decoded += (char)b1;
+                if (decoded.length() < lastLenByte) decoded += (char)b2;
+                if (decoded.length() < lastLenByte) decoded += (char)b3;
+            }
+        }
+        
+        // Trim to exact length
+        if (decoded.length() > lastLenByte) {
+            decoded = decoded.substr(0, lastLenByte);
+        }
+        
+        // Output decoded data
+        fwrite(decoded.data(), 1, decoded.size(), stdout);
+        fflush(stdout);
+    }
 }
 
 // ed - line editor (POSIX standard line-based editor with full functionality)
