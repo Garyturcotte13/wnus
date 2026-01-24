@@ -1,15 +1,16 @@
-[![Version](https://img.shields.io/badge/version-0.1.5.1-orange.svg)](.)[![Size](https://img.shields.io/badge/size-7MB-blue.svg)](.)[![Platform](https://img.shields.io/badge/platform-Windows-blue.svg)](https://www.microsoft.com/windows)[![Build](https://img.shields.io/badge/build-passing-brightgreen.svg)](.)[![Tests](https://img.shields.io/badge/tests-10%2F10%20PASS-brightgreen.svg)](test_posix_simple.ps1)
+[![Version](https://img.shields.io/badge/version-0.1.5.3-orange.svg)](.)[![Size](https://img.shields.io/badge/size-7.2MB-blue.svg)](.)[![Platform](https://img.shields.io/badge/platform-Windows-blue.svg)](https://www.microsoft.com/windows)[![Build](https://img.shields.io/badge/build-passing-brightgreen.svg)](.)[![Tests](https://img.shields.io/badge/tests-10%2F10%20PASS-brightgreen.svg)](test_posix_simple.ps1)
 
 # Windows Native Unix Shell (wnus)
 
-**v0.1.5.1** - Comprehensive Unix/Linux command-line environment for Windows with **276 fully implemented commands** in pure C++ (zero external dependencies).
+**v0.1.5.3** - Comprehensive Unix/Linux command-line environment for Windows with **276 fully implemented commands** in pure C++ (zero external dependencies).
 
-**Quick Stats:** 7 MB | 30-40 MB RAM | Windows 7+ | All 276 commands fully implemented
+**Quick Stats:** 7.2 MB | 40-50 MB RAM | Windows 7+ | Tabbed GUI with multi-session persistence
 
 ## ✨ Features
 
 - 🔧 **276 commands** - strace, journalctl, c-run, uuencode, uudecode, pax, nc, ssh, scp, grep, sed, awk, tar, make, tcpdump, nmap, and more
-- 📁 **Native NTFS** - Windows ACL integration, hard/symbolic links, full permission management
+- � **Tabbed GUI** - Multi-tab terminal with persistent session state (Ctrl+T new, Ctrl+W close, Ctrl+Tab switch)
+- �📁 **Native NTFS** - Windows ACL integration, hard/symbolic links, full permission management
 - 🔀 **Bash compatible** - pipes (`|`), redirects (`>`, `>>`), chaining (`&&`, `||`), background (`&`)
 - 📖 **276 man pages** - comprehensive documentation for every command
 - 🌐 **Networking** - SSH/SCP/SFTP/FTP with AES-256 encryption, tcpdump, nmap, ping, traceroute
@@ -44,6 +45,13 @@
 - **Here-documents** - `<<DELIMITER` syntax for multi-line input
 - **Command substitution** - `$(command)` for output capture
 - **Quote handling** - Single and double quotes with escape sequences
+
+### GUI & Tabs
+- **Tabbed interface** - Multiple concurrent terminal sessions in one window
+- **Tab persistence** - Tabs and directories automatically saved/restored on startup
+- **Keyboard shortcuts** - Ctrl+T (new), Ctrl+W (close), Ctrl+Tab (next), Ctrl+Shift+Tab (prev)
+- **Dark/Light themes** - Automatic system theme detection and application
+- **Session isolation** - Each tab maintains separate command history and directory
 
 ### System Administration
 - **Process management** - ps, top, kill, nice, bg, fg, jobs
@@ -125,13 +133,14 @@ kill -9 1234
 | Aspect | Details |
 |--------|---------|
 | **Language** | Pure C++11 |
-| **Size** | 7 MB (57,986 lines) |
+| **Size** | 7.2 MB (58,653 lines) |
+| **Memory** | 40-50 MB typical (per tab +10 MB) |
 | **Dependencies** | Zero (Windows API + C++ stdlib only) |
 | **Cryptography** | Windows CNG (AES-256, HMAC-SHA256) |
-| **Memory** | 30-40 MB typical |
 | **Platform** | Windows 7+ (x86/x64) |
 | **Commands** | 276 fully implemented (0 stubs) |
 | **Startup** | < 100ms |
+| **GUI** | Native Win32 with tabbed interface |
 
 ## 📊 Status
 

@@ -46,8 +46,10 @@
 #include <windns.h>
 #include <winsvc.h>
 #include <shellapi.h>
+#include <commctrl.h>
 
 #pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "bcrypt.lib")
 #pragma comment(lib, "wtsapi32.lib")
@@ -412,12 +414,30 @@ void debugLog(const std::string& msg) {
     ofs << msg << std::endl;
 }
 
+// Tab session structure to hold per-tab state
+struct TabSession {
+    HWND hEdit;
+    WNDPROC originalEditProc;
+    std::vector<std::string> commandHistory;
+    int historyIndex;
+    int promptStart;
+    std::string currentDir;
+    bool atVirtualRoot;
+    std::vector<std::string> capturedOutput;
+    int lastExitStatus;
+    std::map<std::string, std::string> aliases;
+    std::string tabName;
+};
+
 // Global variables
 HWND g_hWnd = NULL;
 HWND g_hOutput = NULL;
+HWND g_hTabControl = NULL;  // Tab control handle
 HMENU g_hMenu = NULL;
 HMENU g_hOptionsMenu = NULL;
+HMENU g_hTabsMenu = NULL;  // Tabs menu
 WNDPROC g_originalEditProc = NULL;
+WNDPROC g_originalTabProc = NULL;  // Original tab control window procedure
 std::vector<std::string> g_commandHistory;
 int g_historyIndex = -1;
 int g_promptStart = 0;
@@ -428,6 +448,8 @@ bool g_isFullScreen = false;
 bool g_skipFinalPrompt = false;  // Skip final prompt in executeCommand
 RECT g_savedWindowRect = {0};
 LONG g_savedWindowStyle = 0;
+std::vector<TabSession> g_tabSessions;  // All tab sessions
+int g_currentTabIndex = 0;  // Current active tab index
 bool g_capturingOutput = false;
 bool g_isPipedCommand = false; // Flag if current command is downstream in a pipe
 // Virtual root flag: when true, we are at wnus:/ where drives are listed
@@ -525,6 +547,10 @@ int g_emacsMarkCol = 0;  // Emacs mark column
 #define ID_OPTIONS_FULL_PATH 1005
 #define ID_OPTIONS_LINE_WRAP 1006
 #define ID_OPTIONS_FULLSCREEN 1007
+#define ID_TABS_NEW 1010
+#define ID_TABS_CLOSE 1011
+#define ID_TABS_NEXT 1012
+#define ID_TABS_PREV 1013
 
 // Registry settings
 #define REG_KEY_PATH "Software\\GarysConsole"
@@ -534,7 +560,7 @@ int g_emacsMarkCol = 0;  // Emacs mark column
 #define REG_VALUE_FULL_PATH "FullPathPrompt"
 #define REG_VALUE_LINE_WRAP "LineWrap"
 
-const std::string WNUS_VERSION = "0.1.5.1";
+const std::string WNUS_VERSION = "0.1.5.3";
 
 // Utility functions
 std::vector<std::string> split(const std::string& str, char delimiter = ' ') {
@@ -1279,7 +1305,7 @@ bool isWindowsDarkModeEnabled() {
         return (value == 0); // 0 = dark mode, 1 = light mode
     }
     
-    return true; // Default to dark mode if can't read
+    return false; // Default to light mode if can't read
 }
 
 void applySystemTheme() {
@@ -55595,8 +55621,16 @@ void handleTabCompletion(HWND hwnd) {
     // So we just appended text.
 }
 
-// Forward declaration
+// Forward declarations
 void executeCommand(const std::string& command);
+void createNewTab(const std::string& tabName = "", bool showWelcome = true);
+void saveTabSessions();
+bool loadTabSessions();
+void applyThemeToControls();
+LRESULT CALLBACK TabControlSubclassProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData);
+LRESULT CALLBACK TabControlSubclassProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData);
+void closeCurrentTab();
+void switchToTab(int tabIndex);
 
 // Subclassed edit control procedure
 LRESULT CALLBACK EditSubclassProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
@@ -55607,6 +55641,30 @@ LRESULT CALLBACK EditSubclassProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lP
         // Handle Ctrl+F (Fullscreen)
         if (wParam == 'F' && (GetKeyState(VK_CONTROL) & 0x8000)) {
             if (g_isFullScreen) SendMessage(GetParent(hwnd), WM_COMMAND, ID_OPTIONS_FULLSCREEN, 0);
+            return 0;
+        }
+        
+        // Handle Ctrl+T (New Tab)
+        if (wParam == 'T' && (GetKeyState(VK_CONTROL) & 0x8000) && !(GetKeyState(VK_SHIFT) & 0x8000)) {
+            SendMessage(GetParent(hwnd), WM_COMMAND, ID_TABS_NEW, 0);
+            return 0;
+        }
+        
+        // Handle Ctrl+W (Close Tab)
+        if (wParam == 'W' && (GetKeyState(VK_CONTROL) & 0x8000) && !(GetKeyState(VK_SHIFT) & 0x8000) && !g_nanoMode) {
+            SendMessage(GetParent(hwnd), WM_COMMAND, ID_TABS_CLOSE, 0);
+            return 0;
+        }
+        
+        // Handle Ctrl+Tab (Next Tab)
+        if (wParam == VK_TAB && (GetKeyState(VK_CONTROL) & 0x8000) && !(GetKeyState(VK_SHIFT) & 0x8000)) {
+            SendMessage(GetParent(hwnd), WM_COMMAND, ID_TABS_NEXT, 0);
+            return 0;
+        }
+        
+        // Handle Ctrl+Shift+Tab (Previous Tab)
+        if (wParam == VK_TAB && (GetKeyState(VK_CONTROL) & 0x8000) && (GetKeyState(VK_SHIFT) & 0x8000)) {
+            SendMessage(GetParent(hwnd), WM_COMMAND, ID_TABS_PREV, 0);
             return 0;
         }
 
@@ -55795,6 +55853,32 @@ LRESULT CALLBACK EditSubclassProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lP
                 return 0;
             }
             return 0;  // Consume all keys in nano mode
+        }
+        
+        // Handle tab shortcuts (Ctrl+T, Ctrl+W, Ctrl+Tab, Ctrl+Shift+Tab) - only when NOT in nano mode
+        if (!g_nanoMode) {
+            if (wParam == 'T' && GetKeyState(VK_CONTROL) & 0x8000) {
+                createNewTab();
+                return 0;
+            }
+            
+            if (wParam == 'W' && GetKeyState(VK_CONTROL) & 0x8000) {
+                closeCurrentTab();
+                return 0;
+            }
+            
+            if (wParam == VK_TAB && GetKeyState(VK_CONTROL) & 0x8000) {
+                if (GetKeyState(VK_SHIFT) & 0x8000) {
+                    // Ctrl+Shift+Tab - Previous tab
+                    int prevTab = (g_currentTabIndex - 1 + g_tabSessions.size()) % g_tabSessions.size();
+                    switchToTab(prevTab);
+                } else {
+                    // Ctrl+Tab - Next tab
+                    int nextTab = (g_currentTabIndex + 1) % g_tabSessions.size();
+                    switchToTab(nextTab);
+                }
+                return 0;
+            }
         }
         
         // Handle Ctrl+C - Interrupt/terminate
@@ -57272,6 +57356,350 @@ void executeCommand(const std::string& command) {
     }
 }
 
+// Tab management functions
+void saveCurrentTabState() {
+    if (g_currentTabIndex < 0 || g_currentTabIndex >= (int)g_tabSessions.size()) return;
+    
+    TabSession& session = g_tabSessions[g_currentTabIndex];
+    session.commandHistory = g_commandHistory;
+    session.historyIndex = g_historyIndex;
+    session.promptStart = g_promptStart;
+    char cwd[MAX_PATH];
+    GetCurrentDirectoryA(MAX_PATH, cwd);
+    session.currentDir = std::string(cwd);
+    session.atVirtualRoot = g_atVirtualRoot;
+    session.capturedOutput = g_capturedOutput;
+    session.lastExitStatus = g_lastExitStatus;
+    session.aliases = g_aliases;
+}
+
+void restoreTabState(int tabIndex) {
+    if (tabIndex < 0 || tabIndex >= (int)g_tabSessions.size()) return;
+    
+    TabSession& session = g_tabSessions[tabIndex];
+    g_commandHistory = session.commandHistory;
+    g_historyIndex = session.historyIndex;
+    g_promptStart = session.promptStart;
+    g_atVirtualRoot = session.atVirtualRoot;
+    g_capturedOutput = session.capturedOutput;
+    g_lastExitStatus = session.lastExitStatus;
+    g_aliases = session.aliases;
+    g_hOutput = session.hEdit;
+    g_originalEditProc = session.originalEditProc;
+    
+    // Change to the saved directory
+    if (!session.currentDir.empty()) {
+        SetCurrentDirectoryA(session.currentDir.c_str());
+    }
+}
+
+void switchToTab(int tabIndex) {
+    if (tabIndex < 0 || tabIndex >= (int)g_tabSessions.size()) return;
+    if (tabIndex == g_currentTabIndex) return;
+    
+    // Save current tab state
+    saveCurrentTabState();
+    
+    // Hide current edit control
+    if (g_hOutput) {
+        ShowWindow(g_hOutput, SW_HIDE);
+    }
+    
+    // Switch to new tab
+    g_currentTabIndex = tabIndex;
+    TabCtrl_SetCurSel(g_hTabControl, tabIndex);
+    
+    // Restore new tab state
+    restoreTabState(tabIndex);
+    
+    // Show new edit control
+    if (g_hOutput) {
+        ShowWindow(g_hOutput, SW_SHOW);
+        SetFocus(g_hOutput);
+    }
+}
+
+struct EditControlInfo {
+    HWND hEdit;
+    WNDPROC originalProc;
+};
+
+EditControlInfo createEditControl(HWND hParent, RECT rect) {
+    EditControlInfo info = {NULL, NULL};
+    
+    DWORD editStyle = WS_CHILD | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL;
+    if (!g_lineWrap) {
+        editStyle |= ES_AUTOHSCROLL | WS_HSCROLL;
+    }
+    
+    HWND hEdit = CreateWindowExA(
+        0, "EDIT", "",
+        editStyle,
+        rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top,
+        hParent, (HMENU)1, NULL, NULL);
+    
+    if (hEdit) {
+        // Set monospace font
+        HFONT hFont = CreateFontA(16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+            DEFAULT_QUALITY, FIXED_PITCH | FF_MODERN, "Consolas");
+        SendMessage(hEdit, WM_SETFONT, (WPARAM)hFont, TRUE);
+        
+        // Apply dark mode to scroll bar if enabled
+        if (isWindowsDarkModeEnabled()) {
+            SetWindowTheme(hEdit, L"DarkMode_Explorer", NULL);
+        }
+        
+        // Subclass the edit control
+        WNDPROC origProc = (WNDPROC)SetWindowLongPtr(hEdit, GWLP_WNDPROC, (LONG_PTR)EditSubclassProc);
+        info.hEdit = hEdit;
+        info.originalProc = origProc;
+    }
+    return info;
+}
+
+void createNewTab(const std::string& tabName, bool showWelcome) {
+    // Save current tab state if exists
+    if (!g_tabSessions.empty()) {
+        saveCurrentTabState();
+        ShowWindow(g_hOutput, SW_HIDE);
+    }
+    
+    RECT clientRect;
+    GetClientRect(g_hWnd, &clientRect);
+    
+    // Calculate edit control position (below tab control)
+    RECT tabRect;
+    GetWindowRect(g_hTabControl, &tabRect);
+    POINT pt = {tabRect.left, tabRect.bottom};
+    ScreenToClient(g_hWnd, &pt);
+    
+    RECT editRect;
+    editRect.left = 10;
+    editRect.top = pt.y + 5;
+    editRect.right = clientRect.right - 10;
+    editRect.bottom = clientRect.bottom - 10;
+    
+    // Create new edit control
+    EditControlInfo editInfo = createEditControl(g_hWnd, editRect);
+    if (!editInfo.hEdit) return;
+    
+    // Create new tab session
+    TabSession newSession;
+    newSession.hEdit = editInfo.hEdit;
+    newSession.originalEditProc = editInfo.originalProc;
+    newSession.historyIndex = -1;
+    newSession.promptStart = 0;
+    char cwd[MAX_PATH];
+    GetCurrentDirectoryA(MAX_PATH, cwd);
+    newSession.currentDir = std::string(cwd);
+    newSession.atVirtualRoot = g_atVirtualRoot;
+    newSession.lastExitStatus = 0;
+    newSession.tabName = tabName.empty() ? ("Tab " + std::to_string(g_tabSessions.size() + 1)) : tabName;
+    
+    // Add new session to vector first
+    g_tabSessions.push_back(newSession);
+    
+    // Now add tab to control using the stable reference in vector
+    TCITEMA tie;
+    tie.mask = TCIF_TEXT;
+    tie.pszText = (LPSTR)g_tabSessions.back().tabName.c_str();
+    int itemIndex = TabCtrl_InsertItem(g_hTabControl, g_tabSessions.size() - 1, &tie);
+    
+    // Switch to new tab and select it
+    g_currentTabIndex = (int)g_tabSessions.size() - 1;
+    if (itemIndex >= 0) {
+        TabCtrl_SetCurSel(g_hTabControl, itemIndex);
+    }
+    
+    // Force tab control to update
+    InvalidateRect(g_hTabControl, NULL, FALSE);
+    UpdateWindow(g_hTabControl);
+    
+    // Set up new tab
+    g_hOutput = editInfo.hEdit;
+    g_originalEditProc = editInfo.originalProc;
+    g_commandHistory.clear();
+    g_historyIndex = -1;
+    g_promptStart = 0;
+    
+    // Initialize edit control with empty text
+    SetWindowTextA(editInfo.hEdit, "");
+    
+    ShowWindow(editInfo.hEdit, SW_SHOW);
+    SetFocus(editInfo.hEdit);
+    
+    if (showWelcome) {
+        output("Windows Native Unix Shell (wnus) v" + WNUS_VERSION);
+        output("-----------------------------------------");
+    }
+    showPrompt();
+}
+
+void closeCurrentTab() {
+    if (g_tabSessions.size() <= 1) {
+        // Don't close the last tab
+        output("Cannot close the last tab");
+        showPrompt();
+        return;
+    }
+    
+    // Destroy current edit control
+    if (g_hOutput) {
+        DestroyWindow(g_hOutput);
+    }
+    
+    // Remove tab from control
+    TabCtrl_DeleteItem(g_hTabControl, g_currentTabIndex);
+    
+    // Remove session
+    g_tabSessions.erase(g_tabSessions.begin() + g_currentTabIndex);
+    
+    // Renumber all remaining tabs starting from 1
+    for (size_t i = 0; i < g_tabSessions.size(); ++i) {
+        g_tabSessions[i].tabName = "Tab " + std::to_string(i + 1);
+        TCITEMA tie;
+        tie.mask = TCIF_TEXT;
+        tie.pszText = (LPSTR)g_tabSessions[i].tabName.c_str();
+        TabCtrl_SetItem(g_hTabControl, (int)i, &tie);
+    }
+    
+    // Force tab control to update
+    InvalidateRect(g_hTabControl, NULL, FALSE);
+    UpdateWindow(g_hTabControl);
+    
+    // Switch to previous tab (or next if we closed tab 0)
+    int newTabIndex = g_currentTabIndex > 0 ? g_currentTabIndex - 1 : 0;
+    g_currentTabIndex = -1; // Force switch
+    switchToTab(newTabIndex);
+}
+
+std::string getTabsStatePath() {
+    const char* home = getenv("USERPROFILE");
+    if (home) {
+        return std::string(home) + "\\.wnus_tabs";
+    }
+    return ".wnus_tabs";
+}
+
+void saveTabSessions() {
+    if (g_tabSessions.empty()) return;
+    // Ensure current tab state is up to date
+    saveCurrentTabState();
+    
+    std::ofstream out(getTabsStatePath());
+    if (!out.is_open()) return;
+    
+    out << g_currentTabIndex << "\n";
+    out << g_tabSessions.size() << "\n";
+    for (const auto& session : g_tabSessions) {
+        out << session.tabName << "\n";
+        out << session.currentDir << "\n";
+    }
+}
+
+bool loadTabSessions() {
+    std::ifstream in(getTabsStatePath());
+    if (!in.is_open()) return false;
+    
+    std::string line;
+    if (!std::getline(in, line)) return false;
+    int savedCurrent = atoi(line.c_str());
+    if (!std::getline(in, line)) return false;
+    int count = atoi(line.c_str());
+    if (count <= 0) return false;
+    
+    std::vector<std::pair<std::string, std::string>> tabs;
+    tabs.reserve(count);
+    for (int i = 0; i < count; ++i) {
+        std::string name, dir;
+        if (!std::getline(in, name)) break;
+        if (!std::getline(in, dir)) break;
+        tabs.push_back({name, dir});
+    }
+    if (tabs.empty()) return false;
+    
+    char originalCwd[MAX_PATH];
+    GetCurrentDirectoryA(MAX_PATH, originalCwd);
+    
+    // Update first tab
+    if (!tabs[0].first.empty()) {
+        g_tabSessions[0].tabName = tabs[0].first;
+        TCITEMA tie;
+        tie.mask = TCIF_TEXT;
+        tie.pszText = (LPSTR)g_tabSessions[0].tabName.c_str();
+        TabCtrl_SetItem(g_hTabControl, 0, &tie);
+    }
+    if (!tabs[0].second.empty()) {
+        SetCurrentDirectoryA(tabs[0].second.c_str());
+        g_tabSessions[0].currentDir = tabs[0].second;
+    }
+    
+    // Create remaining tabs (they will show their own prompt)
+    for (size_t i = 1; i < tabs.size(); ++i) {
+        if (!tabs[i].second.empty()) {
+            SetCurrentDirectoryA(tabs[i].second.c_str());
+        }
+        createNewTab(tabs[i].first.empty() ? ("Tab " + std::to_string(i + 1)) : tabs[i].first, false);
+        g_tabSessions[i].currentDir = tabs[i].second;
+    }
+    
+    // Restore directory to first tab's location or original
+    if (!tabs[0].second.empty()) {
+        SetCurrentDirectoryA(tabs[0].second.c_str());
+    } else {
+        SetCurrentDirectoryA(originalCwd);
+    }
+    
+    // After creating tabs, we're on the last tab - switch back to first tab temporarily
+    if (tabs.size() > 1) {
+        g_currentTabIndex = -1; // Force switch
+        switchToTab(0);
+    }
+    
+    // Show prompt in first tab (other tabs already have prompts from createNewTab)
+    showPrompt();
+    
+    int targetIndex = (savedCurrent >= 0 && savedCurrent < (int)tabs.size()) ? savedCurrent : 0;
+    
+    // Now switch to the saved active tab if it's not the first tab
+    if (targetIndex != 0) {
+        switchToTab(targetIndex);
+    }
+    
+    return true;
+}
+
+void applyThemeToControls() {
+    bool dark = isWindowsDarkModeEnabled();
+    
+    // Invalidate tab control to trigger redraw with new theme
+    if (g_hTabControl) {
+        InvalidateRect(g_hTabControl, NULL, TRUE);
+    }
+    
+    for (auto& session : g_tabSessions) {
+        if (session.hEdit) {
+            SetWindowTheme(session.hEdit, dark ? L"DarkMode_Explorer" : L"Explorer", NULL);
+            InvalidateRect(session.hEdit, NULL, TRUE);
+        }
+    }
+}
+
+LRESULT CALLBACK TabControlSubclassProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData) {
+    switch (message) {
+        case WM_ERASEBKGND: {
+            // Let default handler erase background first
+            DefSubclassProc(hWnd, message, wParam, lParam);
+            return 1;  // Indicate we handled it to prevent default behavior
+        }
+        case WM_NCDESTROY:
+            RemoveWindowSubclass(hWnd, TabControlSubclassProc, uIdSubclass);
+            break;
+    }
+    return DefSubclassProc(hWnd, message, wParam, lParam);
+}
+
 // Window procedure
 LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) {
     switch (message) {
@@ -57287,6 +57715,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
         }
         
         case WM_CREATE: {
+            g_hWnd = hWnd;
+            
             // Load saved settings
             loadCaseSensitiveSetting();
             loadColorSettings();
@@ -57369,14 +57799,62 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             AppendMenuA(g_hOptionsMenu, MF_STRING, ID_OPTIONS_BG_COLOR, "Background Color...");
             
             AppendMenuA(hMenuBar, MF_POPUP, (UINT_PTR)g_hOptionsMenu, "Options");
+            
+            // Create Tabs menu
+            g_hTabsMenu = CreatePopupMenu();
+            AppendMenuA(g_hTabsMenu, MF_STRING, ID_TABS_NEW, "New Tab\\tCtrl+T");
+            AppendMenuA(g_hTabsMenu, MF_STRING, ID_TABS_CLOSE, "Close Tab\\tCtrl+W");
+            AppendMenuA(g_hTabsMenu, MF_SEPARATOR, 0, NULL);
+            AppendMenuA(g_hTabsMenu, MF_STRING, ID_TABS_NEXT, "Next Tab\\tCtrl+Tab");
+            AppendMenuA(g_hTabsMenu, MF_STRING, ID_TABS_PREV, "Previous Tab\\tCtrl+Shift+Tab");
+            AppendMenuA(hMenuBar, MF_POPUP, (UINT_PTR)g_hTabsMenu, "Tabs");
+            
             g_hMenu = hMenuBar;
             SetMenu(hWnd, hMenuBar);
             
-            // Redraw menu bar to apply theme
+            // Invalidate and redraw menu bar to apply dark mode theme
+            RECT menuRect;
+            GetClientRect(hWnd, &menuRect);
+            menuRect.bottom = GetSystemMetrics(SM_CYMENU);
+            InvalidateRect(hWnd, &menuRect, FALSE);
             DrawMenuBar(hWnd);
+            UpdateWindow(hWnd);
             
-            // Create main text box (editable, multiline)
-            // Add ES_AUTOHSCROLL and WS_HSCROLL when line wrap is disabled
+            // Initialize common controls for tab control
+            INITCOMMONCONTROLSEX icex;
+            icex.dwSize = sizeof(INITCOMMONCONTROLSEX);
+            icex.dwICC = ICC_TAB_CLASSES;
+            InitCommonControlsEx(&icex);
+            
+            // Create tab control with standard theming
+            RECT clientRect;
+            GetClientRect(hWnd, &clientRect);
+            g_hTabControl = CreateWindowExA(
+                0, WC_TABCONTROLA, "",
+                WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | TCS_TABS,
+                10, 10, clientRect.right - 20, 50,
+                hWnd, (HMENU)2, NULL, NULL);
+            
+            if (!g_hTabControl) {
+                MessageBoxA(hWnd, "Failed to create tab control", "Error", MB_OK | MB_ICONERROR);
+                return -1;
+            }
+            
+            // Subclass tab control for themed background painting
+            // SetWindowSubclass(g_hTabControl, TabControlSubclassProc, 0, 0);
+            
+            // Set appropriate tab sizing for better visibility
+            // Width = 0 means auto-fit based on text, Height = 32 for better visibility
+            SendMessage(g_hTabControl, TCM_SETITEMSIZE, 0, MAKELPARAM(100, 32));
+            
+            // Ensure tab control is in front and visible
+            SetWindowPos(g_hTabControl, HWND_TOP, 10, 10, clientRect.right - 20, 50, SWP_SHOWWINDOW);
+            
+            // Calculate edit control position (below tab control)
+            // Tab control is at y=10 with height 50, so bottom is at y=60
+            int tabBottom = 10 + 50;
+            
+            // Create main text box (editable, multiline) below tab control
             DWORD editStyle = WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL;
             if (!g_lineWrap) {
                 editStyle |= ES_AUTOHSCROLL | WS_HSCROLL;
@@ -57385,7 +57863,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             g_hOutput = CreateWindowExA(
                 0, "EDIT", "",
                 editStyle,
-                10, 10, 760, 560,
+                10, tabBottom + 5, clientRect.right - 20, clientRect.bottom - tabBottom - 15,
                 hWnd, (HMENU)1, NULL, NULL);
             
             // Set monospace font
@@ -57402,18 +57880,50 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             // Subclass the edit control to intercept messages
             g_originalEditProc = (WNDPROC)SetWindowLongPtr(g_hOutput, GWLP_WNDPROC, (LONG_PTR)EditSubclassProc);
             
-            // Welcome message (show for interactive launch; suppress only when auto-exiting a startup command)
-            if (!g_executeOnStartup || !g_exitAfterStartup) {
+            // Initialize first tab session
+            TabSession firstSession;
+            firstSession.hEdit = g_hOutput;
+            firstSession.originalEditProc = g_originalEditProc;
+            firstSession.historyIndex = -1;
+            firstSession.promptStart = 0;
+            char cwd[MAX_PATH];
+            GetCurrentDirectoryA(MAX_PATH, cwd);
+            firstSession.currentDir = std::string(cwd);
+            firstSession.atVirtualRoot = g_atVirtualRoot;
+            firstSession.lastExitStatus = 0;
+            firstSession.tabName = "Tab 1";
+            g_tabSessions.push_back(firstSession);
+            g_currentTabIndex = 0;
+            
+            // Add first tab to control
+            TCITEMA tie;
+            tie.mask = TCIF_TEXT;
+            tie.pszText = (LPSTR)"Tab 1";
+            int itemIndex = TabCtrl_InsertItem(g_hTabControl, 0, &tie);
+            if (itemIndex >= 0) {
+                TabCtrl_SetCurSel(g_hTabControl, itemIndex);
+            }
+            
+            // Force tab control to update and paint
+            InvalidateRect(g_hTabControl, NULL, FALSE);
+            UpdateWindow(g_hTabControl);
+            
+            // Restore previously open tabs (if any)
+            bool restoredTabs = loadTabSessions();
+            
+            // Ensure theme is applied to all controls after tab restoration
+            applyThemeToControls();
+            InvalidateRect(g_hTabControl, NULL, TRUE);
+            UpdateWindow(g_hTabControl);
+            
+            // Welcome message (show for interactive launch when not restoring prior session)
+            if (!restoredTabs && (!g_executeOnStartup || !g_exitAfterStartup)) {
                 output("Windows Native Unix Shell (wnus) v" + WNUS_VERSION + " - Native Unix Environment for Windows");
                 output("Type 'help' for available commands");
                 output("Type 'version' for more information");
                 output("Type 'exit' or 'quit' to close");
                 output("Tip: start in POSIX shell with --shell (aliases: --interactive-shell, -S)");
                 output("-----------------------------------------");
-            }
-            
-            // Show initial prompt for interactive shells (skip only when auto-exiting after a startup command)
-            if (!g_executeOnStartup || !g_exitAfterStartup) {
                 showPrompt();
             }
             
@@ -57461,21 +57971,71 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
         }
         
         case WM_SIZE: {
-            // Resize control
+            // Resize controls
             RECT rect;
             GetClientRect(hWnd, &rect);
             
             int width = rect.right - 20;
             int height = rect.bottom - 20;
             
-            if (g_hOutput) {
+            // Resize tab control
+            if (g_hTabControl) {
+                SetWindowPos(g_hTabControl, NULL, 10, 10, width, 50, SWP_NOZORDER);
+                
+                // Get tab control bottom position
+                RECT tabRect;
+                GetWindowRect(g_hTabControl, &tabRect);
+                POINT pt = {tabRect.left, tabRect.bottom};
+                ScreenToClient(hWnd, &pt);
+                
+                // Resize all edit controls
+                for (auto& session : g_tabSessions) {
+                    if (session.hEdit) {
+                        SetWindowPos(session.hEdit, NULL, 10, pt.y + 5, 
+                                   width, rect.bottom - pt.y - 15, SWP_NOZORDER);
+                    }
+                }
+            } else if (g_hOutput) {
+                // Fallback for old behavior without tabs
                 SetWindowPos(g_hOutput, NULL, 10, 10, width, height, SWP_NOZORDER);
             }
             
             return 0;
         }
         
+        case WM_NOTIFY: {
+            if (((LPNMHDR)lParam)->idFrom == 2) {  // Tab control ID
+                if (((LPNMHDR)lParam)->code == TCN_SELCHANGE) {
+                    // Tab selection changed
+                    int newTab = TabCtrl_GetCurSel(g_hTabControl);
+                    if (newTab >= 0 && newTab != g_currentTabIndex) {
+                        switchToTab(newTab);
+                    }
+                }
+            }
+            return 0;
+        }
+        
+
+        
         case WM_COMMAND: {
+            // Handle tab menu commands
+            if (LOWORD(wParam) == ID_TABS_NEW) {
+                createNewTab();
+                return 0;
+            } else if (LOWORD(wParam) == ID_TABS_CLOSE) {
+                closeCurrentTab();
+                return 0;
+            } else if (LOWORD(wParam) == ID_TABS_NEXT) {
+                int nextTab = (g_currentTabIndex + 1) % g_tabSessions.size();
+                switchToTab(nextTab);
+                return 0;
+            } else if (LOWORD(wParam) == ID_TABS_PREV) {
+                int prevTab = (g_currentTabIndex - 1 + g_tabSessions.size()) % g_tabSessions.size();
+                switchToTab(prevTab);
+                return 0;
+            }
+            
             // Handle menu commands
             if (LOWORD(wParam) == ID_OPTIONS_FULL_PATH) {
                 // Toggle full path prompt
@@ -57728,39 +58288,69 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
         }
         
         case WM_UAHDRAWMENUITEM: {
-            if (isWindowsDarkModeEnabled()) {
-                UAHDRAWMENUITEM* pUDMI = (UAHDRAWMENUITEM*)lParam;
-                
-                // Get menu item text
-                char text[256] = {0};
-                MENUITEMINFOA mii = {0};
-                mii.cbSize = sizeof(MENUITEMINFOA);
-                mii.fMask = MIIM_STRING;
-                mii.dwTypeData = text;
-                mii.cch = sizeof(text);
-                GetMenuItemInfoA(pUDMI->um.hmenu, pUDMI->dis.itemID, FALSE, &mii);
-                
-                // Fill background
-                COLORREF bgColor = (pUDMI->dis.itemState & ODS_SELECTED) ? RGB(62, 62, 64) : RGB(32, 32, 32);
-                HBRUSH hBrush = CreateSolidBrush(bgColor);
-                FillRect(pUDMI->um.hdc, &pUDMI->dis.rcItem, hBrush);
-                DeleteObject(hBrush);
-                
-                // Draw text
-                SetTextColor(pUDMI->um.hdc, RGB(255, 255, 255));
-                SetBkMode(pUDMI->um.hdc, TRANSPARENT);
-                
-                RECT textRect = pUDMI->dis.rcItem;
-                textRect.left += 10;
-                DrawTextA(pUDMI->um.hdc, text, -1, &textRect, DT_SINGLELINE | DT_VCENTER | DT_LEFT);
-                
-                return TRUE;
+            UAHDRAWMENUITEM* pUDMI = (UAHDRAWMENUITEM*)lParam;
+            
+            // Get menu item text
+            char text[256] = {0};
+            MENUITEMINFOA mii = {0};
+            mii.cbSize = sizeof(MENUITEMINFOA);
+            mii.fMask = MIIM_STRING;
+            mii.dwTypeData = text;
+            mii.cch = sizeof(text);
+            GetMenuItemInfoA(pUDMI->um.hmenu, pUDMI->dis.itemID, FALSE, &mii);
+            
+            bool isDark = isWindowsDarkModeEnabled();
+            bool isSelected = (pUDMI->dis.itemState & ODS_SELECTED) != 0;
+            
+            // Fill background
+            COLORREF bgColor;
+            if (isDark) {
+                bgColor = isSelected ? RGB(62, 62, 64) : RGB(32, 32, 32);
+            } else {
+                bgColor = isSelected ? GetSysColor(COLOR_HIGHLIGHT) : GetSysColor(COLOR_MENU);
             }
-            break;
+            
+            HBRUSH hBrush = CreateSolidBrush(bgColor);
+            FillRect(pUDMI->um.hdc, &pUDMI->dis.rcItem, hBrush);
+            DeleteObject(hBrush);
+            
+            // Draw text with appropriate color
+            if (isDark) {
+                SetTextColor(pUDMI->um.hdc, RGB(255, 255, 255));
+            } else {
+                SetTextColor(pUDMI->um.hdc, GetSysColor(COLOR_MENUTEXT));
+            }
+            SetBkMode(pUDMI->um.hdc, TRANSPARENT);
+            
+            RECT textRect = pUDMI->dis.rcItem;
+            textRect.left += 10;
+            DrawTextA(pUDMI->um.hdc, text, -1, &textRect, DT_SINGLELINE | DT_VCENTER | DT_LEFT);
+            
+            return TRUE;
         }
         
         case WM_SETFOCUS: {
             SetFocus(g_hOutput);
+            return 0;
+        }
+        
+        case WM_SETTINGCHANGE: {
+            // Respond to theme and system color changes
+            applyThemeToControls();
+            applySystemTheme();
+            if (g_hBrush) {
+                DeleteObject(g_hBrush);
+            }
+            g_hBrush = CreateSolidBrush(g_bgColor);
+            InvalidateRect(hWnd, NULL, TRUE);
+            DrawMenuBar(hWnd);
+            return 0;
+        }
+        
+        case WM_THEMECHANGED: {
+            // User changed Windows theme
+            applyThemeToControls();
+            InvalidateRect(hWnd, NULL, TRUE);
             return 0;
         }
         
@@ -57773,6 +58363,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
         }
         
         case WM_DESTROY: {
+            saveCurrentTabState();
+            saveTabSessions();
             saveCommandHistory();
             if (g_hBrush) {
                 DeleteObject(g_hBrush);
