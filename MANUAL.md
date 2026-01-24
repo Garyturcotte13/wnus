@@ -1,5 +1,5 @@
 # Windows Native Unix Shell (wnus) User Manual
-## Version 0.1.4.5
+## Version 0.1.4.6
 **Build Date:** January 24, 2026  
 **Executable Size:** 6.86 MB (7029.50 KB)  
 **Memory Usage:** 30-40 MB typical
@@ -201,6 +201,30 @@ wnus.exe -c "ls -la"
 wnus.exe -c "pwd"
 wnus.exe -c "grep error logfile.txt"
 ```
+
+#### Interactive POSIX Shell Mode (No Auto-Exit)
+
+Start the app and immediately enter interactive `sh` (window stays open):
+```cmd
+wnus.exe --shell
+```
+Aliases:
+```cmd
+wnus.exe --interactive-shell
+wnus.exe -S
+```
+
+Notes:
+- This switch is handled by the launcher and removed before handing off to `sh`.
+- Use it when you want to always land in the POSIX shell directly from the GUI.
+
+#### Piped Script Mode
+
+Execute piped lines through POSIX sh semantics (`sh -s`):
+```cmd
+echo "echo from pipe" | wnus.exe
+```
+The launcher captures piped input and forwards it to `sh -s` for execution.
 
 ### Basic Navigation
 

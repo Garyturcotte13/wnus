@@ -1,11 +1,11 @@
-[![Version](https://img.shields.io/badge/version-0.1.4.5-orange.svg)](.)[![Size](https://img.shields.io/badge/size-6.86MB-blue.svg)](.)
-# Windows Native Unix Shell (wnus) - Version 0.1.4.5
+[![Version](https://img.shields.io/badge/version-0.1.4.7-orange.svg)](.)[![Size](https://img.shields.io/badge/size-6.92MB-blue.svg)](.)
+# Windows Native Unix Shell (wnus) - Version 0.1.4.7
 
 A comprehensive Unix/Linux-like shell environment for Windows, implemented entirely in C++ without external dependencies. Windows Native Unix Shell brings the power and familiarity of bash commands to native Windows, with full NTFS support and Windows API integration.
 
 [![Platform](https://img.shields.io/badge/platform-Windows-blue.svg)](https://www.microsoft.com/windows)
 [![Build](https://img.shields.io/badge/build-passing-brightgreen.svg)](.)  
-[![Version](https://img.shields.io/badge/version-0.1.3.9-orange.svg)](.)[![Size](https://img.shields.io/badge/size-6.78MB-blue.svg)](.)  
+[![Tests](https://img.shields.io/badge/tests-10%2F10%20PASS-brightgreen.svg)](test_posix_simple.ps1)
 - **Full bash compatibility** for common command-line workflows including I/O redirection and process control
 - **Comprehensive documentation** with man pages for every command
 - **Full-featured AWK interpreter** with all standard Unix/Linux AWK capabilities
@@ -13,7 +13,7 @@ A comprehensive Unix/Linux-like shell environment for Windows, implemented entir
 ## ✨ Key Features
 
 ### Core Capabilities
-- 🔧 **259 Unix/Linux commands** implemented natively in C++
+- 🔧 **275 Unix/Linux commands** implemented natively in C++ (269 fully implemented; 6 informational stubs: nc, strace, journalctl, pax, uuencode, uudecode)
 - 📁 **Native NTFS support** with Windows ACL integration
 - �️ **Virtual root filesystem** (wnus:/) with unified drive access via /C, /D, etc.
 - �🔀 **Full pipe operations** (`|`) for command chaining
@@ -23,7 +23,7 @@ A comprehensive Unix/Linux-like shell environment for Windows, implemented entir
 - ⌨️ **Interactive tab completion** for commands and file paths
 - 📜 **Persistent command history** with search capabilities
 - 🔖 **Configurable command aliases** for personalized workflows
-- 📖 **Comprehensive man page system** for all 259 commands with consistent documentation
+- 📖 **Comprehensive man page system** for all 275 commands with consistent documentation
 - ❓ **Context-sensitive help** (`--help` flag for all commands)
 - 🛑 **Process control** with Ctrl+C (terminate) and Ctrl+Z (suspend)
 
@@ -87,7 +87,7 @@ A comprehensive Unix/Linux-like shell environment for Windows, implemented entir
 
 ### Prerequisites for wnus.exe usage
 - Windows 7 or later (Windows 10/11 recommended)
-- 6.86 MB disk space for executable (v0.1.4.5)
+- 7.08 MB disk space for executable (v0.1.4.6)
 - 30-40 MB RAM typical usage
 
 ### Building
@@ -120,6 +120,18 @@ wnus.exe
 Or for single command execution:
 ```cmd
 wnus.exe -c "ls -la"
+```
+
+Interactive shell startup (no auto-exit):
+```cmd
+wnus.exe --shell
+# aliases: --interactive-shell, -S
+```
+
+Piped script execution via POSIX sh semantics:
+```cmd
+echo "echo from pipe" | wnus.exe
+# executes through: sh -s
 ```
 
 ## 📚 Command Reference
