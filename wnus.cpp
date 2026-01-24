@@ -534,7 +534,7 @@ int g_emacsMarkCol = 0;  // Emacs mark column
 #define REG_VALUE_FULL_PATH "FullPathPrompt"
 #define REG_VALUE_LINE_WRAP "LineWrap"
 
-const std::string WNUS_VERSION = "0.1.5.0";
+const std::string WNUS_VERSION = "0.1.5.1";
 
 // Utility functions
 std::vector<std::string> split(const std::string& str, char delimiter = ' ') {
@@ -6646,10 +6646,18 @@ void cmd_chown(const std::vector<std::string>& args) {
         output("       chown [OPTION]... --reference=RFILE FILE...");
         output("Change the owner and/or group of each FILE to OWNER and/or GROUP.");
         output("");
+        output("Windows Implementation:");
+        output("  • Uses Windows Security Identifiers (SIDs) for ownership tracking");
+        output("  • SIDs uniquely identify user and group accounts");
+        output("  • Recursive operation (-R) applies ownership changes to all files");
+        output("    and subdirectories");
+        output("  • OWNER and GROUP can be account names or domain\\\\account format");
+        output("");
         output("Options:");
         output("  -c, --changes          Like verbose but report only when a change is made");
         output("  -f, --silent, --quiet  Suppress most error messages");
         output("  -v, --verbose          Output a diagnostic for every file processed");
+        output("                         (includes SID information in verbose mode)");
         output("      --dereference      Affect the referent of each symbolic link (default)");
         output("  -h, --no-dereference   Affect symbolic links instead of any referenced file");
         output("      --from=CURRENT_OWNER:CURRENT_GROUP");
@@ -6663,16 +6671,18 @@ void cmd_chown(const std::vector<std::string>& args) {
         output("");
         output("Owner is unchanged if missing. Group is unchanged if missing, but changed");
         output("to login group if implied by a ':' following a symbolic OWNER.");
-        output("OWNER and GROUP may be numeric as well as symbolic.");
+        output("OWNER and GROUP may be numeric SIDs (S-x-x-...) or symbolic names.");
         output("");
         output("Examples:");
-        output("  chown root /u                 Change owner of /u to \"root\"");
-        output("  chown root:staff /u           Change owner to \"root\" and group to \"staff\"");
-        output("  chown -R john /home/john      Change owner recursively");
-        output("  chown :admins /tmp            Change group to \"admins\"");
-        output("  chown --reference=file1 file2 Match file2 owner/group to file1");
+        output("  chown Administrator /u              Change owner to Administrator");
+        output("  chown Users /u                      Change group to Users");
+        output("  chown Administrator:Users /u        Change owner and group");
+        output("  chown -R john /home/john            Change owner recursively");
+        output("  chown -v Administrator file.txt     Change and display SID info");
+        output("  chown --reference=file1 file2       Match file2 owner/group to file1");
         output("");
         output("Note: Requires administrator privileges on Windows");
+        output("      Use -v flag to display SID information for verification");
         return;
     }
     
@@ -6848,71 +6858,52 @@ void cmd_chown(const std::vector<std::string>& args) {
         }
     }
     
-    // Get SID for the specified owner
-    PSID ownerSid = NULL;
-    if (!owner.empty() && referenceFile.empty()) {
-        SID_NAME_USE sidType;
-        DWORD sidSize = 0;
-        DWORD domainSize = 0;
+    // Helper function to convert string to SID (either numeric SID or name)
+    auto stringToSid = [&](const std::string& str, bool quiet) -> PSID {
+        if (str.empty()) return NULL;
         
-        LookupAccountNameA(NULL, owner.c_str(), NULL, &sidSize, NULL, &domainSize, &sidType);
-        
-        if (sidSize > 0) {
-            ownerSid = (PSID)LocalAlloc(LPTR, sidSize);
-            char* domainName = (char*)LocalAlloc(LPTR, domainSize);
-            
-            if (!LookupAccountNameA(NULL, owner.c_str(), ownerSid, &sidSize, domainName, &domainSize, &sidType)) {
-                if (!quiet) {
-                    outputError("chown: invalid user: '" + owner + "'");
-                }
-                LocalFree(ownerSid);
-                LocalFree(domainName);
-                g_lastExitStatus = 1;
-                return;
+        // Check if it's already a numeric SID (starts with S-)
+        if (str.length() > 2 && str[0] == 'S' && str[1] == '-') {
+            PSID sid = NULL;
+            if (ConvertStringSidToSidA(str.c_str(), &sid)) {
+                return sid;
             }
-            LocalFree(domainName);
-        } else {
             if (!quiet) {
-                outputError("chown: invalid user: '" + owner + "'");
+                outputError("chown: invalid SID: '" + str + "'");
             }
-            g_lastExitStatus = 1;
-            return;
+            return NULL;
         }
-    } else if (referenceFile.empty() && owner.empty() && group.empty()) {
-        if (!quiet) {
-            outputError("chown: missing operand after '" + files[0] + "'");
-            output("Try 'chown --help' for more information.");
-        }
-        g_lastExitStatus = 1;
-        return;
-    }
-    
-    // Get SID for the specified group
-    PSID groupSid = NULL;
-    if (!group.empty() && referenceFile.empty()) {
+        
+        // Otherwise treat as account name (possibly domain\account)
         SID_NAME_USE sidType;
         DWORD sidSize = 0;
         DWORD domainSize = 0;
         
-        LookupAccountNameA(NULL, group.c_str(), NULL, &sidSize, NULL, &domainSize, &sidType);
+        // First call to get sizes
+        LookupAccountNameA(NULL, str.c_str(), NULL, &sidSize, NULL, &domainSize, &sidType);
         
         if (sidSize > 0) {
-            groupSid = (PSID)LocalAlloc(LPTR, sidSize);
+            PSID sid = (PSID)LocalAlloc(LPTR, sidSize);
             char* domainName = (char*)LocalAlloc(LPTR, domainSize);
             
-            if (!LookupAccountNameA(NULL, group.c_str(), groupSid, &sidSize, domainName, &domainSize, &sidType)) {
+            if (!LookupAccountNameA(NULL, str.c_str(), sid, &sidSize, domainName, &domainSize, &sidType)) {
                 if (!quiet) {
-                    outputError("chown: invalid group: '" + group + "'");
+                    outputError("chown: invalid user/group: '" + str + "'");
                 }
-                LocalFree(groupSid);
+                LocalFree(sid);
                 LocalFree(domainName);
-                if (ownerSid) LocalFree(ownerSid);
-                g_lastExitStatus = 1;
-                return;
+                return NULL;
             }
             LocalFree(domainName);
+            return sid;
         }
-    }
+        
+        if (!quiet) {
+            outputError("chown: cannot find user/group: '" + str + "'");
+        }
+        return NULL;
+    };
+    
     
     // Helper function to check if current owner/group matches --from criteria
     auto matchesFrom = [&](const std::string& path) -> bool {
@@ -6977,6 +6968,67 @@ void cmd_chown(const std::vector<std::string>& args) {
         return matches;
     };
     
+    // Helper function to get SID string representation
+    auto getSidString = [](PSID sid) -> std::string {
+        if (!sid) return "(none)";
+        LPSTR sidString = NULL;
+        if (ConvertSidToStringSidA(sid, &sidString)) {
+            std::string result = sidString;
+            LocalFree(sidString);
+            return result;
+        }
+        return "(invalid-sid)";
+    };
+    
+    // Helper function to get account name from SID
+    auto getAccountName = [&getSidString](PSID sid) -> std::string {
+        if (!sid) return "(none)";
+        char accountName[256];
+        char domainName[256];
+        DWORD accountNameSize = sizeof(accountName);
+        DWORD domainNameSize = sizeof(domainName);
+        SID_NAME_USE sidType;
+        
+        if (LookupAccountSidA(NULL, sid, accountName, &accountNameSize, 
+                             domainName, &domainNameSize, &sidType)) {
+            if (domainName[0] != '\0') {
+                return std::string(domainName) + "\\" + accountName;
+            }
+            return accountName;
+        }
+        return getSidString(sid);
+    };
+    
+    // Resolve owner and group SIDs using stringToSid helper
+    PSID ownerSid = NULL;
+    PSID groupSid = NULL;
+    
+    if (!owner.empty() && referenceFile.empty()) {
+        ownerSid = stringToSid(owner, quiet);
+        if (!ownerSid) {
+            g_lastExitStatus = 1;
+            return;
+        }
+    }
+    
+    if (!group.empty() && referenceFile.empty()) {
+        groupSid = stringToSid(group, quiet);
+        if (!groupSid) {
+            if (ownerSid) LocalFree(ownerSid);
+            g_lastExitStatus = 1;
+            return;
+        }
+    }
+    
+    if (referenceFile.empty() && owner.empty() && group.empty()) {
+        if (!quiet) {
+            outputError("chown: missing operand after '" + files[0] + "'");
+            output("Try 'chown --help' for more information.");
+        }
+        g_lastExitStatus = 1;
+        return;
+    }
+    
     // Helper function to change ownership of a single file
     auto changeOwnership = [&](const std::string& unixPath) -> bool {
         std::string path = unixPathToWindows(unixPath);
@@ -7011,6 +7063,22 @@ void cmd_chown(const std::vector<std::string>& args) {
             return true; // Not an error, just skip
         }
         
+        // Get current ownership for verbose output
+        PSECURITY_DESCRIPTOR pSD = NULL;
+        PSID currentOwnerSid = NULL;
+        PSID currentGroupSid = NULL;
+        
+        GetNamedSecurityInfoA(
+            (LPSTR)path.c_str(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION,
+            &currentOwnerSid,
+            &currentGroupSid,
+            NULL,
+            NULL,
+            &pSD
+        );
+        
         // Determine which SIDs to use
         PSID useOwnerSid = ownerSid;
         PSID useGroupSid = groupSid;
@@ -7026,6 +7094,7 @@ void cmd_chown(const std::vector<std::string>& args) {
         if (useGroupSid) secInfo |= GROUP_SECURITY_INFORMATION;
         
         if (secInfo == 0) {
+            if (pSD) LocalFree(pSD);
             return true; // Nothing to change
         }
         
@@ -7048,22 +7117,37 @@ void cmd_chown(const std::vector<std::string>& args) {
                     outputError("chown: changing ownership of '" + unixPath + "': Error " + std::to_string(result));
                 }
             }
+            if (pSD) LocalFree(pSD);
             return false;
         }
         
-        // Output diagnostic
+        // Output diagnostic with SID information
         if (verbose || changesOnly) {
-            std::string msg = "ownership of '" + unixPath + "' changed";
+            std::stringstream ss;
+            ss << "changed ownership of '" << unixPath << "'";
+            
             if (useOwnerSid && useGroupSid) {
-                msg = "changed ownership of '" + unixPath + "' to " + owner + ":" + group;
+                ss << " to " << getAccountName(useOwnerSid) << ":" << getAccountName(useGroupSid);
+                if (verbose) {
+                    ss << " (SID: " << getSidString(useOwnerSid) << ":" << getSidString(useGroupSid) << ")";
+                }
             } else if (useOwnerSid) {
-                msg = "changed ownership of '" + unixPath + "' to " + owner;
+                ss << " to " << getAccountName(useOwnerSid);
+                if (verbose) {
+                    ss << " (SID: " << getSidString(useOwnerSid) << ")";
+                }
             } else if (useGroupSid) {
-                msg = "changed group of '" + unixPath + "' to " + group;
+                ss << " (group to " << getAccountName(useGroupSid);
+                if (verbose) {
+                    ss << ", SID: " << getSidString(useGroupSid);
+                }
+                ss << ")";
             }
-            output(msg);
+            
+            output(ss.str());
         }
         
+        if (pSD) LocalFree(pSD);
         return true;
     };
     
