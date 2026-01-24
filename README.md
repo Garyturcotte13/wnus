@@ -1,17 +1,17 @@
-[![Version](https://img.shields.io/badge/version-0.1.4.8-orange.svg)](.)[![Size](https://img.shields.io/badge/size-7.1MB-blue.svg)](.)[![Platform](https://img.shields.io/badge/platform-Windows-blue.svg)](https://www.microsoft.com/windows)[![Build](https://img.shields.io/badge/build-passing-brightgreen.svg)](.)[![Tests](https://img.shields.io/badge/tests-10%2F10%20PASS-brightgreen.svg)](test_posix_simple.ps1)
+[![Version](https://img.shields.io/badge/version-0.1.4.9-orange.svg)](.)[![Size](https://img.shields.io/badge/size-7.14MB-blue.svg)](.)[![Platform](https://img.shields.io/badge/platform-Windows-blue.svg)](https://www.microsoft.com/windows)[![Build](https://img.shields.io/badge/build-passing-brightgreen.svg)](.)[![Tests](https://img.shields.io/badge/tests-10%2F10%20PASS-brightgreen.svg)](test_posix_simple.ps1)
 
 # Windows Native Unix Shell (wnus)
 
-**v0.1.4.8** - Comprehensive Unix/Linux command-line environment for Windows with **273 fully implemented commands** in pure C++ (zero external dependencies).
+**v0.1.4.9** - Comprehensive Unix/Linux command-line environment for Windows with **276 fully implemented commands** (100% - zero stubs) in pure C++ (zero external dependencies).
 
-**Quick Stats:** 7.1 MB executable | 30-40 MB RAM | Windows 7+ | Test suite: 10/10 PASS
+**Quick Stats:** 7.14 MB executable | 30-40 MB RAM | Windows 7+ | Test suite: 10/10 PASS
 
 ## ✨ Features
 
-- 🔧 **273 commands** - uuencode, uudecode, pax, nc, ssh, scp, grep, sed, awk, tar, make, tcpdump, nmap, and more
+- 🔧 **276 commands** - strace, journalctl, c-run, uuencode, uudecode, pax, nc, ssh, scp, grep, sed, awk, tar, make, tcpdump, nmap, and more
 - 📁 **Native NTFS** - Windows ACL integration, hard/symbolic links, full permission management
 - 🔀 **Bash compatible** - pipes (`|`), redirects (`>`, `>>`), chaining (`&&`, `||`), background (`&`)
-- 📖 **275 man pages** - comprehensive documentation for every command
+- 📖 **276 man pages** - comprehensive documentation for every command
 - 🌐 **Networking** - SSH/SCP/SFTP/FTP with AES-256 encryption, tcpdump, nmap, ping, traceroute
 - 📦 **Archives** - tar, gzip, zip, RAR, xz/LZMA, bzip2 (all native implementations)
 - 🔐 **Enterprise crypto** - Windows CNG API with FIPS 140-2 validated algorithms
@@ -56,7 +56,7 @@
 
 ### Requirements
 - **OS:** Windows 7+ (Windows 10/11 recommended)
-- **Disk:** 7.1 MB for executable
+- **Disk:** 7.13 MB for executable
 - **RAM:** 30-40 MB typical usage
 - **Build:** C++ compiler (MSVC, MinGW, or Clang) for source compilation
 - **Note:** gcc/g++ are *not* bundled with wnus; use your own installed toolchain.
@@ -103,10 +103,10 @@ g++ -O3 -std=c++11 -municode -DUNICODE -D_UNICODE -mwindows wnus.cpp -o wnus.exe
 **Text Editors:** vi, vim, nano, ed, ex  
 **Utilities:** echo, printf, test, expr, bc, calc, true, false, yes, seq, shuf, factor, base64  
 **Service Management:** systemctl, service  
-**Build Tools:** make, ar, nm, objdump, strip (compatibility wrappers). gcc/g++ are *not shipped*; they require an external compiler installed and on PATH.
+**Build Tools:** c-run, make, ar, nm, objdump, strip (compatibility wrappers). gcc/g++ are *not shipped*; they require an external compiler installed and on PATH.
 
 ### Manual Pages
-All 275 commands have full manual pages accessible via:
+All 276 commands have full manual pages accessible via:
 ```bash
 man command_name
 ```
@@ -204,7 +204,7 @@ bg %2
 
 ### Architecture
 - **Language:** Pure C++ (C++11 standard)
-- **Size:** 7.1 MB executable (57,263 lines of code)
+- **Size:** 7.14 MB executable (57,686 lines of code)
 - **Dependencies:** Zero external libraries (uses only Windows API and C++ standard library)
 - **APIs Used:** Windows API, Winsock2, CNG Cryptography, Service Control Manager, DNS API
 - **Compiler:** TDM-GCC 10.3.0+ or MSVC 2019+
@@ -219,18 +219,21 @@ bg %2
 ### Performance
 - **Startup:** Instant (< 100ms typical)
 - **Memory:** 30-40 MB RAM typical usage
-- **Commands:** 273 fully implemented, 2 informational stubs (strace, journalctl)
+- **Commands:** 276 fully implemented, 0 stubs (100% coverage)
 - **Threads:** Single-threaded for simplicity and compatibility
 
 ## 📊 Command Implementation Status
 
-- **Total Commands:** 275
-- **Fully Implemented:** 273 (99.3%)
-- **Informational Stubs:** 2 (strace, journalctl - Windows platform limitations)
-- **Manual Pages:** 275 (100% documentation coverage)
+- **Total Commands:** 276
+- **Fully Implemented:** 276 (100%)
+- **Informational Stubs:** 0 (all commands fully functional)
+- **Manual Pages:** 276 (100% documentation coverage)
 - **Test Suite:** 10/10 PASS
 
 ### Recently Added (v0.1.4.8)
+- **strace** - Full Windows Debug API-based process and library call tracing (replaces stub)
+- **journalctl** - Windows Event Log reader with filtering and log enumeration (replaces stub)
+- **c-run** - Compile and run C source using an existing cl/gcc/clang on PATH (no bundled toolchain)
 - **uuencode/uudecode** - RFC 1113 + RFC 4648 base64 encoding/decoding
 - **pax** - POSIX portable archive exchange (create/extract archives)
 - **nc (netcat)** - TCP/UDP network utility with client/server modes

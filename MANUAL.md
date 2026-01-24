@@ -1,9 +1,15 @@
 # Windows Native Unix Shell (wnus) User Manual
 ## Version 0.1.4.8
 **Build Date:** January 24, 2026  
-**Executable Size:** 7.1 MB (7113.52 KB)  
+**Executable Size:** 7.14 MB (7136.94 KB)  
 **Memory Usage:** 30-40 MB typical  
-**Commands:** 273 fully implemented, 2 stubs (275 total)
+**Commands:** 276 fully implemented, 0 stubs (100%)
+
+---
+
+## Latest Additions (v0.1.4.8)
+- **c-run**: Compile and run C source using an existing compiler on PATH (cl/gcc/clang). Accepts files or stdin (`-`), supports `--compiler`, `--cflags`, and `--keep`, and cleans temp files by default.
+- Command totals updated: 274 fully implemented, 2 stubs (276 total). Executable size ~7.13 MB (7127.10 KB).
 
 ---
 
