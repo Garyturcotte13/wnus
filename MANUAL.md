@@ -1,20 +1,17 @@
 # Windows Native Unix Shell (wnus) User Manual
-## Version 0.1.5.9
+## Version 0.1.6.0
 **Build Date:** January 25, 2026  
-**Executable Size:** 11.61 MB (11885.87 KB)  
+**Executable Size:** 11.69 MB (11973.42 KB)  
 **Memory Usage:** 30-40 MB typical  
-**Commands:** 289 fully implemented, 0 stubs (100%)
+**Commands:** 290 fully implemented, 0 stubs (100%)
 
 ---
 
-## Latest Additions (v0.1.5.9)
+## Latest Additions (v0.1.6.0)
+- **ninja**: Fast minimal build system supporting build.ninja files with variable substitution, rule definitions, build statements, and dependency-based incremental builds. Tools include clean, targets, commands, and graph. Reads build files, executes commands via Windows API, and performs timestamp-based rebuild detection. Compatible with CMake-generated ninja files.
 - **gcc**: GNU C compiler wrapper supporting all GCC compilation options (-c, -o, -Wall, -O0/O1/O2/O3, -g, -std=c89/c99/c11/c17, -I, -L, -l, -D, -shared, -static, -m32/m64, -fpic) with gcc.exe delegation and PATH resolution. Enables C compilation workflows in wnus shell. Requires GCC to be installed (MinGW, TDM-GCC, or MSYS2).
 - **g++**: GNU C++ compiler wrapper supporting all G++ compilation options with C++ standards (c++98, c++11, c++14, c++17, c++20), threading support (-pthread), and full option pass-through via g++.exe delegation. Also accessible as 'gxx' alias. Enables C++ compilation in wnus environment. Requires GCC/G++ to be installed.
-- **git**: Distributed version control system wrapper supporting all Git commands (init, clone, add, commit, push, pull, branch, checkout, merge, status, log, diff) with full git.exe delegation and PATH resolution. Enables version control workflows without context switching from wnus shell.
-- **docker**: Container platform and orchestration wrapper supporting all Docker commands (run, ps, images, build, push, pull, exec, logs, stop, rm, rmi, compose) with docker.exe delegation and Docker Compose support. Provides seamless containerization experience in wnus environment.
-- **telnet**: TCP TELNET protocol client supporting hostname/IP resolution with `gethostbyname()`, configurable ports (default 23), and options for username (`-l`), auto-login (`-a`), escape character (`-e`), and version information. Uses Winsock2 API for non-blocking socket communication and interactive session management.
-- **cmake**: CMake build system configuration generator supporting CMakeLists.txt parsing, project discovery, cache generation, multiple generators (Visual Studio, Ninja, Unix Makefiles), build directory management with `-B` and `-S` options, cache variables via `-D`, and build/install modes. Creates complete CMake infrastructure including CMakeCache.txt and build files.
-- Command totals updated: 289 fully implemented, 0 stubs (289 total). Executable size ~11.61 MB (11885.87 KB).
+- Command totals updated: 290 fully implemented, 0 stubs (290 total). Executable size ~11.69 MB (11973.42 KB).
 
 ---
 
