@@ -1,10 +1,10 @@
-[![Version](https://img.shields.io/badge/version-0.1.5.8-orange.svg)](.)[![Size](https://img.shields.io/badge/size-7.23MB-blue.svg)](.)[![Platform](https://img.shields.io/badge/platform-Windows-blue.svg)](https://www.microsoft.com/windows)[![Build](https://img.shields.io/badge/build-passing-brightgreen.svg)](.)[![Tests](https://img.shields.io/badge/tests-10%2F10%20PASS-brightgreen.svg)](test_posix_simple.ps1)
+[![Version](https://img.shields.io/badge/version-0.1.5.9-orange.svg)](.)[![Size](https://img.shields.io/badge/size-11.61MB-blue.svg)](.)[![Platform](https://img.shields.io/badge/platform-Windows-blue.svg)](https://www.microsoft.com/windows)[![Build](https://img.shields.io/badge/build-passing-brightgreen.svg)](.)[![Tests](https://img.shields.io/badge/tests-10%2F10%20PASS-brightgreen.svg)](test_posix_simple.ps1)
 
 # Windows Native Unix Shell (wnus)
 
-**v0.1.5.8** - Comprehensive Unix/Linux command-line environment for Windows with **287 fully implemented commands** in pure C++ (zero external dependencies).
+**v0.1.5.9** - Comprehensive Unix/Linux command-line environment for Windows with **289 fully implemented commands** in pure C++ (zero external dependencies).
 
-**Quick Stats:** 7.09 MB | 40-50 MB RAM | Windows 7+ | Tabbed GUI with multi-session persistence
+**Quick Stats:** 11.61 MB | 40-50 MB RAM | Windows 7+ | Tabbed GUI with multi-session persistence
 
 ## ✨ Features
 

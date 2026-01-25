@@ -1,4 +1,5 @@
 #define _WIN32_WINNT 0x0600
+#define NOMINMAX
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <iphlpapi.h>
@@ -562,7 +563,7 @@ int g_emacsMarkCol = 0;  // Emacs mark column
 #define REG_VALUE_FULL_PATH "FullPathPrompt"
 #define REG_VALUE_LINE_WRAP "LineWrap"
 
-const std::string WNUS_VERSION = "0.1.5.8";
+const std::string WNUS_VERSION = "0.1.5.9";
 
 // Utility functions
 std::vector<std::string> split(const std::string& str, char delimiter = ' ') {
@@ -27665,6 +27666,231 @@ void cmd_man(const std::vector<std::string>& args) {
         output("SEE ALSO");
         output("    ssh, rsync, yq");
 
+    } else if (cmd == "gcc") {
+        output("NAME");
+        output("    gcc - GNU C compiler wrapper");
+        output("");
+        output("SYNOPSIS");
+        output("    gcc [OPTIONS] file...");
+        output("");
+        output("DESCRIPTION");
+        output("    GCC wrapper that delegates to gcc.exe installed on the system.");
+        output("    The GNU Compiler Collection includes front ends for C, C++,");
+        output("    Objective-C, and other languages, providing high-quality");
+        output("    optimization and code generation for multiple platforms.");
+        output("");
+        output("COMMON OPTIONS");
+        output("    -c");
+        output("        Compile or assemble source files without linking");
+        output("");
+        output("    -o <file>");
+        output("        Place output in file <file>");
+        output("");
+        output("    -Wall");
+        output("        Enable all common warning messages");
+        output("");
+        output("    -Werror");
+        output("        Make all warnings into errors");
+        output("");
+        output("    -O0, -O1, -O2, -O3, -Os");
+        output("        Set optimization level (0=none, 3=maximum, s=size)");
+        output("");
+        output("    -g");
+        output("        Generate debug information for use with debugger");
+        output("");
+        output("    -I<directory>");
+        output("        Add directory to include search path");
+        output("");
+        output("    -L<directory>");
+        output("        Add directory to library search path");
+        output("");
+        output("    -l<library>");
+        output("        Link with library (e.g., -lm for math library)");
+        output("");
+        output("    -D<macro>[=value]");
+        output("        Define preprocessor macro");
+        output("");
+        output("    -std=<standard>");
+        output("        Language standard: c89, c99, c11, c17, gnu89, gnu99, gnu11, gnu17");
+        output("");
+        output("    -shared");
+        output("        Create a shared library");
+        output("");
+        output("    -static");
+        output("        Produce static linking");
+        output("");
+        output("    -m32, -m64");
+        output("        Generate code for 32-bit or 64-bit environment");
+        output("");
+        output("    -fpic, -fPIC");
+        output("        Generate position-independent code");
+        output("");
+        output("OPTIONS");
+        output("    --version          Display GCC version");
+        output("    --help             Display help information");
+        output("    -v                 Verbose mode (show compilation commands)");
+        output("    -E                 Preprocess only; do not compile");
+        output("    -S                 Compile only; do not assemble");
+        output("    -pipe              Use pipes for communication between stages");
+        output("    -pedantic          Issue warnings for non-standard code");
+        output("");
+        output("EXAMPLES");
+        output("    gcc hello.c");
+        output("        Compile hello.c to a.exe (default output)");
+        output("");
+        output("    gcc -o hello hello.c");
+        output("        Compile hello.c to hello.exe");
+        output("");
+        output("    gcc -c file.c");
+        output("        Compile file.c to object file file.o");
+        output("");
+        output("    gcc -Wall -O2 -o program main.c utils.c");
+        output("        Compile multiple files with warnings and optimization");
+        output("");
+        output("    gcc -g -o debug program.c");
+        output("        Compile with debug information");
+        output("");
+        output("    gcc -std=c11 -pedantic code.c");
+        output("        Compile with C11 standard and strict checking");
+        output("");
+        output("    gcc -shared -o libfoo.dll foo.c");
+        output("        Create shared library (DLL on Windows)");
+        output("");
+        output("    gcc -I./include -L./lib -o app main.c -lmylib");
+        output("        Compile with custom include/library paths");
+        output("");
+        output("DIAGNOSTICS");
+        output("    Exit status:");
+        output("    0    Successful compilation");
+        output("    1    Compilation failed");
+        output("    127  gcc.exe not found in PATH");
+        output("");
+        output("NOTES");
+        output("    - This is a wrapper that delegates to gcc.exe");
+        output("    - GCC must be installed and in PATH");
+        output("    - All GCC options are passed through directly");
+        output("    - Supports all GCC command-line features");
+        output("    - Install from: TDM-GCC, MinGW-w64, or MSYS2");
+        output("");
+        output("SEE ALSO");
+        output("    g++, make, cmake, gdb");
+
+    } else if (cmd == "g++") {
+        output("NAME");
+        output("    g++ - GNU C++ compiler wrapper");
+        output("");
+        output("SYNOPSIS");
+        output("    g++ [OPTIONS] file...");
+        output("");
+        output("DESCRIPTION");
+        output("    G++ wrapper that delegates to g++.exe installed on the system.");
+        output("    The GNU C++ compiler is part of the GNU Compiler Collection,");
+        output("    providing full C++ language support including C++98, C++11,");
+        output("    C++14, C++17, and C++20 standards.");
+        output("");
+        output("COMMON OPTIONS");
+        output("    -c");
+        output("        Compile or assemble source files without linking");
+        output("");
+        output("    -o <file>");
+        output("        Place output in file <file>");
+        output("");
+        output("    -Wall");
+        output("        Enable all common warning messages");
+        output("");
+        output("    -Werror");
+        output("        Make all warnings into errors");
+        output("");
+        output("    -O0, -O1, -O2, -O3, -Os");
+        output("        Set optimization level (0=none, 3=maximum, s=size)");
+        output("");
+        output("    -g");
+        output("        Generate debug information for use with debugger");
+        output("");
+        output("    -I<directory>");
+        output("        Add directory to include search path");
+        output("");
+        output("    -L<directory>");
+        output("        Add directory to library search path");
+        output("");
+        output("    -l<library>");
+        output("        Link with library (e.g., -lstdc++ for standard C++ library)");
+        output("");
+        output("    -D<macro>[=value]");
+        output("        Define preprocessor macro");
+        output("");
+        output("    -std=<standard>");
+        output("        C++ standard: c++98, c++11, c++14, c++17, c++20, gnu++11, gnu++17");
+        output("");
+        output("    -shared");
+        output("        Create a shared library");
+        output("");
+        output("    -static");
+        output("        Produce static linking");
+        output("");
+        output("    -m32, -m64");
+        output("        Generate code for 32-bit or 64-bit environment");
+        output("");
+        output("    -pthread");
+        output("        Enable POSIX threads support");
+        output("");
+        output("    -fpic, -fPIC");
+        output("        Generate position-independent code");
+        output("");
+        output("OPTIONS");
+        output("    --version          Display G++ version");
+        output("    --help             Display help information");
+        output("    -v                 Verbose mode (show compilation commands)");
+        output("    -E                 Preprocess only; do not compile");
+        output("    -S                 Compile only; do not assemble");
+        output("    -pipe              Use pipes for communication between stages");
+        output("    -pedantic          Issue warnings for non-standard code");
+        output("");
+        output("EXAMPLES");
+        output("    g++ hello.cpp");
+        output("        Compile hello.cpp to a.exe (default output)");
+        output("");
+        output("    g++ -o hello hello.cpp");
+        output("        Compile hello.cpp to hello.exe");
+        output("");
+        output("    g++ -c file.cpp");
+        output("        Compile file.cpp to object file file.o");
+        output("");
+        output("    g++ -Wall -std=c++17 -O2 -o program main.cpp");
+        output("        Compile with C++17 standard, warnings, and optimization");
+        output("");
+        output("    g++ -g -o debug program.cpp");
+        output("        Compile with debug information");
+        output("");
+        output("    g++ -std=c++20 -pedantic code.cpp");
+        output("        Compile with C++20 standard and strict checking");
+        output("");
+        output("    g++ -shared -o libfoo.dll foo.cpp");
+        output("        Create shared library (DLL on Windows)");
+        output("");
+        output("    g++ -pthread -o threaded app.cpp");
+        output("        Compile with threading support");
+        output("");
+        output("    g++ -I./include -L./lib -o app main.cpp -lmylib");
+        output("        Compile with custom include/library paths");
+        output("");
+        output("DIAGNOSTICS");
+        output("    Exit status:");
+        output("    0    Successful compilation");
+        output("    1    Compilation failed");
+        output("    127  g++.exe not found in PATH");
+        output("");
+        output("NOTES");
+        output("    - This is a wrapper that delegates to g++.exe");
+        output("    - G++ must be installed and in PATH");
+        output("    - All G++ options are passed through directly");
+        output("    - Supports all G++ command-line features");
+        output("    - Also accessible as 'gxx' alias");
+        output("    - Install from: TDM-GCC, MinGW-w64, or MSYS2");
+        output("");
+        output("SEE ALSO");
+        output("    gcc, make, cmake, gdb");
+
     } else if (cmd == "uname") {
         output("NAME");
         output("    uname - print system information");
@@ -31189,6 +31415,264 @@ void cmd_docker(const std::vector<std::string>& args) {
     }
 
     // Wait for docker.exe to complete
+    WaitForSingleObject(pi.hProcess, INFINITE);
+
+    // Get exit code
+    DWORD exitCode = 0;
+    GetExitCodeProcess(pi.hProcess, &exitCode);
+
+    // Clean up
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+
+    g_lastExitStatus = exitCode;
+}
+
+// GCC wrapper - delegate to gcc.exe if available
+void cmd_gcc(const std::vector<std::string>& args) {
+    if (args.size() < 2 || checkHelpFlag(args)) {
+        output("Usage: gcc [options] file...");
+        output("  GNU C compiler wrapper");
+        output("");
+        output("DESCRIPTION");
+        output("  GCC wrapper delegates to gcc.exe in system PATH.");
+        output("  Requires GCC to be installed (MinGW, TDM-GCC, or MSYS2).");
+        output("");
+        output("COMMON OPTIONS");
+        output("  -c                  Compile without linking");
+        output("  -o <file>           Output file name");
+        output("  -Wall               Enable all warnings");
+        output("  -Werror             Treat warnings as errors");
+        output("  -O0, -O1, -O2, -O3  Optimization levels");
+        output("  -g                  Generate debug information");
+        output("  -I<dir>             Include directory");
+        output("  -L<dir>             Library directory");
+        output("  -l<library>         Link with library");
+        output("  -D<macro>           Define preprocessor macro");
+        output("  -std=<standard>     Language standard (c89, c99, c11, c17)");
+        output("  -shared             Create shared library");
+        output("  -static             Static linking");
+        output("  -m32, -m64          32/64-bit compilation");
+        output("");
+        output("OPTIONS");
+        output("  --version           Show GCC version");
+        output("  --help              Show this help");
+        output("");
+        output("EXAMPLES");
+        output("  gcc hello.c");
+        output("    Compile hello.c to a.exe");
+        output("");
+        output("  gcc -o hello hello.c");
+        output("    Compile hello.c to hello.exe");
+        output("");
+        output("  gcc -c file.c");
+        output("    Compile to object file");
+        output("");
+        output("  gcc -Wall -O2 -o prog main.c utils.c");
+        output("    Compile with warnings and optimization");
+        output("");
+        output("  gcc -shared -o lib.dll lib.c");
+        output("    Create shared library");
+        output("");
+        output("NOTES");
+        output("  This is a wrapper that delegates to gcc.exe.");
+        output("  GCC must be installed and in PATH.");
+        output("  All GCC options are passed through directly.");
+        output("  Install: MinGW, TDM-GCC, or MSYS2 with GCC package.");
+        return;
+    }
+
+    // Try to find and execute gcc.exe
+    char* pathEnv = getenv("PATH");
+    bool gccFound = false;
+    
+    if (pathEnv) {
+        std::string pathStr(pathEnv);
+        std::istringstream pathStream(pathStr);
+        std::string pathDir;
+        
+        while (std::getline(pathStream, pathDir, ';')) {
+            std::string gccFullPath = pathDir + "\\gcc.exe";
+            
+            HANDLE hFile = CreateFileA(gccFullPath.c_str(), GENERIC_READ, FILE_SHARE_READ, 
+                                      nullptr, OPEN_EXISTING, 0, nullptr);
+            if (hFile != INVALID_HANDLE_VALUE) {
+                CloseHandle(hFile);
+                gccFound = true;
+                break;
+            }
+        }
+    }
+
+    if (!gccFound) {
+        outputError("gcc: command not found (gcc.exe not in PATH)");
+        output("Please install GCC:");
+        output("  - TDM-GCC: https://jmeubank.github.io/tdm-gcc/");
+        output("  - MinGW-w64: https://www.mingw-w64.org/");
+        output("  - MSYS2: https://www.msys2.org/");
+        g_lastExitStatus = 127;
+        return;
+    }
+
+    // Build the command line with all arguments
+    std::string cmdLine = "gcc.exe";
+    for (size_t i = 1; i < args.size(); i++) {
+        cmdLine += " ";
+        if (args[i].find(' ') != std::string::npos) {
+            cmdLine += "\"" + args[i] + "\"";
+        } else {
+            cmdLine += args[i];
+        }
+    }
+
+    // Create process to execute gcc.exe
+    PROCESS_INFORMATION pi;
+    STARTUPINFOA si = {};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    si.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
+    si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+
+    if (!CreateProcessA(nullptr, (LPSTR)cmdLine.c_str(), nullptr, nullptr, TRUE,
+                        0, nullptr, nullptr, &si, &pi)) {
+        outputError("gcc: failed to execute");
+        g_lastExitStatus = 1;
+        return;
+    }
+
+    // Wait for gcc.exe to complete
+    WaitForSingleObject(pi.hProcess, INFINITE);
+
+    // Get exit code
+    DWORD exitCode = 0;
+    GetExitCodeProcess(pi.hProcess, &exitCode);
+
+    // Clean up
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+
+    g_lastExitStatus = exitCode;
+}
+
+// G++ wrapper - delegate to g++.exe if available
+void cmd_gxx(const std::vector<std::string>& args) {
+    if (args.size() < 2 || checkHelpFlag(args)) {
+        output("Usage: g++ [options] file...");
+        output("  GNU C++ compiler wrapper");
+        output("");
+        output("DESCRIPTION");
+        output("  G++ wrapper delegates to g++.exe in system PATH.");
+        output("  Requires GCC/G++ to be installed (MinGW, TDM-GCC, or MSYS2).");
+        output("");
+        output("COMMON OPTIONS");
+        output("  -c                  Compile without linking");
+        output("  -o <file>           Output file name");
+        output("  -Wall               Enable all warnings");
+        output("  -Werror             Treat warnings as errors");
+        output("  -O0, -O1, -O2, -O3  Optimization levels");
+        output("  -g                  Generate debug information");
+        output("  -I<dir>             Include directory");
+        output("  -L<dir>             Library directory");
+        output("  -l<library>         Link with library");
+        output("  -D<macro>           Define preprocessor macro");
+        output("  -std=<standard>     Language standard (c++98, c++11, c++14, c++17, c++20)");
+        output("  -shared             Create shared library");
+        output("  -static             Static linking");
+        output("  -m32, -m64          32/64-bit compilation");
+        output("  -pthread            Enable POSIX threads");
+        output("");
+        output("OPTIONS");
+        output("  --version           Show G++ version");
+        output("  --help              Show this help");
+        output("");
+        output("EXAMPLES");
+        output("  g++ hello.cpp");
+        output("    Compile hello.cpp to a.exe");
+        output("");
+        output("  g++ -o hello hello.cpp");
+        output("    Compile hello.cpp to hello.exe");
+        output("");
+        output("  g++ -c file.cpp");
+        output("    Compile to object file");
+        output("");
+        output("  g++ -Wall -std=c++17 -O2 -o prog main.cpp");
+        output("    Compile with C++17 standard, warnings, and optimization");
+        output("");
+        output("  g++ -shared -o lib.dll lib.cpp");
+        output("    Create shared library");
+        output("");
+        output("  g++ -pthread -o threaded app.cpp");
+        output("    Compile with threading support");
+        output("");
+        output("NOTES");
+        output("  This is a wrapper that delegates to g++.exe.");
+        output("  G++ must be installed and in PATH.");
+        output("  All G++ options are passed through directly.");
+        output("  Install: MinGW, TDM-GCC, or MSYS2 with GCC package.");
+        return;
+    }
+
+    // Try to find and execute g++.exe
+    char* pathEnv = getenv("PATH");
+    bool gxxFound = false;
+    
+    if (pathEnv) {
+        std::string pathStr(pathEnv);
+        std::istringstream pathStream(pathStr);
+        std::string pathDir;
+        
+        while (std::getline(pathStream, pathDir, ';')) {
+            std::string gxxFullPath = pathDir + "\\g++.exe";
+            
+            HANDLE hFile = CreateFileA(gxxFullPath.c_str(), GENERIC_READ, FILE_SHARE_READ, 
+                                      nullptr, OPEN_EXISTING, 0, nullptr);
+            if (hFile != INVALID_HANDLE_VALUE) {
+                CloseHandle(hFile);
+                gxxFound = true;
+                break;
+            }
+        }
+    }
+
+    if (!gxxFound) {
+        outputError("g++: command not found (g++.exe not in PATH)");
+        output("Please install G++:");
+        output("  - TDM-GCC: https://jmeubank.github.io/tdm-gcc/");
+        output("  - MinGW-w64: https://www.mingw-w64.org/");
+        output("  - MSYS2: https://www.msys2.org/");
+        g_lastExitStatus = 127;
+        return;
+    }
+
+    // Build the command line with all arguments
+    std::string cmdLine = "g++.exe";
+    for (size_t i = 1; i < args.size(); i++) {
+        cmdLine += " ";
+        if (args[i].find(' ') != std::string::npos) {
+            cmdLine += "\"" + args[i] + "\"";
+        } else {
+            cmdLine += args[i];
+        }
+    }
+
+    // Create process to execute g++.exe
+    PROCESS_INFORMATION pi;
+    STARTUPINFOA si = {};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    si.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
+    si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+
+    if (!CreateProcessA(nullptr, (LPSTR)cmdLine.c_str(), nullptr, nullptr, TRUE,
+                        0, nullptr, nullptr, &si, &pi)) {
+        outputError("g++: failed to execute");
+        g_lastExitStatus = 1;
+        return;
+    }
+
+    // Wait for g++.exe to complete
     WaitForSingleObject(pi.hProcess, INFINITE);
 
     // Get exit code
@@ -37843,7 +38327,7 @@ void cmd_version(const std::vector<std::string>& args) {
     output("═══════════════════════════════════════════════════════════════════");
     output("CORE FEATURES:");
     output("═══════════════════════════════════════════════════════════════════");
-    output("  ✓ 287 commands (100% fully implemented; zero informational stubs)");
+    output("  ✓ 289 commands (100% fully implemented; zero informational stubs)");
     output("  ✓ Native Windows NTFS file system support");
     output("  ✓ Full pipe operation support (|)");
     output("  ✓ Interactive tab completion");
@@ -49330,6 +49814,9 @@ void cmd_whatis(const std::vector<std::string>& args) {
         {"cmake", "cmake - cross-platform build system generator"},
         {"git", "git - distributed version control system wrapper"},
         {"docker", "docker - container platform and orchestration wrapper"},
+        {"gcc", "gcc - GNU C compiler wrapper"},
+        {"g++", "g++ - GNU C++ compiler wrapper"},
+        {"gxx", "gxx - GNU C++ compiler wrapper (alias for g++)"},
         {"history", "history - display or manage command history"},
         {"umask", "umask - set file mode creation mask"},
         {"watch", "watch - execute command repeatedly"},
@@ -56257,6 +56744,8 @@ void cmd_help() {
     output("  cmake [opts] [dir] - Configure CMake projects and generate build files");
     output("  git [command]    - Distributed version control system wrapper");
     output("  docker [command] - Container platform and orchestration wrapper");
+    output("  gcc [opts] file  - GNU C compiler wrapper");
+    output("  g++ [opts] file  - GNU C++ compiler wrapper");
     output("  gzip/gunzip [file] - Compress/decompress files");
     output("  bzip2/bunzip2 [file] - Compress/decompress files (bzip2 format)");
     output("  xz [opts] <file> - Compress files to XZ format");
@@ -59915,6 +60404,10 @@ void executeCommand(const std::string& command) {
         cmd_git(args);
     } else if (commandEquals(cmd, "docker")) {
         cmd_docker(args);
+    } else if (commandEquals(cmd, "gcc")) {
+        cmd_gcc(args);
+    } else if (commandEquals(cmd, "g++") || commandEquals(cmd, "gxx")) {
+        cmd_gxx(args);
     } else if (commandEquals(cmd, "help")) {
         cmd_help(args);
     } else {
