@@ -562,7 +562,7 @@ int g_emacsMarkCol = 0;  // Emacs mark column
 #define REG_VALUE_FULL_PATH "FullPathPrompt"
 #define REG_VALUE_LINE_WRAP "LineWrap"
 
-const std::string WNUS_VERSION = "0.1.5.7";
+const std::string WNUS_VERSION = "0.1.5.8";
 
 // Utility functions
 std::vector<std::string> split(const std::string& str, char delimiter = ' ') {
@@ -27483,6 +27483,188 @@ void cmd_man(const std::vector<std::string>& args) {
         output("SEE ALSO");
         output("    make, ninja, ctest (cmake testing tool)");
 
+    } else if (cmd == "git") {
+        output("NAME");
+        output("    git - distributed version control system wrapper");
+        output("");
+        output("SYNOPSIS");
+        output("    git [COMMAND] [OPTIONS]");
+        output("");
+        output("DESCRIPTION");
+        output("    Git wrapper that delegates to git.exe installed on the system.");
+        output("    Provides distributed version control for tracking changes to files");
+        output("    and collaborating with other developers.");
+        output("");
+        output("COMMON COMMANDS");
+        output("    init [<directory>]");
+        output("        Create a new local repository");
+        output("");
+        output("    clone <repository> [<directory>]");
+        output("        Clone a repository into a new directory");
+        output("");
+        output("    add <pathspec>...");
+        output("        Stage files for the next commit");
+        output("");
+        output("    commit [-m <message>]");
+        output("        Create a new commit with staged changes");
+        output("");
+        output("    push [<repository>] [<refspec>]");
+        output("        Update remote references with local changes");
+        output("");
+        output("    pull [<repository>] [<branch>]");
+        output("        Fetch and integrate with another repository or branch");
+        output("");
+        output("    branch [<branch-name>]");
+        output("        List, create, or delete branches");
+        output("");
+        output("    checkout <branch>");
+        output("        Switch branches or restore working tree files");
+        output("");
+        output("    merge <branch>");
+        output("        Join development history");
+        output("");
+        output("    status");
+        output("        Show current repository status");
+        output("");
+        output("    log [<options>]");
+        output("        Show commit history");
+        output("");
+        output("    diff [<options>]");
+        output("        Show changes between commits, branches, or files");
+        output("");
+        output("OPTIONS");
+        output("    --version          Show Git version");
+        output("    --help              Show help");
+        output("    -h, --help          Show command-specific help");
+        output("");
+        output("EXAMPLES");
+        output("    git init");
+        output("        Initialize new repository");
+        output("");
+        output("    git clone https://github.com/user/repo.git");
+        output("        Clone remote repository");
+        output("");
+        output("    git add .");
+        output("        Stage all changes");
+        output("");
+        output("    git commit -m 'Initial commit'");
+        output("        Create commit with message");
+        output("");
+        output("    git push origin main");
+        output("        Push to remote branch");
+        output("");
+        output("    git log --oneline -n 5");
+        output("        Show last 5 commits");
+        output("");
+        output("NOTES");
+        output("    - This is a wrapper that delegates to git.exe");
+        output("    - Requires Git to be installed and in PATH");
+        output("    - All Git commands and options are passed through");
+        output("    - Install from: https://git-scm.com/download/win");
+        output("");
+        output("SEE ALSO");
+        output("    ssh, scp, rsync");
+
+    } else if (cmd == "docker") {
+        output("NAME");
+        output("    docker - container platform and orchestration wrapper");
+        output("");
+        output("SYNOPSIS");
+        output("    docker [COMMAND] [OPTIONS]");
+        output("");
+        output("DESCRIPTION");
+        output("    Docker wrapper that delegates to docker.exe installed on the system.");
+        output("    Provides containerization technology for packaging applications");
+        output("    with their dependencies for consistent deployment.");
+        output("");
+        output("COMMON COMMANDS");
+        output("    run [OPTIONS] IMAGE [COMMAND]");
+        output("        Run a command in a new container");
+        output("");
+        output("    ps [OPTIONS]");
+        output("        List containers (use -a for all)");
+        output("");
+        output("    images [OPTIONS]");
+        output("        List images");
+        output("");
+        output("    build [OPTIONS] PATH");
+        output("        Build an image from a Dockerfile");
+        output("");
+        output("    push [OPTIONS] NAME:TAG");
+        output("        Push an image to a registry");
+        output("");
+        output("    pull [OPTIONS] NAME:TAG");
+        output("        Pull an image from a registry");
+        output("");
+        output("    exec [OPTIONS] CONTAINER COMMAND");
+        output("        Run a command in a running container");
+        output("");
+        output("    logs [OPTIONS] CONTAINER");
+        output("        Fetch logs from a container");
+        output("");
+        output("    stop [OPTIONS] CONTAINER");
+        output("        Stop one or more running containers");
+        output("");
+        output("    rm [OPTIONS] CONTAINER");
+        output("        Remove one or more containers");
+        output("");
+        output("    rmi [OPTIONS] IMAGE");
+        output("        Remove one or more images");
+        output("");
+        output("    compose [COMMAND]");
+        output("        Define and run multi-container Docker applications");
+        output("        (also available as 'docker-compose')");
+        output("");
+        output("OPTIONS");
+        output("    --version           Show Docker version");
+        output("    --help              Show help");
+        output("    -h, --help          Show command-specific help");
+        output("");
+        output("EXAMPLES");
+        output("    docker run -d nginx");
+        output("        Run nginx container in background");
+        output("");
+        output("    docker ps");
+        output("        List running containers");
+        output("");
+        output("    docker ps -a");
+        output("        List all containers");
+        output("");
+        output("    docker build -t myapp .");
+        output("        Build image from Dockerfile");
+        output("");
+        output("    docker logs myapp");
+        output("        View container logs");
+        output("");
+        output("    docker exec -it myapp bash");
+        output("        Open shell in running container");
+        output("");
+        output("    docker compose up");
+        output("        Start services defined in docker-compose.yml");
+        output("");
+        output("CONTAINER OPTIONS");
+        output("    -d              Run container in detached mode (background)");
+        output("    -i              Keep STDIN open");
+        output("    -t              Allocate pseudo-TTY");
+        output("    -p PORT:PORT    Map container ports");
+        output("    -e VAR=VAL      Set environment variables");
+        output("    --name NAME     Assign container name");
+        output("    -v PATH:PATH    Mount volumes");
+        output("");
+        output("BUILD OPTIONS");
+        output("    -t NAME:TAG     Tag image");
+        output("    -f FILE         Use specific Dockerfile");
+        output("");
+        output("NOTES");
+        output("    - This is a wrapper that delegates to docker.exe");
+        output("    - Requires Docker Desktop to be installed and running");
+        output("    - All Docker commands and options are passed through");
+        output("    - Supports docker-compose commands");
+        output("    - Install from: https://www.docker.com/products/docker-desktop");
+        output("");
+        output("SEE ALSO");
+        output("    ssh, rsync, yq");
+
     } else if (cmd == "uname") {
         output("NAME");
         output("    uname - print system information");
@@ -30773,6 +30955,251 @@ void cmd_cmake(const std::vector<std::string>& args) {
     output("-- Generating done");
 
     g_lastExitStatus = 0;
+}
+
+// Git wrapper - delegate to git.exe if available
+void cmd_git(const std::vector<std::string>& args) {
+    if (args.size() < 2 || checkHelpFlag(args)) {
+        output("Usage: git [command] [options]");
+        output("  Distributed version control system wrapper");
+        output("");
+        output("DESCRIPTION");
+        output("  Git wrapper delegates to git.exe in system PATH.");
+        output("  Requires git.exe to be installed and available in PATH.");
+        output("");
+        output("COMMON COMMANDS");
+        output("  git init                Initialize a new Git repository");
+        output("  git clone <url>         Clone a repository");
+        output("  git add <file>          Stage files for commit");
+        output("  git commit -m 'msg'     Commit staged changes");
+        output("  git push                Push commits to remote");
+        output("  git pull                Fetch and merge from remote");
+        output("  git status              Show repository status");
+        output("  git log                 Show commit history");
+        output("  git branch              List or create branches");
+        output("  git checkout <branch>   Switch to branch");
+        output("  git merge <branch>      Merge branch into current");
+        output("");
+        output("OPTIONS");
+        output("  --version               Show Git version");
+        output("  --help                  Show this help");
+        output("");
+        output("EXAMPLES");
+        output("  git init");
+        output("    Initialize new repository");
+        output("");
+        output("  git clone https://github.com/user/repo.git");
+        output("    Clone a remote repository");
+        output("");
+        output("  git commit -m 'Initial commit'");
+        output("    Commit changes with message");
+        output("");
+        output("NOTES");
+        output("  This is a wrapper that delegates to git.exe.");
+        output("  Git must be installed and in PATH for this to work.");
+        output("  All git commands and options are passed through directly.");
+        return;
+    }
+
+    // Try to find and execute git.exe
+    // First, check if git.exe is in PATH
+    HANDLE hFind;
+    WIN32_FIND_DATAA findData;
+    
+    // Try direct execution via system/CreateProcess
+    std::string gitCmd = "git.exe";
+    
+    // Check if git exists in PATH by attempting to get its full path
+    char gitPath[MAX_PATH];
+    bool gitFound = false;
+    
+    // Search in PATH environment variable
+    char* pathEnv = getenv("PATH");
+    if (pathEnv) {
+        std::string pathStr(pathEnv);
+        std::istringstream pathStream(pathStr);
+        std::string pathDir;
+        
+        // Split by semicolon (Windows PATH separator)
+        while (std::getline(pathStream, pathDir, ';')) {
+            // Try forward slash first, then backslash
+            std::string gitFullPath = pathDir + "\\git.exe";
+            
+            // Check if file exists
+            HANDLE hFile = CreateFileA(gitFullPath.c_str(), GENERIC_READ, FILE_SHARE_READ, 
+                                      nullptr, OPEN_EXISTING, 0, nullptr);
+            if (hFile != INVALID_HANDLE_VALUE) {
+                CloseHandle(hFile);
+                gitFound = true;
+                break;
+            }
+        }
+    }
+
+    if (!gitFound) {
+        outputError("git: command not found (git.exe not in PATH)");
+        output("Please install Git from: https://git-scm.com/download/win");
+        g_lastExitStatus = 127;
+        return;
+    }
+
+    // Build the command line with all arguments
+    std::string cmdLine = "git.exe";
+    for (size_t i = 1; i < args.size(); i++) {
+        cmdLine += " ";
+        // Quote arguments that contain spaces
+        if (args[i].find(' ') != std::string::npos) {
+            cmdLine += "\"" + args[i] + "\"";
+        } else {
+            cmdLine += args[i];
+        }
+    }
+
+    // Create process to execute git.exe
+    PROCESS_INFORMATION pi;
+    STARTUPINFOA si = {};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    si.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
+    si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+
+    if (!CreateProcessA(nullptr, (LPSTR)cmdLine.c_str(), nullptr, nullptr, TRUE,
+                        0, nullptr, nullptr, &si, &pi)) {
+        outputError("git: failed to execute");
+        g_lastExitStatus = 1;
+        return;
+    }
+
+    // Wait for git.exe to complete
+    WaitForSingleObject(pi.hProcess, INFINITE);
+
+    // Get exit code
+    DWORD exitCode = 0;
+    GetExitCodeProcess(pi.hProcess, &exitCode);
+
+    // Clean up
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+
+    g_lastExitStatus = exitCode;
+}
+
+// Docker wrapper - delegate to docker.exe if available
+void cmd_docker(const std::vector<std::string>& args) {
+    if (args.size() < 2 || checkHelpFlag(args)) {
+        output("Usage: docker [command] [options]");
+        output("  Container platform and orchestration wrapper");
+        output("");
+        output("DESCRIPTION");
+        output("  Docker wrapper delegates to docker.exe in system PATH.");
+        output("  Requires Docker Desktop to be installed and running.");
+        output("");
+        output("COMMON COMMANDS");
+        output("  docker run <image>             Run a container from image");
+        output("  docker ps                      List running containers");
+        output("  docker ps -a                   List all containers");
+        output("  docker images                  List available images");
+        output("  docker pull <image>            Pull image from registry");
+        output("  docker push <image>            Push image to registry");
+        output("  docker build -t <tag> .        Build image from Dockerfile");
+        output("  docker exec <id> <cmd>         Execute command in container");
+        output("  docker logs <id>               Show container logs");
+        output("  docker stop <id>               Stop running container");
+        output("  docker rm <id>                 Remove container");
+        output("  docker rmi <image>             Remove image");
+        output("  docker compose up              Start services (docker-compose)");
+        output("");
+        output("OPTIONS");
+        output("  --version                Show Docker version");
+        output("  --help                  Show this help");
+        output("");
+        output("EXAMPLES");
+        output("  docker run -d nginx");
+        output("    Run nginx container in background");
+        output("");
+        output("  docker ps");
+        output("    List running containers");
+        output("");
+        output("  docker build -t myapp .");
+        output("    Build image from Dockerfile");
+        output("");
+        output("NOTES");
+        output("  This is a wrapper that delegates to docker.exe.");
+        output("  Docker Desktop must be installed and running.");
+        output("  All docker commands and options are passed through directly.");
+        output("  Also supports docker-compose commands via 'docker compose'.");
+        return;
+    }
+
+    // Try to find and execute docker.exe
+    char* pathEnv = getenv("PATH");
+    bool dockerFound = false;
+    
+    if (pathEnv) {
+        std::string pathStr(pathEnv);
+        std::istringstream pathStream(pathStr);
+        std::string pathDir;
+        
+        while (std::getline(pathStream, pathDir, ';')) {
+            std::string dockerFullPath = pathDir + "\\docker.exe";
+            
+            HANDLE hFile = CreateFileA(dockerFullPath.c_str(), GENERIC_READ, FILE_SHARE_READ, 
+                                      nullptr, OPEN_EXISTING, 0, nullptr);
+            if (hFile != INVALID_HANDLE_VALUE) {
+                CloseHandle(hFile);
+                dockerFound = true;
+                break;
+            }
+        }
+    }
+
+    if (!dockerFound) {
+        outputError("docker: command not found (docker.exe not in PATH)");
+        output("Please install Docker Desktop from: https://www.docker.com/products/docker-desktop");
+        g_lastExitStatus = 127;
+        return;
+    }
+
+    // Build the command line with all arguments
+    std::string cmdLine = "docker.exe";
+    for (size_t i = 1; i < args.size(); i++) {
+        cmdLine += " ";
+        if (args[i].find(' ') != std::string::npos || args[i].find('"') != std::string::npos) {
+            cmdLine += "\"" + args[i] + "\"";
+        } else {
+            cmdLine += args[i];
+        }
+    }
+
+    // Create process to execute docker.exe
+    PROCESS_INFORMATION pi;
+    STARTUPINFOA si = {};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    si.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
+    si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+
+    if (!CreateProcessA(nullptr, (LPSTR)cmdLine.c_str(), nullptr, nullptr, TRUE,
+                        0, nullptr, nullptr, &si, &pi)) {
+        outputError("docker: failed to execute");
+        g_lastExitStatus = 1;
+        return;
+    }
+
+    // Wait for docker.exe to complete
+    WaitForSingleObject(pi.hProcess, INFINITE);
+
+    // Get exit code
+    DWORD exitCode = 0;
+    GetExitCodeProcess(pi.hProcess, &exitCode);
+
+    // Clean up
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+
+    g_lastExitStatus = exitCode;
 }
 
 // Alias command - create, list, or remove command aliases
@@ -37416,7 +37843,7 @@ void cmd_version(const std::vector<std::string>& args) {
     output("═══════════════════════════════════════════════════════════════════");
     output("CORE FEATURES:");
     output("═══════════════════════════════════════════════════════════════════");
-    output("  ✓ 285 commands (100% fully implemented; zero informational stubs)");
+    output("  ✓ 287 commands (100% fully implemented; zero informational stubs)");
     output("  ✓ Native Windows NTFS file system support");
     output("  ✓ Full pipe operation support (|)");
     output("  ✓ Interactive tab completion");
@@ -48901,6 +49328,8 @@ void cmd_whatis(const std::vector<std::string>& args) {
         {"xml", "xml - XML parser and processor with query, validation, and formatting"},
         {"telnet", "telnet - communicate with another host using the TELNET protocol"},
         {"cmake", "cmake - cross-platform build system generator"},
+        {"git", "git - distributed version control system wrapper"},
+        {"docker", "docker - container platform and orchestration wrapper"},
         {"history", "history - display or manage command history"},
         {"umask", "umask - set file mode creation mask"},
         {"watch", "watch - execute command repeatedly"},
@@ -55826,6 +56255,8 @@ void cmd_help() {
     output("  tar [-cxt] -f <archive> [files...] - Create/extract/list tar archives");
     output("  make [target]    - Build automation from Makefile");
     output("  cmake [opts] [dir] - Configure CMake projects and generate build files");
+    output("  git [command]    - Distributed version control system wrapper");
+    output("  docker [command] - Container platform and orchestration wrapper");
     output("  gzip/gunzip [file] - Compress/decompress files");
     output("  bzip2/bunzip2 [file] - Compress/decompress files (bzip2 format)");
     output("  xz [opts] <file> - Compress files to XZ format");
@@ -59480,6 +59911,10 @@ void executeCommand(const std::string& command) {
         cmd_telnet(args);
     } else if (commandEquals(cmd, "cmake")) {
         cmd_cmake(args);
+    } else if (commandEquals(cmd, "git")) {
+        cmd_git(args);
+    } else if (commandEquals(cmd, "docker")) {
+        cmd_docker(args);
     } else if (commandEquals(cmd, "help")) {
         cmd_help(args);
     } else {

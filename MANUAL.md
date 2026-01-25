@@ -1,20 +1,22 @@
 # Windows Native Unix Shell (wnus) User Manual
-## Version 0.1.5.7
+## Version 0.1.5.8
 **Build Date:** January 25, 2026  
-**Executable Size:** 7.18 MB (7360.28 KB)  
+**Executable Size:** 7.23 MB (7403.57 KB)  
 **Memory Usage:** 30-40 MB typical  
-**Commands:** 285 fully implemented, 0 stubs (100%)
+**Commands:** 287 fully implemented, 0 stubs (100%)
 
 ---
 
-## Latest Additions (v0.1.5.7)
+## Latest Additions (v0.1.5.8)
+- **git**: Distributed version control system wrapper supporting all Git commands (init, clone, add, commit, push, pull, branch, checkout, merge, status, log, diff) with full git.exe delegation and PATH resolution. Enables version control workflows without context switching from wnus shell.
+- **docker**: Container platform and orchestration wrapper supporting all Docker commands (run, ps, images, build, push, pull, exec, logs, stop, rm, rmi, compose) with docker.exe delegation and Docker Compose support. Provides seamless containerization experience in wnus environment.
 - **telnet**: TCP TELNET protocol client supporting hostname/IP resolution with `gethostbyname()`, configurable ports (default 23), and options for username (`-l`), auto-login (`-a`), escape character (`-e`), and version information. Uses Winsock2 API for non-blocking socket communication and interactive session management.
 - **cmake**: CMake build system configuration generator supporting CMakeLists.txt parsing, project discovery, cache generation, multiple generators (Visual Studio, Ninja, Unix Makefiles), build directory management with `-B` and `-S` options, cache variables via `-D`, and build/install modes. Creates complete CMake infrastructure including CMakeCache.txt and build files.
 - **jq**: JSON query processor and transformer supporting filters (`.`, `.[]`, `.field`, `|`, `keys`, `values`, `length`, `map`, `select`, `sort`, `group_by`, `unique`, `reverse`, `min/max`, arithmetic, and more)
 - **parallel**: Multi-threaded job executor that processes input lines as parallel jobs with `-j` (thread count), `--line-buffer`, and output control
 - **dos2unix**: Converts CRLF to LF line endings with optional backup (`-b` flag), binary-safe operation
 - **unix2dos**: Converts LF to CRLF line endings with optional backup (`-b` flag), binary-safe operation
-- Command totals updated: 285 fully implemented, 0 stubs (285 total). Executable size ~7.18 MB (7360.28 KB).
+- Command totals updated: 287 fully implemented, 0 stubs (287 total). Executable size ~7.23 MB (7403.57 KB).
 
 ---
 
