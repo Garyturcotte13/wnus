@@ -1,8 +1,8 @@
-[![Version](https://img.shields.io/badge/version-0.1.5.3-orange.svg)](.)[![Size](https://img.shields.io/badge/size-7.2MB-blue.svg)](.)[![Platform](https://img.shields.io/badge/platform-Windows-blue.svg)](https://www.microsoft.com/windows)[![Build](https://img.shields.io/badge/build-passing-brightgreen.svg)](.)[![Tests](https://img.shields.io/badge/tests-10%2F10%20PASS-brightgreen.svg)](test_posix_simple.ps1)
+[![Version](https://img.shields.io/badge/version-0.1.5.4-orange.svg)](.)[![Size](https://img.shields.io/badge/size-7.2MB-blue.svg)](.)[![Platform](https://img.shields.io/badge/platform-Windows-blue.svg)](https://www.microsoft.com/windows)[![Build](https://img.shields.io/badge/build-passing-brightgreen.svg)](.)[![Tests](https://img.shields.io/badge/tests-10%2F10%20PASS-brightgreen.svg)](test_posix_simple.ps1)
 
 # Windows Native Unix Shell (wnus)
 
-**v0.1.5.3** - Comprehensive Unix/Linux command-line environment for Windows with **276 fully implemented commands** in pure C++ (zero external dependencies).
+**v0.1.5.4** - Comprehensive Unix/Linux command-line environment for Windows with **276 fully implemented commands** in pure C++ (zero external dependencies).
 
 **Quick Stats:** 7.2 MB | 40-50 MB RAM | Windows 7+ | Tabbed GUI with multi-session persistence
 

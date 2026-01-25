@@ -1,14 +1,52 @@
-# WNUS Release Notes - Version 0.1.4.9
+# WNUS Release Notes - Version 0.1.5.4
 
-**Release Date:** January 24, 2026  
-**Current Build:** 7.14 MB (7136.94 KB)  
+**Release Date:** January 25, 2026  
+**Current Build:** 7.19 MB (7189.62 KB)  
 **Platform:** Windows (all versions)  
 **Compiler:** TDM-GCC 10.3.0+ or MSVC 2019+  
 **C++ Standard:** C++11  
 **Command Count:** 276 (276 fully implemented; 0 stubs - 100% coverage)  
 **Manual Pages:** 276 (100% coverage)  
 **Test Suite:** 10/10 PASS (test_posix_simple.ps1)  
-**Memory Usage:** 30-40 MB typical
+**Memory Usage:** 40-50 MB typical
+
+---
+
+## Version 0.1.5.4 - January 25, 2026 🎨 GUI POLISH RELEASE
+
+### Summary
+Enhanced tabbed GUI interface with improved dark mode support, visual polish, and bug fixes for color theme management.
+
+### GUI Improvements
+
+#### 1. **Dark Mode Tab Support**
+- Fixed tab control visibility in dark mode
+- Proper custom drawing for tabs in dark theme
+- Tab control now respects Windows dark mode settings
+- Empty theme string allows full custom draw control
+
+#### 2. **Color Theme Refresh**
+- Fixed screen edge refresh when changing colors
+- Entire window now invalidates on color changes
+- Both text and background color changes trigger full redraw
+- Eliminated artifacts around window edges
+
+#### 3. **Branding Updates**
+- Replaced all "GaryShell" references with "wnus"
+- Updated help text and command descriptions
+- Consistent branding across all documentation
+- Updated version display and about information
+
+### Technical Changes
+- `applyThemeToControls()`: Modified tab theme handling
+- Color picker handlers: Added window invalidation
+- All command help text updated with correct branding
+- Version constant updated to 0.1.5.4
+
+### Bug Fixes
+- ✅ Tabs now visible in dark mode
+- ✅ Screen edges refresh properly on color change
+- ✅ Consistent branding throughout application
 
 ---
 

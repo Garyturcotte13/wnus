@@ -560,7 +560,7 @@ int g_emacsMarkCol = 0;  // Emacs mark column
 #define REG_VALUE_FULL_PATH "FullPathPrompt"
 #define REG_VALUE_LINE_WRAP "LineWrap"
 
-const std::string WNUS_VERSION = "0.1.5.3";
+const std::string WNUS_VERSION = "0.1.5.4";
 
 // Utility functions
 std::vector<std::string> split(const std::string& str, char delimiter = ' ') {
@@ -22892,13 +22892,13 @@ void cmd_man(const std::vector<std::string>& args) {
         
     } else if (cmd == "version") {
         output("NAME");
-        output("    version - show GaryShell version and features");
+        output("    version - show wnus version and features");
         output("");
         output("SYNOPSIS");
         output("    version");
         output("");
         output("DESCRIPTION");
-        output("    Display the GaryShell version number, build information,");
+        output("    Display the wnus version number, build information,");
         output("    and list of supported features and commands.");
         output("    Shows full compatibility with NTFS file system.");
         output("");
@@ -23276,7 +23276,7 @@ void cmd_man(const std::vector<std::string>& args) {
         output("");
         output("DESCRIPTION");
         output("    Terminal multiplexer allowing multiple terminal sessions.");
-        output("    This is a limited implementation for GaryShell.");
+        output("    This is a limited implementation for wnus.");
         output("    Full screen functionality requires advanced terminal handling.");
         output("");
         output("OPTIONS");
@@ -23369,7 +23369,7 @@ void cmd_man(const std::vector<std::string>& args) {
         output("");
         output("DESCRIPTION");
         output("    Display status of background jobs in the current session.");
-        output("    Job control is limited in GaryShell due to shell architecture.");
+        output("    Job control is limited in wnus due to shell architecture.");
         output("");
         output("OPTIONS");
         output("    -l    List process IDs with job information");
@@ -25556,7 +25556,7 @@ void cmd_man(const std::vector<std::string>& args) {
         output("EXAMPLES");
         output("    pgrep chrome");
         output("    pgrep -l notepad");
-        output("    pgrep -x garyshell.exe");
+        output("    pgrep -x wnus.exe");
         
     } else if (cmd == "pidof") {
         output("NAME");
@@ -35286,7 +35286,7 @@ void cmd_groups(const std::vector<std::string>& args) {
 void cmd_version(const std::vector<std::string>& args) {
     if (checkHelpFlag(args)) {
         output("Usage: version");
-        output("  Display GaryShell version and comprehensive feature information");
+        output("  Display wnus version and comprehensive feature information");
         return;
     }
     
@@ -36775,7 +36775,7 @@ void cmd_jobs(const std::vector<std::string>& args) {
         output("");
         output("DESCRIPTION");
         output("  Display status of jobs in the current session.");
-        output("  Job control is limited in GaryShell.");
+        output("  Job control is limited in wnus.");
         output("");
         output("NOTE");
         output("  Full job control (background/foreground management) requires");
@@ -36802,7 +36802,7 @@ void cmd_jobs(const std::vector<std::string>& args) {
     // Since we don't have real job control, show a message
     output("No background jobs.");
     output("");
-    output("Note: Job control not fully implemented in GaryShell.");
+    output("Note: Job control not fully implemented in wnus.");
     output("Background job management requires shell session state tracking.");
     output("");
     output("Alternatives for Windows:");
@@ -40767,11 +40767,11 @@ void cmd_nice(const std::vector<std::string>& args) {
     
     // Check if this is an internal command
     if (isInternalCommand(cmdName)) {
-        // For internal commands, we need to launch through garyshell.exe
+        // For internal commands, we need to launch through wnus.exe
         char exePath[MAX_PATH];
         GetModuleFileNameA(NULL, exePath, MAX_PATH);
         
-        // Build command line: garyshell.exe -c "command args"
+        // Build command line: wnus.exe -c "command args"
         std::string fullCommand = std::string(exePath) + " -c \"" + command + "\"";
         
         // Map niceness to Windows priority class
@@ -46647,7 +46647,7 @@ void cmd_whatis(const std::vector<std::string>& args) {
         {"whatis", "whatis - display one-line command descriptions"},
         {"apropos", "apropos - search manual page names and descriptions"},
         {"info", "info - display information about topics"},
-        {"version", "version - show GaryShell version and features"},
+        {"version", "version - show wnus version and features"},
         {"exit", "exit - exit the shell"},
         {"quit", "quit - exit the shell"},
         {"clear", "clear - clear the screen"},
@@ -53809,7 +53809,7 @@ void cmd_help() {
     output("HELP & INFO:");
     output("  man <command>    - Display manual page for command");
     output("  help             - Show this help");
-    output("  version          - Show GaryShell version and features");
+    output("  version          - Show wnus version and features");
     output("  info [topic]     - Display information about topics");
     output("  apropos <key>    - Search manual pages");
     output("  whatis <cmd>     - Show one-line command description");
@@ -57674,7 +57674,9 @@ void applyThemeToControls() {
     bool dark = isWindowsDarkModeEnabled();
     
     // Invalidate tab control to trigger redraw with new theme
+    // Set theme to empty string to disable default theming and allow custom draw
     if (g_hTabControl) {
+        SetWindowTheme(g_hTabControl, L"", L"");
         InvalidateRect(g_hTabControl, NULL, TRUE);
     }
     
@@ -57689,9 +57691,15 @@ void applyThemeToControls() {
 LRESULT CALLBACK TabControlSubclassProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData) {
     switch (message) {
         case WM_ERASEBKGND: {
-            // Let default handler erase background first
-            DefSubclassProc(hWnd, message, wParam, lParam);
-            return 1;  // Indicate we handled it to prevent default behavior
+            HDC hdc = (HDC)wParam;
+            RECT rect;
+            GetClientRect(hWnd, &rect);
+            bool isDark = isWindowsDarkModeEnabled();
+            COLORREF bgColor = isDark ? RGB(32, 32, 32) : RGB(240, 240, 240);
+            HBRUSH hBrush = CreateSolidBrush(bgColor);
+            FillRect(hdc, &rect, hBrush);
+            DeleteObject(hBrush);
+            return 1;  // We handled background
         }
         case WM_NCDESTROY:
             RemoveWindowSubclass(hWnd, TabControlSubclassProc, uIdSubclass);
@@ -57841,7 +57849,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             }
             
             // Subclass tab control for themed background painting
-            // SetWindowSubclass(g_hTabControl, TabControlSubclassProc, 0, 0);
+            SetWindowSubclass(g_hTabControl, TabControlSubclassProc, 0, 0);
             
             // Set appropriate tab sizing for better visibility
             // Width = 0 means auto-fit based on text, Height = 32 for better visibility
@@ -58005,6 +58013,61 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
         
         case WM_NOTIFY: {
             if (((LPNMHDR)lParam)->idFrom == 2) {  // Tab control ID
+                // Custom draw for tab background/text to force dark theme
+                if (((LPNMHDR)lParam)->code == NM_CUSTOMDRAW) {
+                    LPNMCUSTOMDRAW pcd = (LPNMCUSTOMDRAW)lParam;
+                    switch (pcd->dwDrawStage) {
+                        case CDDS_PREPAINT:
+                            return CDRF_NOTIFYITEMDRAW;  // Request per-item draw
+                        case CDDS_ITEMPREPAINT: {
+                            bool isDark = isWindowsDarkModeEnabled();
+                            if (isDark) {
+                                // Determine colors
+                                COLORREF bg = RGB(12, 12, 12);
+                                COLORREF border = RGB(96, 96, 96);
+                                COLORREF text = RGB(230, 230, 230);
+                                if (pcd->uItemState & CDIS_SELECTED) {
+                                    bg = RGB(20, 20, 20);
+                                    border = RGB(140, 140, 140);
+                                    text = RGB(255, 255, 255);
+                                }
+                                RECT r = pcd->rc;
+                                // Fill background
+                                HBRUSH hb = CreateSolidBrush(bg);
+                                FillRect(pcd->hdc, &r, hb);
+                                DeleteObject(hb);
+                                // Draw border
+                                HPEN pen = CreatePen(PS_SOLID, 1, border);
+                                HPEN oldPen = (HPEN)SelectObject(pcd->hdc, pen);
+                                HBRUSH oldBrush = (HBRUSH)SelectObject(pcd->hdc, GetStockObject(NULL_BRUSH));
+                                Rectangle(pcd->hdc, r.left, r.top, r.right, r.bottom);
+                                SelectObject(pcd->hdc, oldBrush);
+                                SelectObject(pcd->hdc, oldPen);
+                                DeleteObject(pen);
+                                // Get tab text
+                                char textBuf[256] = {0};
+                                TCITEMA item = {};
+                                item.mask = TCIF_TEXT;
+                                item.pszText = textBuf;
+                                item.cchTextMax = sizeof(textBuf);
+                                TabCtrl_GetItem(g_hTabControl, (int)pcd->dwItemSpec, &item);
+                                // Use tab font
+                                HFONT hFont = (HFONT)SendMessage(g_hTabControl, WM_GETFONT, 0, 0);
+                                HFONT oldFont = NULL;
+                                if (hFont) oldFont = (HFONT)SelectObject(pcd->hdc, hFont);
+                                SetTextColor(pcd->hdc, text);
+                                SetBkMode(pcd->hdc, TRANSPARENT);
+                                RECT textRect = r;
+                                textRect.left += 8;
+                                DrawTextA(pcd->hdc, textBuf, -1, &textRect, DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_END_ELLIPSIS);
+                                if (oldFont) SelectObject(pcd->hdc, oldFont);
+                                return CDRF_SKIPDEFAULT;  // We drew it
+                            }
+                            return CDRF_DODEFAULT;
+                        }
+                    }
+                }
+                
                 if (((LPNMHDR)lParam)->code == TCN_SELCHANGE) {
                     // Tab selection changed
                     int newTab = TabCtrl_GetCurSel(g_hTabControl);
@@ -58224,7 +58287,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
                 if (ChooseColor(&cc)) {
                     g_textColor = cc.rgbResult;
                     saveColorSettings();
-                    InvalidateRect(g_hOutput, NULL, TRUE);
+                    InvalidateRect(hWnd, NULL, TRUE);
                 }
                 return 0;
             } else if (LOWORD(wParam) == ID_OPTIONS_BG_COLOR) {
@@ -58244,7 +58307,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
                         DeleteObject(g_hBrush);
                     }
                     g_hBrush = CreateSolidBrush(g_bgColor);
-                    InvalidateRect(g_hOutput, NULL, TRUE);
+                    InvalidateRect(hWnd, NULL, TRUE);
                 }
                 return 0;
             }
