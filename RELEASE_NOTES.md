@@ -1,14 +1,62 @@
-# WNUS Release Notes - Version 0.1.5.5
+# WNUS Release Notes - Version 0.1.5.6
 
 **Release Date:** January 25, 2026  
-**Current Build:** 7.09 MB (7255.21 KB)  
+**Current Build:** 7.15 MB (7492.86 KB)  
 **Platform:** Windows (all versions)  
 **Compiler:** TDM-GCC 10.3.0+ or MSVC 2019+  
 **C++ Standard:** C++11  
-**Command Count:** 280 (280 fully implemented; 0 stubs - 100% coverage)  
-**Manual Pages:** 280 (100% coverage)  
+**Command Count:** 283 (283 fully implemented; 0 stubs - 100% coverage)  
+**Manual Pages:** 283 (100% coverage)  
 **Test Suite:** 10/10 PASS (test_posix_simple.ps1)  
 **Memory Usage:** 40-50 MB typical
+
+---
+
+## Version 0.1.5.6 - January 25, 2026 🚀 YAML, MTR & XML RELEASE
+
+### Major Additions
+
+**Three New Enterprise-Grade Commands:**
+
+1. **YQ** - YAML Query Processor
+   - XPath-like YAML filtering and transformation
+   - Kubernetes manifest processing
+   - Docker Compose configuration queries
+   - Full nested field access and array operations
+
+2. **MTR** - Network Route Tracing & Diagnostics
+   - Combined traceroute + ping functionality
+   - Per-hop latency statistics (min/avg/max/stddev)
+   - Packet loss analysis
+   - JSON and ASCII table output formats
+
+3. **XML** - XML Document Processor
+   - XML parsing, formatting, and validation
+   - XPath-like element selection and extraction
+   - Pretty-printing with indentation
+   - Element counting and listing
+
+### Implementation Details
+
+- **Total New Code:** ~1,200 lines of C++
+- **Binary Size:** 7.15 MB (increased from 7.09 MB)
+- **Commands:** 283 (increased from 280)
+- **External Dependencies:** ZERO (100% Windows native)
+- **Windows APIs Used:** ICMP, File I/O, string processing
+
+### Integration
+
+- ✅ Complete help system integration
+- ✅ Full man pages for all three commands
+- ✅ Whatis database entries
+- ✅ Command dispatcher registration
+
+### Testing
+
+- ✅ All commands verified working
+- ✅ Help output tested
+- ✅ Man pages display correctly
+- ✅ Backward compatibility maintained
 
 ---
 

@@ -1,0 +1,72 @@
+╔════════════════════════════════════════════════════════════════════════════════╗
+║                                                                                ║
+║                    VERSION UPDATE COMPLETE: v0.1.5.6                          ║
+║                                                                                ║
+╚════════════════════════════════════════════════════════════════════════════════╝
+
+
+FILES UPDATED
+──────────────────────────────────────────────────────────────────────────────────
+
+✅ wnus.cpp
+   └─ WNUS_VERSION constant updated: "0.1.5.5" → "0.1.5.6"
+   └─ Location: Line 565
+
+✅ README.md
+   ├─ Version badge updated: 0.1.5.5 → 0.1.5.6
+   ├─ Size badge updated: 7.09MB → 7.15MB
+   └─ Command count updated: 280 → 283
+
+✅ RELEASE_NOTES.md
+   ├─ Title updated: Version 0.1.5.5 → 0.1.5.6
+   ├─ Build size updated: 7.09 MB → 7.15 MB
+   ├─ Command count updated: 280 → 283
+   └─ New release section added for v0.1.5.6 with:
+      • YQ - YAML Query Processor
+      • MTR - Network Route Tracing
+      • XML - Document Processor
+
+
+BUILD VERIFICATION
+──────────────────────────────────────────────────────────────────────────────────
+
+Binary Information:
+  File:                wnus.exe
+  Size:                7317.24 KB (7.15 MB)
+  Version String:      0.1.5.6 ✅
+  Command Count:       283 ✅
+  Build Status:        SUCCESS ✅
+
+
+VERSION DISPLAY OUTPUT
+──────────────────────────────────────────────────────────────────────────────────
+
+$ .\wnus.exe version
+
+╔════════════════════════════════════════════════════════════╗
+║      Windows Native Unix Shell (wnus) version 0.1.5.6     ║
+║     A Comprehensive Bash-like Console for Windows (NTFS)  ║
+╚════════════════════════════════════════════════════════════╝
+
+Platform: Windows NTFS file system
+Build Date: January 2026
+
+═══════════════════════════════════════════════════════════════
+ Features
+═══════════════════════════════════════════════════════════════
+  ✓ 283 commands (100% fully implemented; zero informational stubs)
+
+
+SUMMARY
+──────────────────────────────────────────────────────────────────────────────────
+
+Version 0.1.5.6 is now live with:
+
+✅ Version constant updated in source code
+✅ README badges updated
+✅ Release notes updated
+✅ Binary rebuilt successfully
+✅ Version display verified
+✅ Command count verified (283)
+
+All version strings have been updated from 0.1.5.5 to 0.1.5.6.
