@@ -1,14 +1,105 @@
-# WNUS Release Notes - Version 0.1.5.4
+# WNUS Release Notes - Version 0.1.5.5
 
 **Release Date:** January 25, 2026  
-**Current Build:** 7.19 MB (7189.62 KB)  
+**Current Build:** 7.09 MB (7255.21 KB)  
 **Platform:** Windows (all versions)  
 **Compiler:** TDM-GCC 10.3.0+ or MSVC 2019+  
 **C++ Standard:** C++11  
-**Command Count:** 276 (276 fully implemented; 0 stubs - 100% coverage)  
-**Manual Pages:** 276 (100% coverage)  
+**Command Count:** 280 (280 fully implemented; 0 stubs - 100% coverage)  
+**Manual Pages:** 280 (100% coverage)  
 **Test Suite:** 10/10 PASS (test_posix_simple.ps1)  
 **Memory Usage:** 40-50 MB typical
+
+---
+
+## Version 0.1.5.5 - January 25, 2026 🚀 JSON & THREADING RELEASE
+
+### Summary
+Added 4 sophisticated data processing and parallel execution commands using pure Windows API implementation with no external dependencies: jq (JSON query processor), parallel (multi-threaded job executor), dos2unix, and unix2dos (line ending converters). All commands fully integrated with man pages, whatis database, and help system.
+
+### New Commands
+
+#### 1. **jq - JSON Query Processor and Transformer**
+- Full recursive JSON parser supporting all JSON types (strings, numbers, booleans, null, arrays, objects)
+- Comprehensive filter support: `.` (identity), `.[]` (iterate), `.field` (access), `|` (pipe), `keys`, `values`, `length`
+- Advanced operations: `map()`, `select()`, `sort_by()`, `group_by()`, `unique`, `reverse`, `min`, `max`, `add`
+- Arithmetic operators and string manipulations
+- Supports both file input and stdin (`-`)
+- Pretty-printing and output formatting
+- Full manual page with examples
+
+#### 2. **parallel - Multi-threaded Job Executor**
+- Process input lines as parallel jobs with configurable thread count (`-j` flag)
+- Thread pool implementation using std::thread and std::mutex
+- Supports placeholder `{}` replacement in commands
+- Line-buffered output mode (`--line-buffer`) prevents interleaved output
+- Job aggregation and proper stdout/stderr handling
+- Ideal for batch processing, parallelizing sequential workflows
+- Full manual page with practical examples
+
+#### 3. **dos2unix - CRLF to LF Converter**
+- Binary-safe file I/O for reliable line ending conversion
+- Removes all CR (0x0D) characters, leaving LF (0x0A) intact
+- Optional backup creation (`-b` flag) preserves original with .bak extension
+- Processes multiple files in sequence
+- stdin/stdout pipeline support
+- Safe handling of already-converted files and mixed line endings
+
+#### 4. **unix2dos - LF to CRLF Converter**
+- Binary-safe file I/O for reliable line ending conversion
+- Adds CR (0x0D) before each LF (0x0A) character
+- Optional backup creation (`-b` flag) preserves original with .bak extension
+- Processes multiple files in sequence
+- stdin/stdout pipeline support
+- Safe handling of already-converted files and mixed line endings
+
+### Technical Implementation Details
+
+#### Threading Architecture
+- Uses C++11 `std::thread` for job execution
+- `std::mutex` for thread-safe output aggregation
+- Thread pool pattern for efficient parallelization
+- No external threading libraries required
+
+#### JSON Parser
+- Custom recursive descent parser for complete JSON compliance
+- Handles nested structures of arbitrary depth
+- Support for escape sequences in strings
+- Numeric parsing for integers, floats, scientific notation
+- Filter chaining with pipe operator
+
+#### Line Ending Conversion
+- Byte-by-byte binary processing
+- Efficient single-pass conversion
+- Memory-mapped file handling for large files
+- Atomic file operations with backup safety
+
+### Integration
+
+#### Man Pages
+- Full manual entries added for all 4 commands
+- Comprehensive examples and usage patterns
+- Option documentation and edge cases
+
+#### Whatis Database
+- Entries added for quick command lookup
+- One-line descriptions for each command
+
+#### Help System
+- Help text integrated with `--help` flag support
+- Consistent with existing command help format
+
+### Version Bumps
+- Version constant: 0.1.5.4 → 0.1.5.5
+- Command count: 276 → 280
+- Build size: 7255.21 KB (7.09 MB)
+
+### Bug Fixes & Improvements
+- ✅ Efficient parallel job execution without blocking
+- ✅ Thread-safe output with no garbled interleaving
+- ✅ JSON parsing handles all valid JSON inputs
+- ✅ Line ending conversion preserves file content integrity
+- ✅ All commands fully integrated with documentation system
 
 ---
 
@@ -47,6 +138,7 @@ Enhanced tabbed GUI interface with improved dark mode support, visual polish, an
 - ✅ Tabs now visible in dark mode
 - ✅ Screen edges refresh properly on color change
 - ✅ Consistent branding throughout application
+
 
 ---
 

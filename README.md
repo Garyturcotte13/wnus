@@ -1,18 +1,18 @@
-[![Version](https://img.shields.io/badge/version-0.1.5.4-orange.svg)](.)[![Size](https://img.shields.io/badge/size-7.2MB-blue.svg)](.)[![Platform](https://img.shields.io/badge/platform-Windows-blue.svg)](https://www.microsoft.com/windows)[![Build](https://img.shields.io/badge/build-passing-brightgreen.svg)](.)[![Tests](https://img.shields.io/badge/tests-10%2F10%20PASS-brightgreen.svg)](test_posix_simple.ps1)
+[![Version](https://img.shields.io/badge/version-0.1.5.5-orange.svg)](.)[![Size](https://img.shields.io/badge/size-7.09MB-blue.svg)](.)[![Platform](https://img.shields.io/badge/platform-Windows-blue.svg)](https://www.microsoft.com/windows)[![Build](https://img.shields.io/badge/build-passing-brightgreen.svg)](.)[![Tests](https://img.shields.io/badge/tests-10%2F10%20PASS-brightgreen.svg)](test_posix_simple.ps1)
 
 # Windows Native Unix Shell (wnus)
 
-**v0.1.5.4** - Comprehensive Unix/Linux command-line environment for Windows with **276 fully implemented commands** in pure C++ (zero external dependencies).
+**v0.1.5.5** - Comprehensive Unix/Linux command-line environment for Windows with **280 fully implemented commands** in pure C++ (zero external dependencies).
 
-**Quick Stats:** 7.2 MB | 40-50 MB RAM | Windows 7+ | Tabbed GUI with multi-session persistence
+**Quick Stats:** 7.09 MB | 40-50 MB RAM | Windows 7+ | Tabbed GUI with multi-session persistence
 
 ## ✨ Features
 
-- 🔧 **276 commands** - strace, journalctl, c-run, uuencode, uudecode, pax, nc, ssh, scp, grep, sed, awk, tar, make, tcpdump, nmap, and more
+- 🔧 **280 commands** - jq, parallel, dos2unix, unix2dos, strace, journalctl, c-run, uuencode, uudecode, pax, nc, ssh, scp, grep, sed, awk, tar, make, tcpdump, nmap, and more
 - � **Tabbed GUI** - Multi-tab terminal with persistent session state (Ctrl+T new, Ctrl+W close, Ctrl+Tab switch)
 - �📁 **Native NTFS** - Windows ACL integration, hard/symbolic links, full permission management
 - 🔀 **Bash compatible** - pipes (`|`), redirects (`>`, `>>`), chaining (`&&`, `||`), background (`&`)
-- 📖 **276 man pages** - comprehensive documentation for every command
+- 📖 **280 man pages** - comprehensive documentation for every command
 - 🌐 **Networking** - SSH/SCP/SFTP/FTP with AES-256 encryption, tcpdump, nmap, ping, traceroute
 - 📦 **Archives** - tar, gzip, zip, RAR, xz/LZMA, bzip2 (all native implementations)
 - 🔐 **Enterprise crypto** - Windows CNG API with FIPS 140-2 validated algorithms

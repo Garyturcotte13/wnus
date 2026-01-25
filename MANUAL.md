@@ -1,15 +1,18 @@
 # Windows Native Unix Shell (wnus) User Manual
-## Version 0.1.4.8
-**Build Date:** January 24, 2026  
-**Executable Size:** 7.14 MB (7136.94 KB)  
+## Version 0.1.5.5
+**Build Date:** January 25, 2026  
+**Executable Size:** 7.09 MB (7255.21 KB)  
 **Memory Usage:** 30-40 MB typical  
-**Commands:** 276 fully implemented, 0 stubs (100%)
+**Commands:** 280 fully implemented, 0 stubs (100%)
 
 ---
 
-## Latest Additions (v0.1.4.8)
-- **c-run**: Compile and run C source using an existing compiler on PATH (cl/gcc/clang). Accepts files or stdin (`-`), supports `--compiler`, `--cflags`, and `--keep`, and cleans temp files by default.
-- Command totals updated: 274 fully implemented, 2 stubs (276 total). Executable size ~7.13 MB (7127.10 KB).
+## Latest Additions (v0.1.5.5)
+- **jq**: JSON query processor and transformer supporting filters (`.`, `.[]`, `.field`, `|`, `keys`, `values`, `length`, `map`, `select`, `sort`, `group_by`, `unique`, `reverse`, `min/max`, arithmetic, and more)
+- **parallel**: Multi-threaded job executor that processes input lines as parallel jobs with `-j` (thread count), `--line-buffer`, and output control
+- **dos2unix**: Converts CRLF to LF line endings with optional backup (`-b` flag), binary-safe operation
+- **unix2dos**: Converts LF to CRLF line endings with optional backup (`-b` flag), binary-safe operation
+- Command totals updated: 280 fully implemented, 0 stubs (280 total). Executable size ~7.09 MB (7255.21 KB).
 
 ---
 
@@ -875,6 +878,105 @@ grep --binary-files=text "pattern" file.bin
 grep -in "error" file.txt    # Ignore case + line numbers
 grep -l -r "pattern" /logs   # Find files with pattern recursively
 grep -B2 -A2 --color "warn" *.log
+```
+
+### JSON & Data Processing
+
+#### jq - JSON Query Processor and Transformer
+```bash
+# Pretty-print JSON
+jq '.' input.json
+
+# Extract field
+jq '.name' data.json
+
+# Array iteration
+jq '.[]' array.json
+
+# Nested field access
+jq '.user.email' data.json
+
+# Recursive descent (find all values of specific key)
+jq '.. | .fieldname?' data.json
+
+# Array/Object operations
+jq 'keys' object.json       # Get object keys or array indices
+jq 'values' object.json     # Get object values
+jq 'length' data.json       # Get length of array/object/string
+
+# Filtering and selection
+jq '.[] | select(.age > 21)' users.json
+jq 'map(.name)' users.json
+jq 'sort_by(.age)' users.json
+jq 'group_by(.department)' employees.json
+jq 'unique' values.json
+jq 'reverse' array.json
+jq 'min, max' numbers.json
+
+# Pipe operations and composition
+echo '{"a":1,"b":2}' | jq '.a'
+jq '.[] | .name' users.json | grep pattern
+
+# Arithmetic and string operations
+jq '.price * 1.1' items.json
+jq '.name | length' data.json
+
+# Note: Input via stdin or files; output to stdout
+```
+
+#### parallel - Multi-threaded Job Executor
+```bash
+# Execute jobs in parallel from stdin
+echo -e "job1\njob2\njob3" | parallel echo "Processing: {}"
+
+# Process with specified thread count
+cat commands.txt | parallel -j 4 bash -c "{}"
+
+# Line-buffered output (each line from same job grouped together)
+parallel --line-buffer -j 2 echo "Job: {}" < jobs.txt
+
+# Execute commands across multiple lines
+seq 1 1000 | parallel -j 8 "echo {} && sleep 0.1"
+
+# Practical examples
+find . -name "*.log" -type f | parallel gzip {}
+cat urls.txt | parallel -j 4 curl -s {}
+
+# Note: Each input line becomes a separate job; threads specified with -j
+```
+
+#### dos2unix - Convert CRLF Line Endings to LF
+```bash
+# Convert file in-place (Windows CRLF to Unix LF)
+dos2unix file.txt
+
+# Convert with backup (creates .bak)
+dos2unix -b file.txt
+
+# Convert multiple files
+dos2unix -b file1.txt file2.txt file3.txt
+
+# Read from stdin, output to stdout
+cat windows_file.txt | dos2unix > unix_file.txt
+
+# Note: Original file modified in-place; use -b for backup
+```
+
+#### unix2dos - Convert LF Line Endings to CRLF
+```bash
+# Convert file in-place (Unix LF to Windows CRLF)
+unix2dos file.txt
+
+# Convert with backup (creates .bak)
+unix2dos -b file.txt
+
+# Convert multiple files
+unix2dos -b file1.txt file2.txt file3.txt
+
+# Read from stdin, output to stdout
+cat unix_file.txt | unix2dos > windows_file.txt
+
+# Note: Original file modified in-place; use -b for backup
 ```
 
 #### sed - Stream Editor (POSIX/GNU Compatible, Refactored v0.1.2.2)
