@@ -1,18 +1,18 @@
-[![Version](https://img.shields.io/badge/version-0.1.9.0-orange.svg)](.)[![Size](https://img.shields.io/badge/size-12.55MB-blue.svg)](.)[![Platform](https://img.shields.io/badge/platform-Windows-blue.svg)](https://www.microsoft.com/windows)[![Build](https://img.shields.io/badge/build-passing-brightgreen.svg)](.)[![Tests](https://img.shields.io/badge/tests-10%2F10%20PASS-brightgreen.svg)](test_posix_simple.ps1)
+[![Version](https://img.shields.io/badge/version-0.2.0.0-orange.svg)](.)[![Size](https://img.shields.io/badge/size-12.97MB-blue.svg)](.)[![Platform](https://img.shields.io/badge/platform-Windows-blue.svg)](https://www.microsoft.com/windows)[![Build](https://img.shields.io/badge/build-passing-brightgreen.svg)](.)[![Tests](https://img.shields.io/badge/tests-10%2F10%20PASS-brightgreen.svg)](test_posix_simple.ps1)
 
 # Windows Native Unix Shell (wnus)
 
-**v0.1.9.0** - Comprehensive Unix/Linux command-line environment for Windows with **305 fully implemented commands** in pure C++ (zero external dependencies).
+**v0.2.0.0** - Comprehensive Unix/Linux command-line environment for Windows with **316 fully implemented commands** in pure C++ (zero external dependencies).
 
-**Quick Stats:** 12.55 MB | 40-50 MB RAM | Windows 7+ | Tabbed GUI with multi-session persistence
+**Quick Stats:** 12.97 MB | 40-50 MB RAM | Windows 7+ | Tabbed GUI with multi-session persistence
 
 ## ✨ Features
 
-- 🔧 **305 commands** - ctags, lex, yacc, newgrp, asa, batch, cflow, ninja, gcc, g++, cmake, git, docker, telnet, jq, parallel, dos2unix, unix2dos, strace, journalctl, c-run, uuencode, uudecode, pax, nc, ssh, scp, grep, sed, awk, tar, make, tcpdump, nmap, **SCCS (get, prs, rmdel, unget, sact, sccs, val, what)**, and more
+- 🔧 **316 commands** - ctags, lex, yacc, newgrp, asa, batch, cflow, ninja, gcc, g++, cmake, git, docker, telnet, jq, parallel, dos2unix, unix2dos, strace, journalctl, c-run, uuencode, uudecode, pax, nc, ssh, scp, grep, sed, awk, tar, make, tcpdump, nmap, **SCCS (get, prs, rmdel, unget, sact, sccs, val, what)**, **✅ 100% POSIX Batch Processing (qalter, qdel, qhold, qmove, qmsg, qrerun, qrls, qselect, qsig, qstat, qsub)**, and more
 - 🖥️ **Tabbed GUI** - Multi-tab terminal with persistent session state (Ctrl+T new, Ctrl+W close, Ctrl+Tab switch)
 - 📁 **Native NTFS** - Windows ACL integration, hard/symbolic links, full permission management
 - 🔀 **Bash compatible** - pipes (`|`), redirects (`>`, `>>`), chaining (`&&`, `||`), background (`&`)
-- 📖 **305 man pages** - comprehensive documentation with enhanced build system guides and complete SCCS toolchain
+- 📖 **316 man pages** - comprehensive documentation with enhanced build system guides, complete SCCS toolchain, and 100% complete POSIX batch processing
 - 🌐 **Networking** - SSH/SCP/SFTP/FTP with AES-256 encryption, tcpdump, nmap, ping, traceroute
 - 📦 **Archives** - tar, gzip, zip, RAR, xz/LZMA, bzip2 (all native implementations)
 - 🔐 **Enterprise crypto** - Windows CNG API with FIPS 140-2 validated algorithms
