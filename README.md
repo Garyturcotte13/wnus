@@ -1,18 +1,18 @@
-[![Version](https://img.shields.io/badge/version-0.1.8.0-orange.svg)](.)[![Size](https://img.shields.io/badge/size-11.96MB-blue.svg)](.)[![Platform](https://img.shields.io/badge/platform-Windows-blue.svg)](https://www.microsoft.com/windows)[![Build](https://img.shields.io/badge/build-passing-brightgreen.svg)](.)[![Tests](https://img.shields.io/badge/tests-10%2F10%20PASS-brightgreen.svg)](test_posix_simple.ps1)
+[![Version](https://img.shields.io/badge/version-0.1.9.0-orange.svg)](.)[![Size](https://img.shields.io/badge/size-12.55MB-blue.svg)](.)[![Platform](https://img.shields.io/badge/platform-Windows-blue.svg)](https://www.microsoft.com/windows)[![Build](https://img.shields.io/badge/build-passing-brightgreen.svg)](.)[![Tests](https://img.shields.io/badge/tests-10%2F10%20PASS-brightgreen.svg)](test_posix_simple.ps1)
 
 # Windows Native Unix Shell (wnus)
 
-**v0.1.8.0** - Comprehensive Unix/Linux command-line environment for Windows with **297 fully implemented commands** in pure C++ (zero external dependencies).
+**v0.1.9.0** - Comprehensive Unix/Linux command-line environment for Windows with **305 fully implemented commands** in pure C++ (zero external dependencies).
 
-**Quick Stats:** 11.96 MB | 40-50 MB RAM | Windows 7+ | Tabbed GUI with multi-session persistence
+**Quick Stats:** 12.55 MB | 40-50 MB RAM | Windows 7+ | Tabbed GUI with multi-session persistence
 
 ## ✨ Features
 
-- 🔧 **297 commands** - ctags, lex, yacc, newgrp, asa, batch, cflow, ninja, gcc, g++, cmake, git, docker, telnet, jq, parallel, dos2unix, unix2dos, strace, journalctl, c-run, uuencode, uudecode, pax, nc, ssh, scp, grep, sed, awk, tar, make, tcpdump, nmap, and more
+- 🔧 **305 commands** - ctags, lex, yacc, newgrp, asa, batch, cflow, ninja, gcc, g++, cmake, git, docker, telnet, jq, parallel, dos2unix, unix2dos, strace, journalctl, c-run, uuencode, uudecode, pax, nc, ssh, scp, grep, sed, awk, tar, make, tcpdump, nmap, **SCCS (get, prs, rmdel, unget, sact, sccs, val, what)**, and more
 - 🖥️ **Tabbed GUI** - Multi-tab terminal with persistent session state (Ctrl+T new, Ctrl+W close, Ctrl+Tab switch)
 - 📁 **Native NTFS** - Windows ACL integration, hard/symbolic links, full permission management
 - 🔀 **Bash compatible** - pipes (`|`), redirects (`>`, `>>`), chaining (`&&`, `||`), background (`&`)
-- 📖 **297 man pages** - comprehensive documentation for every command
+- 📖 **305 man pages** - comprehensive documentation with enhanced build system guides and complete SCCS toolchain
 - 🌐 **Networking** - SSH/SCP/SFTP/FTP with AES-256 encryption, tcpdump, nmap, ping, traceroute
 - 📦 **Archives** - tar, gzip, zip, RAR, xz/LZMA, bzip2 (all native implementations)
 - 🔐 **Enterprise crypto** - Windows CNG API with FIPS 140-2 validated algorithms
@@ -34,6 +34,11 @@
 - **bzip2/bunzip2** - Burrows-Wheeler compression (native)
 - **zip/unzip** - Full ZIP format support
 - **RAR** - Native Windows RAR archive extraction
+
+### Build Automation
+- **GNU Make** - Complete GNU Make 4.x implementation with 20+ functions (subst, patsubst, filter, wildcard, foreach, call, shell, if, or, and), automatic variables ($@, $<, $^, $?, $*), pattern rules, parallel jobs (-j), vpath, includes, .PHONY targets
+- **Ninja** - Full Ninja 1.10+ build system with 11 tools (clean, targets, rules, commands, graph, query, compdb, deps, browse, recompact, restat), variable expansion, dependency resolution, response files, depfiles, parallel builds
+- **200+ line man pages** - Comprehensive documentation for both build systems with all options, syntax, examples, and Windows implementation notes
 
 ### Shell Features
 - **sh command** - POSIX-compliant shell interpreter with complete scripting support

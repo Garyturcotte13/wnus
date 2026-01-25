@@ -1,13 +1,29 @@
 # Windows Native Unix Shell (wnus) User Manual
-## Version 0.1.8.0
+## Version 0.1.9.0
 **Build Date:** January 25, 2026  
-**Executable Size:** 11.96 MB (12535.34 KB)  
+**Executable Size:** 12.55 MB (12851.20 KB)  
 **Memory Usage:** 30-40 MB typical  
-**Commands:** 297 fully implemented, 0 stubs (100%)
+**Commands:** 305 fully implemented, 0 stubs (100%)
 
 ---
 
-## Latest Additions (v0.1.8.0)
+## Latest Additions (v0.1.9.0)
+- **sact**: SCCS activity reporter (POSIX.1-2017 XSI) - Shows editing activity for SCCS files by displaying active p-files (pending edits). For each file being edited, shows: SID being edited, new SID that will be created, username, date/time of checkout, and filename. Essential for team coordination to prevent merge conflicts and identify abandoned checkouts. Scans for p-files, parses content, displays in format: "SID new_SID username date_time filename". Exit status 0 if activity found, 1 if no activity.
+- **sccs**: SCCS front-end command (POSIX.1-2017 XSI) - Convenient wrapper for SCCS utilities that simplifies common operations by handling s. prefix automatically and providing cleaner syntax. Options: -r (run with real user ID), -d<path> (change to root directory), -p<path> (prepend path to filenames). Routes commands to implementations: get, prs, rmdel, sact, unget, val, what. Future support planned for admin and delta commands.
+- **val**: SCCS file validator (POSIX.1-2017 XSI) - Validates SCCS file format and integrity. Checks: file starts with ^Ah magic number, header section present, delta section present, optional SID existence with -r<SID>. Options: -s silent mode (exit status only), -r<SID> verify specific version exists. Essential for repository integrity checks, file corruption detection, pre-operation validation. Exit status 0 if valid, 1 if invalid or SID not found.
+- **what**: SCCS identification string extractor (POSIX.1-2017 XSI) - Searches files for @(#) pattern and extracts version identification strings. Used to identify which source file versions are compiled into binaries. Supports -s (stop after first match per file). Searches until delimiters: ", >, newline, \, null. Works on source files, object files, executables, libraries. Output format: "filename:" followed by indented ID strings. Essential for deployment verification, release management, version tracking in compiled programs.
+
+## Previous Additions (v0.1.8.2)
+- **get**: SCCS file retrieval (POSIX.1-2017 XSI) - Retrieves versions from Source Code Control System repositories. Supports all SCCS options: -e for editing (creates p-file lock), -r<SID> for specific versions, -p for stdout, -k to suppress keyword expansion, -n to show SID only. Complete SID parsing (release.level.branch.sequence), keyword substitution (%I%, %R%, %L%, %D%, %T%, %P%, %M%, %W%, %Z%, %Q%), delta reconstruction from s-files, p-file locking mechanism, read-only/writable file attributes.
+- **prs**: SCCS history printer (POSIX.1-2017 XSI) - Displays delta information from SCCS files. Custom format support via -d option with data keywords (:I:, :R:, :L:, :D:, :T:, :P:, :C:, :MR:, :F:, :PN:, :DI:, :DD:, :DU:), filter by SID (-r), cutoff date (-c), all deltas (-e), delta table only (-l). Perfect for release notes, audit trails, version tracking.
+- **rmdel**: SCCS delta removal (POSIX.1-2017 XSI) - Removes deltas from SCCS history. Safety restrictions: only newest delta on branch, no p-file lock, write permission required. Destructive operation with mandatory -r<SID> option to prevent accidents. Full delta tree parsing, p-file checking, file reconstruction without removed delta.
+- **unget**: SCCS checkout cancellation (POSIX.1-2017 XSI) - Undoes 'get -e' command by removing p-file and optionally working file. Options: -r<SID> for specific version, -s silent mode, -n to keep working file. Essential for aborting edit sessions, starting over, or correcting wrong version checkouts.
+
+## Previous Additions (v0.1.8.1)
+- **make**: Enhanced comprehensive GNU Make 4.x documentation with 200+ line man page covering all features: 20+ functions (subst, patsubst, filter, filter-out, wildcard, foreach, call, shell, if, or, and, findstring, strip, sort, etc.), automatic variables ($@, $<, $^, $?, $*, $(@D), $(@F), $(<D), $(<F)), pattern rules (%.o: %.c), variable assignment operators (=, :=, ?=, +=), all command-line options (-j parallel, -n dry-run, -k keep-going, -B always-make, -t touch, -q question, -C directory, -f file, -I include-dir), include directives, vpath support, .PHONY targets, double-colon rules. Complete implementation already existed (~1100 lines), now with comprehensive professional documentation.
+- **ninja**: Enhanced comprehensive Ninja 1.10+ documentation with 200+ line man page covering complete build system: 11 tools (clean, targets, rules, commands, graph, query, compdb, deps, browse, recompact, restat), all directives (rule, build, default, pool, include, subninja), variable expansion ($var, ${var}, $$, $in, $out, $in_newline, $out_newline), dependencies (explicit, implicit |, order-only ||), response files, depfiles, restat, phony targets, parallel builds. Full Ninja 1.10+ implementation with comprehensive documentation for all features.
+
+## Previous Additions (v0.1.8.0)
 - **ctags**: Tag file generator for source code navigation (POSIX.1-2017 XSI) - Generates tag indices for C/C++/Python/JavaScript/Shell source files enabling quick navigation to function/class definitions in editors like vi/emacs. Supports append (-a), custom output file (-f), recursive (-R), cross-reference (-x), and language filtering (--languages). Pure parser with no external dependencies.
 - **lex**: Lexical analyzer generator (POSIX.1-2017 XSI) - Generates C source code for lexical analyzers from .l specification files. Produces lex.yy.c with yylex() function implementing pattern-action rules. Supports stdout output (-t), quiet mode (-n), and verbose statistics (-v). Simplified implementation focusing on POSIX compliance.
 - **yacc**: Parser generator (POSIX.1-2017 XSI) - Generates LALR(1) parsers from .y grammar specification files. Produces y.tab.c parser code with optional y.tab.h token definitions (-d) and y.output description (-v). Implements basic grammar processing, token extraction, and parser generation for POSIX compliance.
