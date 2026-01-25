@@ -1,13 +1,24 @@
 # Windows Native Unix Shell (wnus) User Manual
-## Version 0.1.6.0
+## Version 0.1.8.0
 **Build Date:** January 25, 2026  
-**Executable Size:** 11.69 MB (11973.42 KB)  
+**Executable Size:** 11.96 MB (12535.34 KB)  
 **Memory Usage:** 30-40 MB typical  
-**Commands:** 290 fully implemented, 0 stubs (100%)
+**Commands:** 297 fully implemented, 0 stubs (100%)
 
 ---
 
-## Latest Additions (v0.1.6.0)
+## Latest Additions (v0.1.8.0)
+- **ctags**: Tag file generator for source code navigation (POSIX.1-2017 XSI) - Generates tag indices for C/C++/Python/JavaScript/Shell source files enabling quick navigation to function/class definitions in editors like vi/emacs. Supports append (-a), custom output file (-f), recursive (-R), cross-reference (-x), and language filtering (--languages). Pure parser with no external dependencies.
+- **lex**: Lexical analyzer generator (POSIX.1-2017 XSI) - Generates C source code for lexical analyzers from .l specification files. Produces lex.yy.c with yylex() function implementing pattern-action rules. Supports stdout output (-t), quiet mode (-n), and verbose statistics (-v). Simplified implementation focusing on POSIX compliance.
+- **yacc**: Parser generator (POSIX.1-2017 XSI) - Generates LALR(1) parsers from .y grammar specification files. Produces y.tab.c parser code with optional y.tab.h token definitions (-d) and y.output description (-v). Implements basic grammar processing, token extraction, and parser generation for POSIX compliance.
+- **newgrp**: Change group ID (POSIX.1-2017 Base) - Switches current group context using Windows security APIs. Displays available groups and validates membership before switching. Integrates with Windows net commands and whoami for group management.
+
+## Previous Additions (v0.1.7.0)
+- **asa**: FORTRAN carriage-control interpreter (POSIX.1-2017) - Processes FORTRAN print files with ASA control characters (space, 0, 1, +) for legacy compatibility.
+- **batch**: Background job execution (POSIX.1-2017) - Schedules commands to run when system load permits using Windows Task Scheduler.
+- **cflow**: C call graph generator (POSIX.1-2017) - Analyzes C source files to generate function call hierarchies.
+
+## Previous Additions (v0.1.6.0)
 - **ninja**: Fast minimal build system supporting build.ninja files with variable substitution, rule definitions, build statements, and dependency-based incremental builds. Tools include clean, targets, commands, and graph. Reads build files, executes commands via Windows API, and performs timestamp-based rebuild detection. Compatible with CMake-generated ninja files.
 - **gcc**: GNU C compiler wrapper supporting all GCC compilation options (-c, -o, -Wall, -O0/O1/O2/O3, -g, -std=c89/c99/c11/c17, -I, -L, -l, -D, -shared, -static, -m32/m64, -fpic) with gcc.exe delegation and PATH resolution. Enables C compilation workflows in wnus shell. Requires GCC to be installed (MinGW, TDM-GCC, or MSYS2).
 - **g++**: GNU C++ compiler wrapper supporting all G++ compilation options with C++ standards (c++98, c++11, c++14, c++17, c++20), threading support (-pthread), and full option pass-through via g++.exe delegation. Also accessible as 'gxx' alias. Enables C++ compilation in wnus environment. Requires GCC/G++ to be installed.
