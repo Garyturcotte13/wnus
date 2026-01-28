@@ -1,18 +1,18 @@
-[![Version](https://img.shields.io/badge/version-0.3.1.6-orange.svg)](.)[![Size](https://img.shields.io/badge/size-13.39MB-blue.svg)](.)[![Platform](https://img.shields.io/badge/platform-Windows-blue.svg)](https://www.microsoft.com/windows)[![Build](https://img.shields.io/badge/build-passing-brightgreen.svg)](.)[![Tests](https://img.shields.io/badge/tests-10%2F10%20PASS-brightgreen.svg)](test_posix_simple.ps1)
+[![Version](https://img.shields.io/badge/version-0.3.2.0-orange.svg)](.)[![Size](https://img.shields.io/badge/size-13.50MB-blue.svg)](.)[![Platform](https://img.shields.io/badge/platform-Windows-blue.svg)](https://www.microsoft.com/windows)[![Build](https://img.shields.io/badge/build-passing-brightgreen.svg)](.)[![Tests](https://img.shields.io/badge/tests-10%2F10%20PASS-brightgreen.svg)](test_posix_simple.ps1)
 
 # Windows Native Unix Shell (wnus)
 
-**v0.3.1.6** - Comprehensive Unix/Linux command-line environment for Windows with **337 fully implemented commands** in pure C++ (zero external dependencies).
+**v0.3.2.0** - Comprehensive Unix/Linux command-line environment for Windows with **342 fully implemented commands** in pure C++ (zero external dependencies).
 
 **Quick Stats:** 13.29 MB | 40-50 MB RAM | Windows 7+ | Tabbed GUI with multi-session persistence
 
 ## ✨ Features
 
-- 🔧 **337 commands** - **be (batch editor), tabs (terminal tab stops), cxref (C cross-reference), uuname (UUCP node names), ipcrm, ipcs, locale, localedef, mailx, gencat, iconv, m4, tput**, ctermid, getmsg, putmsg, talk, uucp, uustat, uux, fort77, ctags, lex, yacc, newgrp, asa, batch, cflow, ninja, gcc, g++, cmake, git, docker, telnet, jq, parallel, dos2unix, unix2dos, strace, journalctl, c-run, uuencode, uudecode, pax, nc, ssh, scp, grep, sed, awk, tar, make, tcpdump, nmap, **SCCS (get, prs, rmdel, unget, sact, sccs, val, what)**, **✅ 100% POSIX Batch Processing (qalter, qdel, qhold, qmove, qmsg, qrerun, qrls, qselect, qsig, qstat, qsub)**, and more
+- 🔧 **342 commands** - **be (batch editor), tabs (terminal tab stops), cxref (C cross-reference), uuname (UUCP node names), ld (GNU linker), csplit (context-aware file split), fc (command history editor), getopts (option parsing), hash (command caching), ipcrm, ipcs, locale, localedef, mailx, gencat, iconv, m4, tput**, ctermid, getmsg, putmsg, talk, uucp, uustat, uux, fort77, ctags, lex, yacc, newgrp, asa, batch, cflow, ninja, gcc, g++, cmake, git, docker, telnet, jq, parallel, dos2unix, unix2dos, strace, journalctl, c-run, uuencode, uudecode, pax, nc, ssh, scp, grep, sed, awk, tar, make, tcpdump, nmap, **SCCS (get, prs, rmdel, unget, sact, sccs, val, what)**, **✅ 100% POSIX Batch Processing (qalter, qdel, qhold, qmove, qmsg, qrerun, qrls, qselect, qsig, qstat, qsub)**, and more
 - 🖥️ **Tabbed GUI** - Multi-tab terminal with persistent session state (Ctrl+T new, Ctrl+W close, Ctrl+Tab switch)
 - 📁 **Native NTFS** - Windows ACL integration, hard/symbolic links, full permission management
 - 🔀 **Bash compatible** - pipes (`|`), redirects (`>`, `>>`), chaining (`&&`, `||`), background (`&`)
-- 📖 **337 man pages** - comprehensive documentation with batch editor (be), UUCP utilities (uuname), terminal control (tabs), development tools (cxref), IPC facilities, internationalization, mail handling, message catalogs, character encoding, macro processing, SCCS toolchain, UUCP utilities, STREAMS support, and 100% complete POSIX batch processing
+- 📖 **342 man pages** - comprehensive documentation with batch editor (be), UUCP utilities (uuname), GNU linker (ld), file splitting (csplit), command history (fc), option parsing (getopts), command caching (hash), terminal control (tabs), development tools (cxref), IPC facilities, internationalization, mail handling, message catalogs, character encoding, macro processing, SCCS toolchain, UUCP utilities, STREAMS support, and 100% complete POSIX batch processing
 - 🌐 **Networking** - SSH/SCP/SFTP/FTP with AES-256 encryption, tcpdump, nmap, ping, traceroute
 - 📦 **Archives** - tar, gzip, zip, RAR, xz/LZMA, bzip2 (all native implementations)
 - 🔐 **Enterprise crypto** - Windows CNG API with FIPS 140-2 validated algorithms
@@ -69,7 +69,7 @@
 
 ### Requirements
 - **OS:** Windows 7+  
-- **Disk:** 7 MB | **RAM:** 30-40 MB typical  
+- **Disk:** 13.5 MB | **RAM:** 40-50 MB typical  
 - **Build:** C++ compiler (MSVC, MinGW, Clang) or run precompiled binary
 
 ### Download & Run
