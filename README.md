@@ -100,7 +100,7 @@ g++ -O3 -std=c++11 -municode -DUNICODE -D_UNICODE -mwindows wnus.cpp -o wnus.exe
 
 ## 📖 Documentation
 
-All 328 commands have full manual pages:
+All 342 commands have full manual pages:
 ```bash
 man command_name      # Detailed manual
 command_name --help   # Quick reference
@@ -143,14 +143,14 @@ kill -9 1234
 | **Dependencies** | Zero (Windows API + C++ stdlib only) |
 | **Cryptography** | Windows CNG (AES-256, HMAC-SHA256) |
 | **Platform** | Windows 7+ (x86/x64) |
-| **Commands** | 328 fully implemented (0 stubs) |
+| **Commands** | 342 fully implemented (0 stubs) |
 | **Startup** | < 100ms |
 | **GUI** | Native Win32 with tabbed interface |
 
 ## 📊 Status
 
-- **Total Commands:** 328 (100% fully implemented, 0 stubs)
-- **Manual Pages:** 328 (100% coverage)
+- **Total Commands:** 342 (100% fully implemented, 0 stubs)
+- **Manual Pages:** 342 (100% coverage)
 - **Test Suite:** 10/10 PASS
 - **Documentation:** Complete (MANUAL.md, RELEASE_NOTES.md)
 
