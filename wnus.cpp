@@ -563,7 +563,7 @@ int g_emacsMarkCol = 0;  // Emacs mark column
 #define REG_VALUE_FULL_PATH "FullPathPrompt"
 #define REG_VALUE_LINE_WRAP "LineWrap"
 
-const std::string WNUS_VERSION = "0.3.2.0";
+const std::string WNUS_VERSION = "0.3.2.1";
 
 // Utility functions
 std::vector<std::string> split(const std::string& str, char delimiter = ' ') {
@@ -75425,8 +75425,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             InvalidateRect(g_hTabControl, NULL, TRUE);
             UpdateWindow(g_hTabControl);
             
-            // Welcome message (show for interactive launch when not restoring prior session)
-            if (!restoredTabs && (!g_executeOnStartup || !g_exitAfterStartup)) {
+            // Welcome message (show for interactive launch)
+            if (!g_executeOnStartup || !g_exitAfterStartup) {
                 output("Windows Native Unix Shell (wnus) v" + WNUS_VERSION + " - Native Unix Environment for Windows");
                 output("Type 'help' for available commands");
                 output("Type 'version' for more information");
