@@ -1,5 +1,5 @@
 # Windows Native Unix Shell (wnus) User Manual
-## Version 0.3.2.0
+## Version 0.3.2.5
 **Build Date:** January 28, 2026  
 **Executable Size:** 13.50 MB (13824 KB)  
 **Memory Usage:** 30-40 MB typical  
@@ -7,7 +7,7 @@
 
 ---
 
-## Latest Additions (v0.3.2.0) ✅ Final POSIX Compliance Achieved
+## Latest Additions (v0.3.2.5) ✅ Final POSIX Compliance Achieved
 - **csplit**: Context-aware file splitting (POSIX.1-2017 Base Utilities) - Splits input file into pieces determined by context patterns and lines. Each output piece is written to a new file named with a specified prefix and numeric suffix. Options: -f PREFIX (output file prefix, default 'xx'), -n DIGITS (number of digits in suffix, default 2), -s/--silent (suppress byte counts), -k/--keep-files (keep output files on error), -z (remove empty output files). Patterns: /REGEXP/ (split at lines matching regex), %REGEXP% (skip to lines matching), {N} (repeat last pattern N times), LINE (split at line number). Windows implementation uses CreateFileA/ReadFile for input, string-based line parsing, and CreateFileA/WriteFile for output file creation. Generates files xx00, xx01, xx02, etc. with customizable prefix and digit count. Essential for data partitioning, log file splitting, large file processing, data export/import operations.
 - **fc**: Command history editor (POSIX.1-2017 Base Utilities) - Processes the command history list, allowing users to list, edit, and re-execute previous commands. Options: -e EDITOR (specify editor, default vi/notepad), -l (list commands), -n (omit line numbers), -r (reverse order), first [last] (command range). Features: history storage in ~/.sh_history file, range selection (fc 5-10), reverse listing (fc -r), editor integration for command editing and re-execution. Windows implementation reads ~/.sh_history file, parses command lines, supports basic listing and editing operations. Compatible with bash history mechanism. Note: Full re-execution requires shell integration. Essential for command history management, command recovery, typo correction, batch command execution.
 - **getopts**: Option argument processing (POSIX.1-2017 Base Utilities) - Parses command-line options (flags and arguments) in shell scripts using a compact option specification format. Syntax: getopts optstring name [args]. OPTSTRING format: 'ab:c' means -a (flag), -b ARG (requires argument), -c (flag). Sets variables: name (current option), OPTARG (option argument), OPTIND (next argument index). Returns 0 on success, 1 on end of options. Options: processes standard single-letter options with optional colon-suffixed arguments. Windows implementation parses option string, processes arguments array, and displays recognized options. Essential for portable shell script option parsing, command-line interface standardization, POSIX script compatibility. Typically used in while loops for option processing in shell scripts.

@@ -1,15 +1,41 @@
-# WNUS Release Notes - Version 0.1.8.0
+# WNUS Release Notes - Version 0.3.2.5
 
-**Release Date:** January 25, 2026  
-**Current Build:** 11.96 MB (12535.34 KB)  
+**Release Date:** February 28, 2026  
+**Current Build:** 13.53 MB  
 **Platform:** Windows (all versions)  
 **Compiler:** TDM-GCC 10.3.0+ or MSVC 2019+  
 **C++ Standard:** C++11  
-**Command Count:** 297 (297 fully implemented; 0 stubs - 100% coverage)  
-**Manual Pages:** 297 (100% coverage)  
+**Command Count:** 342 (342 fully implemented; 0 stubs - 100% coverage)  
+**Manual Pages:** 342 (100% coverage)  
 **Test Suite:** 10/10 PASS (test_posix_simple.ps1)  
 **Memory Usage:** 40-50 MB typical  
-**POSIX Compliance:** 95.4% weighted (126 of 160 POSIX.1-2017 commands)
+**POSIX Compliance:** 99.63% weighted (146 of 160 POSIX.1-2017 commands)
+
+---
+
+## Version 0.3.2.5 - February 28, 2026 🧩 SHELL COMPATIBILITY PATCH
+
+### Summary
+Focused patch release that improves POSIX `sh` loop compatibility and synchronizes runtime/documentation versioning.
+
+### Key Fixes
+- **Multiline `while ... do ... done` support in `sh`**
+  - Fixed parsing/execution for standalone `while` form where condition commands are listed between `while` and `do`.
+  - Prevents `do` from being treated as an external command in this script pattern.
+- **`jarty-logo` syntax path validated**
+  - `sh -n /usr/bin/jarty-logo` now parses successfully.
+
+### Version Updates
+- Runtime version constants bumped to `0.3.2.5` in:
+  - `wnus.cpp`
+  - `release_current/wnus.cpp`
+- Primary docs synced to `0.3.2.5`:
+  - `README.md`, `MANUAL.md`
+  - `release_current/README.md`, `release_current/MANUAL.md`
+
+### Verification
+- ✅ Build passed via `./build.ps1`
+- ✅ Parser validation passed: `sh -n /usr/bin/jarty-logo` returned success
 
 ---
 

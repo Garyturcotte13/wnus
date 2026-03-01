@@ -563,7 +563,8 @@ int g_emacsMarkCol = 0;  // Emacs mark column
 #define REG_VALUE_FULL_PATH "FullPathPrompt"
 #define REG_VALUE_LINE_WRAP "LineWrap"
 
-const std::string WNUS_VERSION = "0.3.2.1";
+const std::string WNUS_VERSION = "0.3.2.5";
+const std::string WNUS_BUILD_STAMP = std::string(__DATE__) + " " + std::string(__TIME__);
 
 // Utility functions
 std::vector<std::string> split(const std::string& str, char delimiter = ' ') {
@@ -725,6 +726,57 @@ std::string windowsPathToUnix(const std::string& path) {
     return p;
 }
 
+void ensureUsrBinInPath() {
+    const std::string usrBin = "C:\\usr\\bin";
+
+    DWORD needed = GetEnvironmentVariableA("PATH", NULL, 0);
+    std::string currentPath;
+    if (needed > 0) {
+        currentPath.resize(needed - 1);
+        GetEnvironmentVariableA("PATH", &currentPath[0], needed);
+    }
+
+    auto normalizeForCompare = [](const std::string& p) {
+        std::string n = p;
+        std::replace(n.begin(), n.end(), '/', '\\');
+        while (!n.empty() && (n.back() == '\\' || n.back() == ' ' || n.back() == '\t')) {
+            n.pop_back();
+        }
+        std::transform(n.begin(), n.end(), n.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+        return n;
+    };
+
+    const std::string targetNorm = normalizeForCompare(usrBin);
+    bool exists = false;
+
+    if (!currentPath.empty()) {
+        size_t start = 0;
+        while (start <= currentPath.length()) {
+            size_t sep = currentPath.find(';', start);
+            std::string entry = (sep == std::string::npos)
+                ? currentPath.substr(start)
+                : currentPath.substr(start, sep - start);
+
+            if (normalizeForCompare(entry) == targetNorm) {
+                exists = true;
+                break;
+            }
+
+            if (sep == std::string::npos) break;
+            start = sep + 1;
+        }
+    }
+
+    if (!exists) {
+        std::string updatedPath = currentPath;
+        if (!updatedPath.empty() && updatedPath.back() != ';') {
+            updatedPath += ';';
+        }
+        updatedPath += usrBin;
+        SetEnvironmentVariableA("PATH", updatedPath.c_str());
+    }
+}
+
 // Pad string to the right with spaces
 std::string padRight(const std::string& str, size_t width) {
     if (str.length() >= width) {
@@ -786,7 +838,8 @@ void searchFiles(const std::string& basePath, const std::string& pattern,
 std::vector<std::string> splitByPipe(const std::string& command) {
     std::vector<std::string> commands;
     std::string current;
-    bool inQuotes = false;
+    bool inDoubleQuotes = false;
+    bool inSingleQuotes = false;
     bool escapeNext = false;
     
     for (size_t i = 0; i < command.length(); i++) {
@@ -798,10 +851,13 @@ std::vector<std::string> splitByPipe(const std::string& command) {
         } else if (c == '\\') {
             current += c;
             escapeNext = true;
-        } else if (c == '"') {
-            inQuotes = !inQuotes;
+        } else if (c == '"' && !inSingleQuotes) {
+            inDoubleQuotes = !inDoubleQuotes;
             current += c;
-        } else if (c == '|' && !inQuotes) {
+        } else if (c == '\'' && !inDoubleQuotes) {
+            inSingleQuotes = !inSingleQuotes;
+            current += c;
+        } else if (c == '|' && !inDoubleQuotes && !inSingleQuotes) {
             // Check if it's || (OR operator) - if so, don't split here
             if (i + 1 < command.length() && command[i + 1] == '|') {
                 current += c;
@@ -835,7 +891,8 @@ struct ChainedCommand {
 std::vector<ChainedCommand> splitByChain(const std::string& command) {
     std::vector<ChainedCommand> commands;
     std::string current;
-    bool inQuotes = false;
+    bool inDoubleQuotes = false;
+    bool inSingleQuotes = false;
     bool escapeNext = false;
     
     for (size_t i = 0; i < command.length(); i++) {
@@ -847,10 +904,13 @@ std::vector<ChainedCommand> splitByChain(const std::string& command) {
         } else if (c == '\\') {
             current += c;
             escapeNext = true;
-        } else if (c == '"') {
-            inQuotes = !inQuotes;
+        } else if (c == '"' && !inSingleQuotes) {
+            inDoubleQuotes = !inDoubleQuotes;
             current += c;
-        } else if (!inQuotes && c == '&' && i + 1 < command.length() && command[i + 1] == '&') {
+        } else if (c == '\'' && !inDoubleQuotes) {
+            inSingleQuotes = !inSingleQuotes;
+            current += c;
+        } else if (!inDoubleQuotes && !inSingleQuotes && c == '&' && i + 1 < command.length() && command[i + 1] == '&') {
             // Found && operator
             if (!trim(current).empty()) {
                 ChainedCommand cmd;
@@ -860,7 +920,7 @@ std::vector<ChainedCommand> splitByChain(const std::string& command) {
                 current.clear();
             }
             i++; // Skip the second &
-        } else if (!inQuotes && c == '|' && i + 1 < command.length() && command[i + 1] == '|') {
+        } else if (!inDoubleQuotes && !inSingleQuotes && c == '|' && i + 1 < command.length() && command[i + 1] == '|') {
             // Found || operator
             if (!trim(current).empty()) {
                 ChainedCommand cmd;
@@ -67580,9 +67640,49 @@ public:
     std::string expandVariables(const std::string& input) {
         std::string result;
         size_t i = 0;
+        bool inSingleQuote = false;
+        bool inDoubleQuote = false;
+        bool escaped = false;
         
         while (i < input.length()) {
-            if (input[i] == '$' && i + 1 < input.length()) {
+            char c = input[i];
+
+            if (escaped) {
+                result += c;
+                escaped = false;
+                i++;
+                continue;
+            }
+
+            if (c == '\\' && !inSingleQuote) {
+                escaped = true;
+                result += c;
+                i++;
+                continue;
+            }
+
+            if (c == '\'' && !inDoubleQuote) {
+                inSingleQuote = !inSingleQuote;
+                result += c;
+                i++;
+                continue;
+            }
+
+            if (c == '"' && !inSingleQuote) {
+                inDoubleQuote = !inDoubleQuote;
+                result += c;
+                i++;
+                continue;
+            }
+
+            // In single quotes, everything is literal in POSIX shell.
+            if (inSingleQuote) {
+                result += c;
+                i++;
+                continue;
+            }
+
+            if (c == '$' && i + 1 < input.length()) {
                 if (input[i + 1] == '(') {
                     // Check for $(( or $(
                     if (i + 2 < input.length() && input[i + 2] == '(') {
@@ -67621,9 +67721,21 @@ public:
                     }
                 } else {
                     // $VAR expansion
+                    char next = input[i + 1];
+                    bool validVarStart = (isalpha(static_cast<unsigned char>(next)) ||
+                                          next == '_' || next == '?' || next == '$' ||
+                                          next == '#' || isdigit(static_cast<unsigned char>(next)));
+
+                    // Literal '$' (e.g., sed regex anchors in single-quoted fragments)
+                    if (!validVarStart) {
+                        result += '$';
+                        i++;
+                        continue;
+                    }
+
                     size_t j = i + 1;
-                    while (j < input.length() && (isalnum(input[j]) || input[j] == '_' || 
-                           (j == i + 1 && (input[j] == '?' || input[j] == '$' || input[j] == '#' || isdigit(input[j]))))) {
+                    while (j < input.length() && (isalnum(static_cast<unsigned char>(input[j])) || input[j] == '_' || 
+                           (j == i + 1 && (input[j] == '?' || input[j] == '$' || input[j] == '#' || isdigit(static_cast<unsigned char>(input[j])))))) {
                         j++;
                         if (j == i + 2 && (input[i + 1] == '?' || input[i + 1] == '$' || input[i + 1] == '#')) break;
                     }
@@ -67632,15 +67744,9 @@ public:
                     i = j;
                     continue;
                 }
-            } else if (input[i] == '\\' && i + 1 < input.length()) {
-                // Handle escape sequences
-                i++;
-                result += input[i];
-                i++;
-                continue;
             }
             
-            result += input[i];
+            result += c;
             i++;
         }
         
@@ -67649,9 +67755,39 @@ public:
     
     size_t findMatchingParen(const std::string& s, size_t start) {
         int depth = 1;
+        bool inSingleQuote = false;
+        bool inDoubleQuote = false;
+        bool escaped = false;
+
         for (size_t i = start + 1; i < s.length(); i++) {
-            if (s[i] == '(') depth++;
-            else if (s[i] == ')') {
+            char c = s[i];
+
+            if (escaped) {
+                escaped = false;
+                continue;
+            }
+
+            if (c == '\\' && !inSingleQuote) {
+                escaped = true;
+                continue;
+            }
+
+            if (c == '\'' && !inDoubleQuote) {
+                inSingleQuote = !inSingleQuote;
+                continue;
+            }
+
+            if (c == '"' && !inSingleQuote) {
+                inDoubleQuote = !inDoubleQuote;
+                continue;
+            }
+
+            if (inSingleQuote || inDoubleQuote) {
+                continue;
+            }
+
+            if (c == '(') depth++;
+            else if (c == ')') {
                 depth--;
                 if (depth == 0) return i;
             }
@@ -67664,14 +67800,20 @@ public:
         std::vector<std::string> savedOutput = g_capturedOutput;
         bool savedCapturing = g_capturingOutput;
         bool savedSkipPrompt = g_skipFinalPrompt;
+        bool savedOptionV = optionV;
+        bool savedOptionX = optionX;
         
         g_capturedOutput.clear();
         g_capturingOutput = true;
         g_skipFinalPrompt = true;
+        optionV = false;
+        optionX = false;
         
-        // Execute command
-        std::string expanded = expandVariables(command);
-        executeCommand(expanded);
+        // Execute command through shell parser so built-ins, script fallbacks,
+        // and control-aware behavior work inside command substitution $(...).
+        // Do not pre-expand here: executeLine already performs expansion with
+        // proper quote context, and double expansion can corrupt complex sed/awk text.
+        executeLine(command);
         
         // Capture result
         std::string result;
@@ -67683,6 +67825,8 @@ public:
         g_capturedOutput = savedOutput;
         g_capturingOutput = savedCapturing;
         g_skipFinalPrompt = savedSkipPrompt;
+        optionV = savedOptionV;
+        optionX = savedOptionX;
         
         return result;
     }
@@ -67814,6 +67958,53 @@ public:
         
         return args;
     }
+
+    std::string stripInlineComment(const std::string& line) {
+        std::string result;
+        bool inSingleQuote = false;
+        bool inDoubleQuote = false;
+        bool escaped = false;
+
+        for (size_t i = 0; i < line.length(); ++i) {
+            char c = line[i];
+
+            if (escaped) {
+                result += c;
+                escaped = false;
+                continue;
+            }
+
+            if (c == '\\' && !inSingleQuote) {
+                escaped = true;
+                result += c;
+                continue;
+            }
+
+            if (c == '\'' && !inDoubleQuote) {
+                inSingleQuote = !inSingleQuote;
+                result += c;
+                continue;
+            }
+
+            if (c == '"' && !inSingleQuote) {
+                inDoubleQuote = !inDoubleQuote;
+                result += c;
+                continue;
+            }
+
+            if (c == '#' && !inSingleQuote && !inDoubleQuote) {
+                char prev = (i > 0) ? line[i - 1] : '\0';
+                if (i == 0 || std::isspace(static_cast<unsigned char>(prev)) ||
+                    prev == ';' || prev == '|' || prev == '&') {
+                    break;
+                }
+            }
+
+            result += c;
+        }
+
+        return trim(result);
+    }
     
     // Parse and execute a line (handles assignments, control flow, etc.)
     bool executeLine(const std::string& line) {
@@ -67823,6 +68014,9 @@ public:
         if (start == std::string::npos) return true;
         size_t end = trimmed.find_last_not_of(" \t\r\n");
         trimmed = trimmed.substr(start, end - start + 1);
+
+        // Strip unquoted inline comments so trailing script notes don't become commands.
+        trimmed = stripInlineComment(trimmed);
         
         if (trimmed.empty() || trimmed[0] == '#') return true;
         
@@ -67930,6 +68124,24 @@ public:
         // Handle shell built-ins that must not go through executeCommand
         std::vector<std::string> tokens = parseArguments(cmdToExecute);
         if (!tokens.empty()) {
+            // Normalize Unix-style command paths for Windows external execution
+            // e.g. ./tool -> .\tool, ../tool -> ..\tool, /C/path/tool -> C:\path\tool
+            const std::string& commandToken = tokens[0];
+            bool looksLikeUnixPathCommand = !commandToken.empty() &&
+                (commandToken.find('/') != std::string::npos) &&
+                (commandToken[0] == '.' || commandToken[0] == '/' || commandToken[0] == '~');
+
+            if (looksLikeUnixPathCommand) {
+                std::string windowsCommandToken = unixPathToWindows(commandToken);
+                if (windowsCommandToken != commandToken) {
+                    size_t tokenPos = cmdToExecute.find(commandToken);
+                    if (tokenPos != std::string::npos) {
+                        cmdToExecute.replace(tokenPos, commandToken.length(), windowsCommandToken);
+                    }
+                    tokens[0] = windowsCommandToken;
+                }
+            }
+
             const std::string& builtin = tokens[0];
 
             // set: toggle shell options like -e/-u/-v/-x/-n or -o name
@@ -67997,6 +68209,41 @@ public:
                 return executeLine(evalCmd);
             }
 
+            // . / source: execute commands from file in current shell context
+            if (builtin == "." || builtin == "source") {
+                if (tokens.size() < 2) {
+                    outputError("sh: " + builtin + ": filename argument required");
+                    g_lastExitStatus = 2;
+                    return true;
+                }
+
+                std::string scriptPath = tokens[1];
+                std::string windowsPath = unixPathToWindows(scriptPath);
+
+                char fullPath[MAX_PATH];
+                DWORD len = GetFullPathNameA(windowsPath.c_str(), MAX_PATH, fullPath, NULL);
+                if (len > 0 && len < MAX_PATH) {
+                    windowsPath = std::string(fullPath);
+                }
+
+                std::ifstream srcFile(windowsPath);
+                if (!srcFile.is_open()) {
+                    outputError("sh: " + scriptPath + ": No such file or directory");
+                    g_lastExitStatus = 127;
+                    return true;
+                }
+
+                bool ok = executeScript(srcFile);
+                srcFile.close();
+
+                if (!ok && optionE) {
+                    return false;
+                }
+
+                g_lastExitStatus = ok ? 0 : 1;
+                return true;
+            }
+
             // return: exit from a function with optional status
             if (builtin == "return") {
                 if (functionDepth <= 0) {
@@ -68029,8 +68276,59 @@ public:
         if (!optionN) {
             bool savedSkipPrompt = g_skipFinalPrompt;
             g_skipFinalPrompt = true;
+
+            // If command token resolves to a script file (often extensionless in
+            // Unix workflows), execute it via sh instead of cmd.exe.
+            bool executedAsScript = false;
+            if (!tokens.empty()) {
+                auto hasExecutableExtension = [](const std::string& filePath) {
+                    std::string lower = filePath;
+                    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+                    return (lower.length() >= 4 &&
+                            (lower.substr(lower.length() - 4) == ".exe" ||
+                             lower.substr(lower.length() - 4) == ".bat" ||
+                             lower.substr(lower.length() - 4) == ".cmd" ||
+                             lower.substr(lower.length() - 4) == ".com" ||
+                             lower.substr(lower.length() - 4) == ".ps1"));
+                };
+
+                std::vector<std::string> scriptCandidates;
+                scriptCandidates.push_back(unixPathToWindows(tokens[0]));
+
+                // Bare command name: also try current working directory explicitly
+                if (tokens[0].find('\\') == std::string::npos &&
+                    tokens[0].find('/') == std::string::npos &&
+                    tokens[0].find(':') == std::string::npos) {
+                    char cwd[MAX_PATH];
+                    if (GetCurrentDirectoryA(MAX_PATH, cwd)) {
+                        scriptCandidates.push_back(std::string(cwd) + "\\" + tokens[0]);
+                    }
+                }
+
+                for (const auto& candidate : scriptCandidates) {
+                    DWORD attrs = GetFileAttributesA(candidate.c_str());
+                    if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+                        continue;
+                    }
+                    if (hasExecutableExtension(candidate)) {
+                        continue;
+                    }
+
+                    std::vector<std::string> shArgs;
+                    shArgs.push_back("sh");
+                    shArgs.push_back(windowsPathToUnix(candidate));
+                    for (size_t i = 1; i < tokens.size(); ++i) {
+                        shArgs.push_back(tokens[i]);
+                    }
+
+                    cmd_sh(shArgs);
+                    executedAsScript = true;
+                    break;
+                }
+            }
+
             // First try to execute as wnus built-in command
-            if (!tryExecuteWnusCommand(cmdToExecute)) {
+            if (!executedAsScript && !tryExecuteWnusCommand(cmdToExecute)) {
                 // If not a wnus command, execute as shell command
                 executeCommand(cmdToExecute);
             }
@@ -69462,6 +69760,22 @@ void cmd_sh(const std::vector<std::string>& args) {
     std::string commandString;
     std::string scriptFile;
     std::vector<std::string> scriptArgs;
+
+    auto resolveScriptPath = [](const std::string& userPath) -> std::string {
+        if (userPath.empty()) {
+            return "";
+        }
+
+        std::string windowsPath = unixPathToWindows(userPath);
+
+        char fullPath[MAX_PATH];
+        DWORD len = GetFullPathNameA(windowsPath.c_str(), MAX_PATH, fullPath, NULL);
+        if (len > 0 && len < MAX_PATH) {
+            return std::string(fullPath);
+        }
+
+        return windowsPath;
+    };
     
     size_t argIdx = 1;
     bool optionsEnded = false;
@@ -69620,16 +69934,7 @@ void cmd_sh(const std::vector<std::string>& args) {
         // Read script file if specified
         std::string scriptContent;
         if (!scriptFile.empty()) {
-            // Expand tilde if present
-            if (scriptFile[0] == '~') {
-                char homeDir[MAX_PATH];
-                if (GetEnvironmentVariableA("USERPROFILE", homeDir, sizeof(homeDir))) {
-                    scriptFile = std::string(homeDir) + scriptFile.substr(1);
-                }
-            }
-            
-            // Convert Unix path to Windows path
-            std::string windowsPath = unixPathToWindows(scriptFile);
+            std::string windowsPath = resolveScriptPath(scriptFile);
             
             std::ifstream file(windowsPath);
             if (!file.is_open()) {
@@ -69699,17 +70004,7 @@ void cmd_sh(const std::vector<std::string>& args) {
         return;
     } else if (!scriptFile.empty()) {
         // Execute script file mode with full shell features
-        
-        // Expand tilde if present
-        if (scriptFile[0] == '~') {
-            char homeDir[MAX_PATH];
-            if (GetEnvironmentVariableA("USERPROFILE", homeDir, sizeof(homeDir))) {
-                scriptFile = std::string(homeDir) + scriptFile.substr(1);
-            }
-        }
-        
-        // Convert Unix path to Windows path
-        std::string windowsPath = unixPathToWindows(scriptFile);
+        std::string windowsPath = resolveScriptPath(scriptFile);
         
         std::ifstream file(windowsPath);
         if (!file.is_open()) {
@@ -72414,26 +72709,88 @@ std::string findExecutableInPath(const std::string& exeName) {
 }
 
 bool executeExternalCommand(const std::string& cmdLine) {
-    // Parse the command to extract the executable name
+    // Parse command with shell-aware tokenization so single/double quotes
+    // are consumed as syntax, not forwarded literally to child processes.
     std::string trimmedCmd = trim(cmdLine);
-    std::string exeName = trimmedCmd;
-    
-    // Extract first token (command name)
-    size_t spacePos = trimmedCmd.find(' ');
-    if (spacePos != std::string::npos) {
-        exeName = trimmedCmd.substr(0, spacePos);
+    std::vector<std::string> parsedCmd = split(trimmedCmd);
+    if (parsedCmd.empty()) {
+        return false;
     }
+
+    std::string exeName = parsedCmd[0];
     
     // Search for executable in PATH
     std::string executablePath = findExecutableInPath(exeName);
-    std::string actualCmd = trimmedCmd;
+    std::vector<std::string> actualArgs = parsedCmd;
     
     // Replace the command name with the found path
     if (executablePath != exeName) {
-        size_t cmdPos = actualCmd.find(exeName);
-        if (cmdPos != std::string::npos) {
-            actualCmd = executablePath + actualCmd.substr(cmdPos + exeName.length());
+        actualArgs[0] = executablePath;
+    }
+
+    auto needsQuotes = [](const std::string& arg) {
+        if (arg.empty()) return true;
+        for (char c : arg) {
+            if (std::isspace(static_cast<unsigned char>(c)) || c == '"') {
+                return true;
+            }
         }
+        return false;
+    };
+
+    auto quoteArg = [&](const std::string& arg) {
+        if (!needsQuotes(arg)) return arg;
+        std::string escaped;
+        escaped.reserve(arg.size() + 2);
+        escaped.push_back('"');
+        for (char c : arg) {
+            if (c == '"') {
+                escaped += "\\\"";
+            } else {
+                escaped.push_back(c);
+            }
+        }
+        escaped.push_back('"');
+        return escaped;
+    };
+
+    std::string actualCmd;
+    for (size_t i = 0; i < actualArgs.size(); ++i) {
+        if (i > 0) actualCmd += " ";
+        actualCmd += quoteArg(actualArgs[i]);
+    }
+
+    // If command resolves to a non-native executable file (often extensionless
+    // Unix script in /C/usr/bin), run it through sh.
+    auto hasNativeExecutableExtension = [](const std::string& filePath) {
+        std::string lower = filePath;
+        std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+        return (lower.length() >= 4 &&
+                (lower.substr(lower.length() - 4) == ".exe" ||
+                 lower.substr(lower.length() - 4) == ".com" ||
+                 lower.substr(lower.length() - 4) == ".bat" ||
+                 lower.substr(lower.length() - 4) == ".cmd" ||
+                 lower.substr(lower.length() - 4) == ".ps1" ||
+                 lower.substr(lower.length() - 4) == ".scr"));
+    };
+
+    DWORD resolvedAttrs = GetFileAttributesA(executablePath.c_str());
+    if (resolvedAttrs != INVALID_FILE_ATTRIBUTES &&
+        !(resolvedAttrs & FILE_ATTRIBUTE_DIRECTORY) &&
+        !hasNativeExecutableExtension(executablePath)) {
+        std::vector<std::string> shArgs;
+        shArgs.push_back("sh");
+
+        if (actualArgs.empty()) {
+            shArgs.push_back(windowsPathToUnix(executablePath));
+        } else {
+            std::vector<std::string> shParsedArgs = actualArgs;
+            shParsedArgs[0] = windowsPathToUnix(executablePath);
+            shArgs.insert(shArgs.end(), shParsedArgs.begin(), shParsedArgs.end());
+        }
+
+        cmd_sh(shArgs);
+        return (g_lastExitStatus == 0);
     }
     
     // Check if this is a screensaver file (.scr)
@@ -72534,7 +72891,14 @@ bool executeExternalCommand(const std::string& cmdLine) {
     PROCESS_INFORMATION pi = {0};
     
     // Prepare command line (need mutable buffer)
-    std::string fullCmd = "cmd.exe /c " + actualCmd;
+    std::string lowerExec = executablePath;
+    std::transform(lowerExec.begin(), lowerExec.end(), lowerExec.begin(), ::tolower);
+    bool useCmdWrapper = (executablePath == exeName ||
+                          (lowerExec.length() >= 4 &&
+                           (lowerExec.substr(lowerExec.length() - 4) == ".bat" ||
+                            lowerExec.substr(lowerExec.length() - 4) == ".cmd")));
+
+    std::string fullCmd = useCmdWrapper ? ("cmd.exe /c " + actualCmd) : actualCmd;
     std::vector<char> cmdBuf(fullCmd.begin(), fullCmd.end());
     cmdBuf.push_back('\0');
     
@@ -74060,7 +74424,9 @@ void executeCommand(const std::string& command) {
         // Reset capture mode
         g_capturingOutput = false;
         g_isPipedCommand = false;
-        showPrompt();
+        if (!g_skipFinalPrompt) {
+            showPrompt();
+        }
         return;
     }
     
@@ -75428,6 +75794,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             // Welcome message (show for interactive launch)
             if (!g_executeOnStartup || !g_exitAfterStartup) {
                 output("Windows Native Unix Shell (wnus) v" + WNUS_VERSION + " - Native Unix Environment for Windows");
+                output("Build: " + WNUS_BUILD_STAMP);
                 output("Type 'help' for available commands");
                 output("Type 'version' for more information");
                 output("Type 'exit' or 'quit' to close");
@@ -75952,6 +76319,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     // Initialize Winsock for network operations (ping, ip, ssh, etc.)
     WSADATA wsaData;
     WSAStartup(MAKEWORD(2, 2), &wsaData);
+
+    // Ensure Unix-style user bin location is in process PATH
+    ensureUsrBinInPath();
 
     // Load persisted mesg preference for current user
     std::string startupUser = getCurrentUsername();
